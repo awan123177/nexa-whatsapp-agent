@@ -105,4 +105,37 @@ export class WhatsAppGateway {
   async markRead(messageId: string): Promise<any> {
     return this.client.markAsRead(messageId);
   }
+
+  /**
+   * Uploads binary media to Meta WhatsApp Cloud API.
+   */
+  async uploadMedia(
+    buffer: Buffer,
+    mimeType: string,
+    filename: string
+  ): Promise<{ mediaId: string }> {
+    return this.client.uploadMedia(buffer, mimeType, filename);
+  }
+
+  /**
+   * Sends an image message to a user WhatsApp number via Meta Cloud API.
+   */
+  async sendImageMessage(
+    to: string,
+    mediaIdOrUrl: string,
+    caption?: string
+  ): Promise<any> {
+    return this.client.sendImageMessage(to, mediaIdOrUrl, caption);
+  }
+
+  /**
+   * Alias for sendImageMessage.
+   */
+  async sendImage(
+    to: string,
+    mediaIdOrUrl: string,
+    caption?: string
+  ): Promise<any> {
+    return this.client.sendImageMessage(to, mediaIdOrUrl, caption);
+  }
 }

@@ -3,19 +3,21 @@ import cors from '@fastify/cors';
 import rawBody from 'fastify-raw-body';
 import { IDatabaseRepository } from '@nexa/database';
 import { AIProvider, NexaError } from '@nexa/shared';
-import { ToolRegistry } from '@nexa/tools';
+import { ToolRegistry, GoogleOAuthService } from '@nexa/tools';
 import { AgentOrchestrator } from '@nexa/agent';
 import { WhatsAppGateway } from '@nexa/whatsapp';
-import { InMemoryRateLimiter } from '@nexa/security';
+import { InMemoryRateLimiter, redactString } from '@nexa/security';
 import { registerHealthRoutes } from './routes/health.js';
 import { registerWhatsAppRoutes } from './routes/whatsapp.js';
 import { registerChatRoutes } from './routes/chat.js';
+import { registerAuthRoutes } from './routes/auth.js';
 
 export interface AppDependencies {
   db: IDatabaseRepository;
   aiProvider: AIProvider;
   toolRegistry: ToolRegistry;
   whatsapp: WhatsAppGateway;
+  oauthService?: GoogleOAuthService;
   rateLimiter?: InMemoryRateLimiter;
   maxAgentSteps?: number;
 }
@@ -46,7 +48,8 @@ export function buildApp(deps: AppDependencies): FastifyInstance {
     deps.aiProvider,
     deps.toolRegistry,
     deps.db,
-    deps.maxAgentSteps || 10
+    deps.maxAgentSteps || 10,
+    deps.whatsapp
   );
 
   // Global Error Handler
@@ -54,23 +57,26 @@ export function buildApp(deps: AppDependencies): FastifyInstance {
     app.log.error(error);
     if (error instanceof NexaError) {
       return reply.status(error.statusCode).send({
-        error: error.message,
+        error: redactString(error.message),
         code: error.code,
-        userFacingMessage: error.userFacingMessage,
+        userFacingMessage: redactString(error.userFacingMessage),
       });
     }
 
     return reply.status(500).send({
       error: 'Internal Server Error',
-      message: (error as any).message || 'An unexpected error occurred.',
+      message: redactString((error as any).message || 'An unexpected error occurred.'),
     });
   });
+
+  const oauthService = deps.oauthService || new GoogleOAuthService({ db: deps.db });
 
   // Register route handlers
   registerHealthRoutes(app, {
     db: deps.db,
     aiProvider: deps.aiProvider,
     whatsapp: deps.whatsapp,
+    oauthService,
   });
 
   registerWhatsAppRoutes(app, {
@@ -83,6 +89,11 @@ export function buildApp(deps: AppDependencies): FastifyInstance {
     orchestrator,
     db: deps.db,
     rateLimiter,
+  });
+
+  registerAuthRoutes(app, {
+    db: deps.db,
+    oauthService,
   });
 
   return app;

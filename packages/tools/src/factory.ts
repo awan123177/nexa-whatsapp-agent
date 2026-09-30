@@ -6,6 +6,7 @@ import { createBrowserTools } from './tools/browser-tools.js';
 import { createTravelTools, LiveWebFlightProvider, LiveWebHotelProvider } from './tools/travel-tools.js';
 import { createShoppingTools } from './tools/shopping-tools.js';
 import { createCommunicationTools, DisconnectedEmailProvider } from './tools/communication-tools.js';
+import { GoogleOAuthService } from './tools/google-oauth.js';
 import { createProductivityTools } from './tools/productivity-tools.js';
 import { createMemoryTools } from './tools/memory-tools.js';
 import { createApprovalTool } from './tools/approval-tool.js';
@@ -13,6 +14,8 @@ import { createApprovalTool } from './tools/approval-tool.js';
 export function createDefaultToolRegistry(options: {
   db: IDatabaseRepository;
   browserService?: PlaywrightBrowserService;
+  oauthService?: GoogleOAuthService;
+  whatsappClient?: any;
 }): ToolRegistry {
   const registry = new ToolRegistry({ db: options.db });
   const searchProvider = new DuckDuckGoSearchProvider();
@@ -22,7 +25,7 @@ export function createDefaultToolRegistry(options: {
 
   // 2. Controlled Browser Automation
   const browserService = options.browserService || new PlaywrightBrowserService();
-  for (const browserTool of createBrowserTools(browserService)) {
+  for (const browserTool of createBrowserTools(browserService, options.whatsappClient)) {
     registry.register(browserTool);
   }
 
@@ -39,8 +42,8 @@ export function createDefaultToolRegistry(options: {
   }
 
   // 5. Communication (Email)
-  const emailProvider = new DisconnectedEmailProvider();
-  for (const commTool of createCommunicationTools(emailProvider)) {
+  const oauthService = options.oauthService || new GoogleOAuthService({ db: options.db });
+  for (const commTool of createCommunicationTools({ db: options.db, oauthService })) {
     registry.register(commTool);
   }
 

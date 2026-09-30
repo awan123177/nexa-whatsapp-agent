@@ -9,6 +9,7 @@ import {
   ApprovalStatus,
   AuditLog,
   ChannelType,
+  ConnectedAccount,
 } from '@nexa/shared';
 
 export interface IDatabaseRepository {
@@ -40,6 +41,12 @@ export interface IDatabaseRepository {
   // Tasks
   createTask(data: Omit<Task, 'id' | 'created_at' | 'updated_at'>): Promise<Task>;
   getUserTasks(userId: string): Promise<Task[]>;
+
+  // Connected Accounts (OAuth)
+  saveConnectedAccount(data: Omit<ConnectedAccount, 'id' | 'created_at' | 'updated_at'>): Promise<ConnectedAccount>;
+  getConnectedAccount(userId: string, provider: string): Promise<ConnectedAccount | null>;
+  updateConnectedAccountStatus(userId: string, provider: string, status: 'active' | 'revoked' | 'expired'): Promise<ConnectedAccount | null>;
+  deleteConnectedAccount(userId: string, provider: string): Promise<boolean>;
 
   // Audit Logs
   saveAuditLog(data: Omit<AuditLog, 'id' | 'created_at'>): Promise<void>;

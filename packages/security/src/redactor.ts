@@ -23,7 +23,13 @@ const PATTERNS = [
   { regex: /("?password"?\s*[:=]\s*)"([^"]+)"/gi, replacement: '$1"[REDACTED_PASSWORD]"' },
   { regex: /("?password"?\s*[:=]\s*)([^\s,;&]+)/gi, replacement: '$1[REDACTED_PASSWORD]' },
   // Secrets / Tokens in JSON
-  { regex: /("?(secret|access_token|private_key|api_key)"?\s*[:=]\s*)"([^"]+)"/gi, replacement: '$1"[REDACTED_SECRET]"' },
+  { regex: /("?(secret|access_token|refresh_token|id_token|private_key|api_key)"?\s*[:=]\s*)"([^"]+)"/gi, replacement: '$1"[REDACTED_SECRET]"' },
+  // Google OAuth Access Tokens (ya29.xxx)
+  { regex: /\b(ya29\.[0-9A-Za-z_-]{20,})\b/g, replacement: '[REDACTED_GOOGLE_ACCESS_TOKEN]' },
+  // Google OAuth Refresh Tokens (1//xxx)
+  { regex: /\b(1\/\/[0-9A-Za-z_-]{20,})\b/g, replacement: '[REDACTED_GOOGLE_REFRESH_TOKEN]' },
+  // Stored AES-256-GCM ciphertexts
+  { regex: /\baes256gcm:[0-9a-fA-F]+:[0-9a-fA-F]+:[0-9a-fA-F]+\b/g, replacement: '[REDACTED_ENCRYPTED_TOKEN]' },
 ];
 
 export function redactString(input: string): string {

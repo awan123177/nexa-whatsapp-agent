@@ -39,6 +39,7 @@ describe('Fastify REST & Webhook API Suite', () => {
     const body = JSON.parse(response.body);
     expect(body.status).toBe('healthy');
     expect(body.service).toBe('NEXA Agent API');
+    expect(body.integrations).toHaveProperty('googleOAuthConfigured');
   });
 
   it('GET /webhook/whatsapp returns challenge on valid token', async () => {

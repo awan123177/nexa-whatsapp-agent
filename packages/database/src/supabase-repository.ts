@@ -10,6 +10,7 @@ import {
   ApprovalStatus,
   AuditLog,
   ChannelType,
+  ConnectedAccount,
 } from '@nexa/shared';
 import { IDatabaseRepository } from './types.js';
 
@@ -343,5 +344,78 @@ export class SupabaseRepository implements IDatabaseRepository {
     if (error) {
       console.error(`Failed to write audit log: ${error.message}`);
     }
+  }
+
+  async saveConnectedAccount(
+    data: Omit<ConnectedAccount, 'id' | 'created_at' | 'updated_at'>
+  ): Promise<ConnectedAccount> {
+    const { data: saved, error } = await this.client
+      .from('connected_accounts')
+      .upsert(
+        {
+          user_id: data.user_id,
+          provider: data.provider,
+          account_id: data.account_id,
+          scopes: data.scopes,
+          token_data: data.token_data,
+          status: data.status,
+          metadata: data.metadata,
+          updated_at: new Date().toISOString(),
+        },
+        { onConflict: 'user_id,provider' }
+      )
+      .select()
+      .single();
+
+    if (error || !saved) {
+      throw new Error(`Failed to save connected account: ${error?.message}`);
+    }
+
+    return saved as ConnectedAccount;
+  }
+
+  async getConnectedAccount(userId: string, provider: string): Promise<ConnectedAccount | null> {
+    const { data, error } = await this.client
+      .from('connected_accounts')
+      .select('*')
+      .eq('user_id', userId)
+      .eq('provider', provider)
+      .maybeSingle();
+
+    if (error) {
+      throw new Error(`Failed to get connected account: ${error.message}`);
+    }
+
+    return (data as ConnectedAccount) || null;
+  }
+
+  async updateConnectedAccountStatus(
+    userId: string,
+    provider: string,
+    status: 'active' | 'revoked' | 'expired'
+  ): Promise<ConnectedAccount | null> {
+    const { data, error } = await this.client
+      .from('connected_accounts')
+      .update({ status, updated_at: new Date().toISOString() })
+      .eq('user_id', userId)
+      .eq('provider', provider)
+      .select()
+      .maybeSingle();
+
+    if (error) {
+      throw new Error(`Failed to update connected account status: ${error.message}`);
+    }
+
+    return (data as ConnectedAccount) || null;
+  }
+
+  async deleteConnectedAccount(userId: string, provider: string): Promise<boolean> {
+    const { error } = await this.client
+      .from('connected_accounts')
+      .delete()
+      .eq('user_id', userId)
+      .eq('provider', provider);
+
+    return !error;
   }
 }

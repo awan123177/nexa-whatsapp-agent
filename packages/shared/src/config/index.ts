@@ -22,6 +22,14 @@ export const ConfigSchema = z.object({
   SUPABASE_ANON_KEY: z.string().optional(),
   SUPABASE_SERVICE_ROLE_KEY: z.string().optional(),
 
+  // Google OAuth (Gmail)
+  GOOGLE_CLIENT_ID: z.string().optional(),
+  GOOGLE_CLIENT_SECRET: z.string().optional(),
+  GOOGLE_REDIRECT_URI: z.string().optional(),
+
+  // Data Security
+  ENCRYPTION_KEY: z.string().optional(),
+
   // Search Providers (Optional)
   TAVILY_API_KEY: z.string().optional(),
   SERPER_API_KEY: z.string().optional(),

@@ -4,7 +4,7 @@
   "private": true,
   "description": "NEXA - WhatsApp-first personal AI agent",
   "engines": {
-    "node": ">=20.0.0"
+    "node": ">=22.0.0"
   },
   "workspaces": [
     "packages/*",

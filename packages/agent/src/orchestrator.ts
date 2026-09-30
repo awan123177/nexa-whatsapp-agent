@@ -20,6 +20,7 @@ export interface AgentProcessInput {
   mediaType?: MediaType;
   whatsappMessageId?: string;
   interactiveButtonId?: string;
+  whatsappClient?: any;
 }
 
 export interface AgentProcessOutput {
@@ -36,7 +37,8 @@ export class AgentOrchestrator {
     private aiProvider: AIProvider,
     private toolRegistry: ToolRegistry,
     private db: IDatabaseRepository,
-    private maxSteps = 10
+    private maxSteps = 10,
+    private whatsappClient?: any
   ) {}
 
   /**
@@ -78,6 +80,8 @@ export class AgentOrchestrator {
       conversation,
       messageId: userMessage.id,
       sourceChannel: channel,
+      whatsappClient: input.whatsappClient || this.whatsappClient,
+      recipientPhone: input.phoneNumber || user.phone_number,
     };
 
     // 4. Check for Pending Approvals

@@ -92,3 +92,14 @@ export class WebhookVerificationError extends NexaError {
     });
   }
 }
+
+export class AuthenticationError extends NexaError {
+  constructor(message = 'Authentication required', userFacingMessage?: string) {
+    super(message, {
+      code: 'AUTHENTICATION_REQUIRED',
+      statusCode: 401,
+      userFacingMessage:
+        userFacingMessage || 'You must be authenticated to perform this action.',
+    });
+  }
+}

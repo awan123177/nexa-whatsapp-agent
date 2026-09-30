@@ -1,6 +1,20 @@
 import { chromium, Browser, BrowserContext, Page } from 'playwright';
 import { NexaError, ToolExecutionError } from '@nexa/shared';
 import { validateBrowserUrl, detectCaptchaOrBotBlock } from './safety.js';
+import { PermissionEngine } from '@nexa/security';
+
+export interface ScreenshotOptions {
+  fullPage?: boolean;
+  selector?: string;
+  type?: 'png' | 'jpeg';
+  quality?: number;
+}
+
+export interface ScreenshotResult {
+  buffer: Buffer;
+  mimeType: string;
+  base64: string;
+}
 
 export class PlaywrightBrowserService {
   private browser: Browser | null = null;
@@ -17,6 +31,7 @@ export class PlaywrightBrowserService {
             '--no-sandbox',
             '--disable-setuid-sandbox',
             '--disable-dev-shm-usage',
+            '--disable-gpu',
             '--disable-accelerated-2d-canvas',
             '--no-first-run',
             '--no-zygote',
@@ -163,15 +178,83 @@ export class PlaywrightBrowserService {
     }
   }
 
-  async takeScreenshot(): Promise<{ base64: string; mimeType: string }> {
-    const page = await this.ensurePage();
+  getActiveUrl(): string | null {
+    return this.activeUrl;
+  }
+
+  getPage(): Page | null {
+    return this.page;
+  }
+
+  async takeScreenshot(options?: ScreenshotOptions): Promise<ScreenshotResult> {
+    if (!this.activeUrl) {
+      throw new ToolExecutionError('browser_screenshot', 'No page currently open. Use browser_open first.');
+    }
+
+    if (!this.page || this.page.isClosed()) {
+      throw new ToolExecutionError('browser_screenshot', 'Browser page is closed or not available.');
+    }
+
+    // SSRF & resource permission validation
+    validateBrowserUrl(this.activeUrl);
+    PermissionEngine.validateResourceAccess(this.activeUrl);
+
+    if (this.page.url() && this.page.url() !== 'about:blank') {
+      validateBrowserUrl(this.page.url());
+      PermissionEngine.validateResourceAccess(this.page.url());
+    }
+
+    // Check CAPTCHA / bot block on active page
     try {
-      const buffer = await page.screenshot({ type: 'jpeg', quality: 75 });
+      const bodyHtml = await this.page.content();
+      const botCheck = detectCaptchaOrBotBlock(bodyHtml);
+      if (botCheck.detected) {
+        throw new ToolExecutionError(
+          'browser_screenshot',
+          `Automated browsing blocked by ${botCheck.type}: ${botCheck.message}`,
+          `The website requires human verification (${botCheck.type}). Automated access is restricted.`
+        );
+      }
+    } catch (err: any) {
+      if (err instanceof ToolExecutionError) throw err;
+      // Continue if content reading encountered minor error
+    }
+
+    try {
+      const imgType = options?.type || 'png';
+      const screenshotOpts: any = { type: imgType };
+      if (imgType === 'jpeg' && options?.quality) {
+        screenshotOpts.quality = options.quality;
+      }
+
+      let rawBuffer: Buffer | Uint8Array;
+
+      if (options?.selector) {
+        const element = await this.page.$(options.selector);
+        if (!element) {
+          throw new ToolExecutionError(
+            'browser_screenshot',
+            `Element with selector '${options.selector}' not found on page.`
+          );
+        }
+        rawBuffer = await element.screenshot(screenshotOpts);
+      } else if (options?.fullPage) {
+        screenshotOpts.fullPage = true;
+        rawBuffer = await this.page.screenshot(screenshotOpts);
+      } else {
+        rawBuffer = await this.page.screenshot(screenshotOpts);
+      }
+
+      const buffer = Buffer.from(rawBuffer);
+      const mimeType = imgType === 'jpeg' ? 'image/jpeg' : 'image/png';
+
       return {
+        buffer,
+        mimeType,
         base64: buffer.toString('base64'),
-        mimeType: 'image/jpeg',
       };
     } catch (err: any) {
+      if (err instanceof ToolExecutionError) throw err;
       throw new ToolExecutionError('browser_screenshot', `Failed to take screenshot: ${err.message}`);
     }
   }

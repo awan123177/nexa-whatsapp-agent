@@ -2,6 +2,7 @@ import { FastifyInstance } from 'fastify';
 import { IDatabaseRepository } from '@nexa/database';
 import { AIProvider } from '@nexa/shared';
 import { WhatsAppGateway } from '@nexa/whatsapp';
+import { GoogleOAuthService } from '@nexa/tools';
 
 export function registerHealthRoutes(
   app: FastifyInstance,
@@ -9,6 +10,7 @@ export function registerHealthRoutes(
     db: IDatabaseRepository;
     aiProvider: AIProvider;
     whatsapp: WhatsAppGateway;
+    oauthService?: GoogleOAuthService;
   }
 ) {
   app.get('/health', async (_req, reply) => {
@@ -21,6 +23,7 @@ export function registerHealthRoutes(
       integrations: {
         aiProvider: options.aiProvider.name,
         whatsappConfigured: options.whatsapp.client.isConfigured(),
+        googleOAuthConfigured: options.oauthService ? options.oauthService.isConfigured() : false,
         databaseType: options.db.constructor.name,
       },
     });

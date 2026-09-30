@@ -1,5 +1,18 @@
 {
   "extends": "./tsconfig.base.json",
+  "compilerOptions": {
+    "baseUrl": ".",
+    "paths": {
+      "@nexa/shared": ["packages/shared/src/index.ts"],
+      "@nexa/security": ["packages/security/src/index.ts"],
+      "@nexa/database": ["packages/database/src/index.ts"],
+      "@nexa/browser": ["packages/browser/src/index.ts"],
+      "@nexa/tools": ["packages/tools/src/index.ts"],
+      "@nexa/ai": ["packages/ai/src/index.ts"],
+      "@nexa/whatsapp": ["packages/whatsapp/src/index.ts"],
+      "@nexa/agent": ["packages/agent/src/index.ts"]
+    }
+  },
   "include": [
     "packages/*/src/**/*",
     "apps/*/src/**/*",

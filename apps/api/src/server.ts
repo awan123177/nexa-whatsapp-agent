@@ -2,7 +2,7 @@ import 'dotenv/config';
 import { loadConfig } from '@nexa/shared';
 import { createDatabaseRepository } from '@nexa/database';
 import { createAIProvider } from '@nexa/ai';
-import { createDefaultToolRegistry } from '@nexa/tools';
+import { createDefaultToolRegistry, GoogleOAuthService } from '@nexa/tools';
 import { PlaywrightBrowserService } from '@nexa/browser';
 import { WhatsAppGateway } from '@nexa/whatsapp';
 import { InMemoryRateLimiter } from '@nexa/security';
@@ -31,17 +31,15 @@ async function bootstrap() {
   // 3. Initialize Controlled Browser Automation
   const browserService = new PlaywrightBrowserService();
 
-  // 4. Initialize Tool Registry with all initial tools
-  const toolRegistry = createDefaultToolRegistry({
+  // 4. Initialize Google OAuth Service
+  const oauthService = new GoogleOAuthService({
+    clientId: config.GOOGLE_CLIENT_ID,
+    clientSecret: config.GOOGLE_CLIENT_SECRET,
+    redirectUri: config.GOOGLE_REDIRECT_URI,
+    encryptionKey: config.ENCRYPTION_KEY,
     db,
-    browserService,
   });
-  console.log(
-    `[NEXA] Registered ${toolRegistry.getAllTools().length} tools: [${toolRegistry
-      .getAllTools()
-      .map((t) => t.name)
-      .join(', ')}]`
-  );
+  console.log(`[NEXA] Google OAuth Service initialized (configured: ${oauthService.isConfigured()})`);
 
   // 5. Initialize WhatsApp Gateway
   const whatsapp = new WhatsAppGateway({
@@ -51,18 +49,33 @@ async function bootstrap() {
     phoneNumberId: config.WHATSAPP_PHONE_NUMBER_ID,
   });
 
-  // 6. Security Rate Limiter
+  // 6. Initialize Tool Registry with all initial tools
+  const toolRegistry = createDefaultToolRegistry({
+    db,
+    browserService,
+    oauthService,
+    whatsappClient: whatsapp,
+  });
+  console.log(
+    `[NEXA] Registered ${toolRegistry.getAllTools().length} tools: [${toolRegistry
+      .getAllTools()
+      .map((t) => t.name)
+      .join(', ')}]`
+  );
+
+  // 7. Security Rate Limiter
   const rateLimiter = new InMemoryRateLimiter({
     maxRequests: config.RATE_LIMIT_MAX_REQUESTS_PER_MINUTE,
     windowMs: 60_000,
   });
 
-  // 7. Build Fastify App
+  // 8. Build Fastify App
   const app = buildApp({
     db,
     aiProvider,
     toolRegistry,
     whatsapp,
+    oauthService,
     rateLimiter,
     maxAgentSteps: config.MAX_AGENT_STEPS,
   });

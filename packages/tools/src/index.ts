@@ -7,4 +7,6 @@ export * from './tools/communication-tools.js';
 export * from './tools/productivity-tools.js';
 export * from './tools/memory-tools.js';
 export * from './tools/approval-tool.js';
+export * from './tools/google-oauth.js';
+export * from './tools/gmail-provider.js';
 export * from './factory.js';

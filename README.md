@@ -243,6 +243,85 @@ Copy the HTTPS forwarding URL (e.g. `https://xxxx-xx-xx.ngrok-free.app`).
 
 ---
 
+## 🔐 Google OAuth 2.0 (Gmail Integration) Setup
+
+NEXA integrates directly with Gmail using standard OAuth 2.0. Users authorize NEXA without ever sharing their Google password.
+
+### 1. Create Google Cloud Credentials
+1. Go to the [Google Cloud Console](https://console.cloud.google.com/).
+2. Create or select a project.
+3. Enable the **Gmail API** under **APIs & Services > Library**.
+4. Go to **APIs & Services > OAuth consent screen**:
+   - User Type: **External** (or Internal for Google Workspace).
+   - Add app name, support email, and developer contact.
+   - Scopes requested:
+     - `https://www.googleapis.com/auth/gmail.send`
+     - `https://www.googleapis.com/auth/gmail.readonly`
+5. Go to **APIs & Services > Credentials** > **Create Credentials** > **OAuth client ID**:
+   - Application type: **Web application**.
+   - Authorized redirect URIs:
+     - Local development: `http://localhost:3000/auth/google/callback`
+     - Render production: `https://your-service.onrender.com/auth/google/callback`
+6. Copy the **Client ID** and **Client Secret** into your `.env` or Render Dashboard.
+
+### 2. Generate Data Encryption Key
+NEXA automatically encrypts access and refresh tokens at rest with AES-256-GCM before saving them to the database. Generate a 256-bit key:
+```bash
+node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
+```
+Set the output as `ENCRYPTION_KEY` in your environment.
+
+### 3. OAuth Flow Endpoints
+- **Initiate OAuth Flow**: `GET /auth/google/start?userId=<USER_UUID>` (generates signed CSRF state with 15-minute expiry).
+- **Callback Endpoint**: `GET /auth/google/callback?code=...&state=...` (exchanges code, retrieves profile, stores encrypted tokens in `connected_accounts`).
+- **Disconnect / Revoke**: `POST /auth/google/disconnect` with body `{"userId": "<USER_UUID>"}` (revokes token with Google and updates database status to `revoked`).
+
+---
+
+## 🚀 Production Deployment on Render
+
+NEXA is fully configured for Render as a containerized web service with Playwright Chromium support.
+
+### Render Deployment Steps
+1. Push your repository to GitHub (ensure `.env` is **NOT** committed).
+2. Log in to [Render](https://dashboard.render.com/).
+3. Click **New +** > **Blueprint** (or connect your repo via **Web Service** using Docker runtime).
+4. Render will detect `render.yaml` and configure the service:
+   - **Environment**: Docker (Node 22 Bookworm base)
+   - **DockerfilePath**: `./Dockerfile`
+   - **Health Check Path**: `/health`
+   - **Port**: `10000` (Fastify automatically listens on `0.0.0.0` and respects `$PORT`)
+5. In the Render Dashboard, fill in your production secrets under **Environment Variables**:
+   - `GEMINI_API_KEY`
+   - `WHATSAPP_ACCESS_TOKEN`, `WHATSAPP_APP_SECRET`, `WHATSAPP_PHONE_NUMBER_ID`, `WHATSAPP_VERIFY_TOKEN`
+   - `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`
+   - `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `GOOGLE_REDIRECT_URI`
+   - `ENCRYPTION_KEY`
+6. Deploy! Render will build the multi-stage image, install Playwright Chromium system dependencies, and start the service.
+
+### Verify Production Health
+Once deployed, check your service health:
+```bash
+curl https://your-service.onrender.com/health
+```
+Expected response:
+```json
+{
+  "status": "healthy",
+  "service": "NEXA Agent API",
+  "version": "0.1.0",
+  "uptimeSeconds": 120,
+  "integrations": {
+    "aiProvider": "gemini",
+    "whatsappConfigured": true,
+    "googleOAuthConfigured": true,
+    "databaseType": "SupabaseRepository"
+  }
+}
+```
+
+---
+
 ## 🧪 Testing the API Locally
 
 You can test NEXA without WhatsApp using the direct chat endpoint:

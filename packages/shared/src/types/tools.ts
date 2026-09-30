@@ -3,12 +3,19 @@ import { User, Conversation, ChannelType, ApprovalImpactLevel } from './models.j
 
 export type ToolRiskLevel = 'read_only' | 'low_risk' | 'medium_risk' | 'high_risk' | 'critical';
 
+export interface WhatsAppMediaSender {
+  uploadMedia: (buffer: Buffer, mimeType: string, filename: string) => Promise<{ mediaId: string }>;
+  sendImageMessage: (to: string, mediaIdOrUrl: string, caption?: string) => Promise<any>;
+}
+
 export interface ToolExecutionContext {
   user: User;
   conversation: Conversation;
   messageId?: string;
   sourceChannel: ChannelType;
   isUserConfirmed?: boolean;
+  whatsappClient?: WhatsAppMediaSender;
+  recipientPhone?: string;
 }
 
 export interface ToolResult<T = unknown> {

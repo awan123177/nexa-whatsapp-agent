@@ -10,6 +10,7 @@ import {
   ApprovalStatus,
   AuditLog,
   ChannelType,
+  ConnectedAccount,
 } from '@nexa/shared';
 import { IDatabaseRepository } from './types.js';
 
@@ -21,6 +22,7 @@ export class InMemoryRepository implements IDatabaseRepository {
   public approvals = new Map<string, Approval>();
   public memories = new Map<string, Memory>();
   public tasks = new Map<string, Task>();
+  public connectedAccounts = new Map<string, ConnectedAccount>();
   public auditLogs: AuditLog[] = [];
 
   async findOrCreateUserByPhone(phoneNumber: string, name?: string): Promise<User> {
@@ -229,5 +231,61 @@ export class InMemoryRepository implements IDatabaseRepository {
       created_at: new Date().toISOString(),
     };
     this.auditLogs.push(log);
+  }
+
+  async saveConnectedAccount(
+    data: Omit<ConnectedAccount, 'id' | 'created_at' | 'updated_at'>
+  ): Promise<ConnectedAccount> {
+    const existing = Array.from(this.connectedAccounts.values()).find(
+      (a) => a.user_id === data.user_id && a.provider === data.provider
+    );
+
+    const now = new Date().toISOString();
+    if (existing) {
+      existing.account_id = data.account_id;
+      existing.scopes = data.scopes;
+      existing.token_data = data.token_data;
+      existing.status = data.status;
+      existing.metadata = data.metadata;
+      existing.updated_at = now;
+      return existing;
+    }
+
+    const account: ConnectedAccount = {
+      ...data,
+      id: crypto.randomUUID(),
+      created_at: now,
+      updated_at: now,
+    };
+    this.connectedAccounts.set(account.id, account);
+    return account;
+  }
+
+  async getConnectedAccount(userId: string, provider: string): Promise<ConnectedAccount | null> {
+    return (
+      Array.from(this.connectedAccounts.values()).find(
+        (a) => a.user_id === userId && a.provider === provider
+      ) || null
+    );
+  }
+
+  async updateConnectedAccountStatus(
+    userId: string,
+    provider: string,
+    status: 'active' | 'revoked' | 'expired'
+  ): Promise<ConnectedAccount | null> {
+    const account = await this.getConnectedAccount(userId, provider);
+    if (!account) return null;
+    account.status = status;
+    account.updated_at = new Date().toISOString();
+    return account;
+  }
+
+  async deleteConnectedAccount(userId: string, provider: string): Promise<boolean> {
+    const account = await this.getConnectedAccount(userId, provider);
+    if (account) {
+      return this.connectedAccounts.delete(account.id);
+    }
+    return false;
   }
 }

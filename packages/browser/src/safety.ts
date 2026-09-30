@@ -1,17 +1,72 @@
 import { SecurityViolationError } from '@nexa/shared';
 
-// Prohibited hostnames and IP prefixes (SSRF protection)
-const BLOCKED_HOSTS = [
-  'localhost',
-  '127.0.0.1',
-  '0.0.0.0',
-  '169.254.169.254', // AWS/GCP metadata IP
-  'metadata.google.internal',
-  '10.',
-  '192.168.',
-  '172.16.',
-  '::1',
-];
+function isPrivateOrRestrictedHost(rawHostname: string): boolean {
+  // Strip IPv6 square brackets if present (e.g. "[::1]" -> "::1")
+  let host = rawHostname.toLowerCase().replace(/^\[|\]$/g, '').trim();
+
+  // Handle IPv4-mapped IPv6 addresses (e.g. "::ffff:127.0.0.1" or normalized "[::ffff:7f00:1]")
+  if (host.startsWith('::ffff:')) {
+    const rest = host.slice(7);
+    if (rest.includes('.')) {
+      host = rest;
+    } else {
+      const hexParts = rest.split(':');
+      if (hexParts.length === 2) {
+        const h1 = parseInt(hexParts[0], 16) || 0;
+        const h2 = parseInt(hexParts[1], 16) || 0;
+        const o1 = (h1 >> 8) & 0xff;
+        const o2 = h1 & 0xff;
+        const o3 = (h2 >> 8) & 0xff;
+        const o4 = h2 & 0xff;
+        host = `${o1}.${o2}.${o3}.${o4}`;
+      }
+    }
+  }
+
+  // Exact blocked hostnames
+  const blockedHostnames = new Set([
+    'localhost',
+    'metadata.google.internal',
+    'instance-data',
+    'metadata.azure.com',
+    '::1',
+  ]);
+  if (blockedHostnames.has(host) || host.endsWith('.localhost')) {
+    return true;
+  }
+
+  // Loopback (127.0.0.0/8) and unspecified (0.0.0.0/8)
+  if (host.startsWith('127.') || host.startsWith('0.') || host === '0.0.0.0') {
+    return true;
+  }
+
+  // Link-Local / Cloud Metadata (169.254.0.0/16)
+  if (host.startsWith('169.254.')) {
+    return true;
+  }
+
+  // Class A Private (10.0.0.0/8)
+  if (host.startsWith('10.')) {
+    return true;
+  }
+
+  // Class B Private (172.16.0.0/12: 172.16.x.x - 172.31.x.x)
+  if (/^172\.(1[6-9]|2[0-9]|3[0-1])\./.test(host)) {
+    return true;
+  }
+
+  // Class C Private (192.168.0.0/16)
+  if (host.startsWith('192.168.')) {
+    return true;
+  }
+
+  // IPv6 Private & Link-Local (Unique Local fc00::/7, Link-Local fe80::/10)
+  if (/^f[cd][0-9a-f]{2}:/i.test(host) || /^fe80:/i.test(host)) {
+    return true;
+  }
+
+  return false;
+}
 
 export function validateBrowserUrl(targetUrl: string): URL {
   let parsed: URL;
@@ -28,13 +83,10 @@ export function validateBrowserUrl(targetUrl: string): URL {
     );
   }
 
-  const hostname = parsed.hostname.toLowerCase();
-  for (const blocked of BLOCKED_HOSTS) {
-    if (hostname === blocked || hostname.startsWith(blocked)) {
-      throw new SecurityViolationError(
-        `Navigation to internal/private network address '${hostname}' is prohibited.`
-      );
-    }
+  if (isPrivateOrRestrictedHost(parsed.hostname)) {
+    throw new SecurityViolationError(
+      `Navigation to internal/private network address '${parsed.hostname}' is prohibited.`
+    );
   }
 
   return parsed;

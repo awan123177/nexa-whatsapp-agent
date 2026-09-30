@@ -6,6 +6,8 @@ import {
   verifyMetaSignature,
   InMemoryRateLimiter,
   PermissionEngine,
+  encryptToken,
+  decryptToken,
 } from '../packages/security/src/index.js';
 import { SecurityViolationError } from '../packages/shared/src/index.js';
 import { InMemoryRepository } from '../packages/database/src/index.js';
@@ -41,6 +43,43 @@ describe('Security & Privacy Suite', () => {
       expect(redacted.credentials.accessToken).toBe('[REDACTED_SENSITIVE_FIELD]');
       expect(redacted.credentials.password).toBe('[REDACTED_SENSITIVE_FIELD]');
       expect(redacted.metadata.note).toBe('regular note');
+    });
+
+    it('should mask refresh_token, id_token, and Google OAuth ya29/1// tokens in strings', () => {
+      const jsonText = JSON.stringify({
+        refresh_token: '1//04ABCDEF1234567890xyz',
+        id_token: 'eyJhbGciOiJSUzI1NiIsImtpZCI6IjEyMyJ9.eyJuYW1lIjoiQWxpY2UifQ.abcdef123456',
+        access_token: 'ya29.a0AfH6SMCxyz12345678901234567890',
+      });
+      const redacted = redactString(jsonText);
+
+      expect(redacted).not.toContain('1//04ABCDEF1234567890xyz');
+      expect(redacted).not.toContain('ya29.a0AfH6SMCxyz12345678901234567890');
+      expect(redacted).toContain('[REDACTED_SECRET]');
+    });
+  });
+
+  describe('AES-256-GCM Token Encryption', () => {
+    const key = '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef';
+
+    it('should encrypt and decrypt tokens accurately', () => {
+      const plain = 'secret_access_token_value_xyz_123';
+      const encrypted = encryptToken(plain, key);
+      expect(encrypted).toMatch(/^aes256gcm:[0-9a-f]+:[0-9a-f]+:[0-9a-f]+$/);
+      expect(encrypted).not.toContain(plain);
+
+      const decrypted = decryptToken(encrypted, key);
+      expect(decrypted).toBe(plain);
+    });
+
+    it('should reject tampered ciphertext with authentication tag failure', () => {
+      const plain = 'super_secret_token';
+      const encrypted = encryptToken(plain, key);
+      const parts = encrypted.split(':');
+      // Tamper with ciphertext
+      const tampered = `${parts[0]}:${parts[1]}:${parts[2]}:${parts[3].slice(0, -2)}ff`;
+
+      expect(() => decryptToken(tampered, key)).toThrow();
     });
   });
 

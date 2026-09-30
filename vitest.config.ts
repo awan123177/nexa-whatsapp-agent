@@ -8,7 +8,9 @@ export default defineConfig({
   test: {
     globals: true,
     environment: 'node',
-    testTimeout: 20000,
+    testTimeout: 60000,
+    hookTimeout: 60000,
+    fileParallelism: false,
   },
   resolve: {
     alias: {

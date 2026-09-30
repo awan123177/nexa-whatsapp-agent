@@ -1,0 +1,64 @@
+services:
+  - type: web
+    name: nexa-api
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: starter
+    region: oregon
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: HOST
+        value: 0.0.0.0
+      - key: PORT
+        value: 10000
+      - key: LOG_LEVEL
+        value: info
+
+      # Gemini AI Provider
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: GEMINI_MODEL
+        value: gemini-2.5-flash
+
+      # Meta WhatsApp Cloud API
+      - key: WHATSAPP_ACCESS_TOKEN
+        sync: false
+      - key: WHATSAPP_PHONE_NUMBER_ID
+        sync: false
+      - key: WHATSAPP_BUSINESS_ACCOUNT_ID
+        sync: false
+      - key: WHATSAPP_VERIFY_TOKEN
+        sync: false
+      - key: WHATSAPP_APP_SECRET
+        sync: false
+
+      # Supabase PostgreSQL Database
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_ANON_KEY
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+
+      # Google OAuth 2.0 (Gmail Integration)
+      - key: GOOGLE_CLIENT_ID
+        sync: false
+      - key: GOOGLE_CLIENT_SECRET
+        sync: false
+      - key: GOOGLE_REDIRECT_URI
+        sync: false
+
+      # Security & Credential Encryption (AES-256)
+      - key: ENCRYPTION_KEY
+        sync: false
+
+      # Runtime Limits
+      - key: RATE_LIMIT_MAX_REQUESTS_PER_MINUTE
+        value: "60"
+      - key: MAX_AGENT_STEPS
+        value: "10"
+      - key: APPROVAL_TIMEOUT_MINUTES
+        value: "60"

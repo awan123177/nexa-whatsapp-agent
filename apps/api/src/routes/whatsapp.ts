@@ -94,6 +94,7 @@ export function registerWhatsAppRoutes(
             channel: 'whatsapp',
             whatsappMessageId: msg.whatsappMessageId,
             interactiveButtonId: msg.interactiveSelection?.id,
+            whatsappClient: whatsapp,
           });
 
           // Send response back to user

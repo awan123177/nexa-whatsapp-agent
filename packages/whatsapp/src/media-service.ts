@@ -10,6 +10,7 @@ export interface DownloadedMedia {
 export interface IMediaService {
   downloadMedia(mediaId: string): Promise<DownloadedMedia>;
   transcribeAudio(media: DownloadedMedia): Promise<string>;
+  uploadMedia(buffer: Buffer, mimeType: string, filename: string, phoneNumberId?: string): Promise<{ mediaId: string }>;
 }
 
 export class WhatsAppMediaService implements IMediaService {
@@ -61,6 +62,51 @@ export class WhatsAppMediaService implements IMediaService {
       buffer,
       fileSizeBytes: buffer.length,
     };
+  }
+
+  async uploadMedia(
+    buffer: Buffer,
+    mimeType: string,
+    filename: string,
+    phoneNumberId?: string
+  ): Promise<{ mediaId: string }> {
+    if (!this.accessToken) {
+      throw new NexaError('Cannot upload WhatsApp media: WHATSAPP_ACCESS_TOKEN not configured.', {
+        code: 'MISSING_CREDENTIALS',
+        statusCode: 500,
+      });
+    }
+
+    if (!phoneNumberId) {
+      throw new NexaError('Cannot upload WhatsApp media: phoneNumberId is required.', {
+        code: 'MISSING_PHONE_NUMBER_ID',
+        statusCode: 400,
+      });
+    }
+
+    const url = `https://graph.facebook.com/v21.0/${phoneNumberId}/media`;
+    const formData = new FormData();
+    formData.append('messaging_product', 'whatsapp');
+    formData.append('file', new Blob([new Uint8Array(buffer)], { type: mimeType }), filename);
+    formData.append('type', mimeType);
+
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${this.accessToken}`,
+      },
+      body: formData,
+    });
+
+    const data = (await res.json()) as any;
+    if (!res.ok) {
+      throw new NexaError(`Failed to upload media to WhatsApp: ${JSON.stringify(data)}`, {
+        code: 'MEDIA_UPLOAD_FAILED',
+        statusCode: res.status,
+      });
+    }
+
+    return { mediaId: data.id };
   }
 
   async transcribeAudio(_media: DownloadedMedia): Promise<string> {
