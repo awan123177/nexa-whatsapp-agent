@@ -1,0 +1,31 @@
+{
+  "name": "@nexa/api",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "./dist/server.js",
+  "scripts": {
+    "build": "tsc",
+    "clean": "rimraf dist",
+    "dev": "tsx watch src/server.ts",
+    "start": "node dist/server.js"
+  },
+  "dependencies": {
+    "@fastify/cors": "^10.0.2",
+    "fastify-raw-body": "^6.0.1",
+    "@nexa/shared": "workspace:*",
+    "@nexa/security": "workspace:*",
+    "@nexa/database": "workspace:*",
+    "@nexa/browser": "workspace:*",
+    "@nexa/tools": "workspace:*",
+    "@nexa/ai": "workspace:*",
+    "@nexa/whatsapp": "workspace:*",
+    "@nexa/agent": "workspace:*",
+    "dotenv": "^16.4.7",
+    "fastify": "^5.2.1"
+  },
+  "devDependencies": {
+    "tsx": "^4.19.3",
+    "typescript": "^5.7.3"
+  }
+}
