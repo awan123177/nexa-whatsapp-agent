@@ -682,13 +682,13 @@ describe('GeminiProvider Reliability & Transient Error Retry Suite', () => {
       await provider.generateResponse([{ role: 'user', content: 'hello secret prompt' }]);
 
       const loggedMessages = logSpy.mock.calls.map((c) => c[0]);
-      expect(loggedMessages.some((m) => m === '[Gemini] attempt=1 model=gemini-3.8-flash')).toBe(true);
+      expect(loggedMessages.some((m) => m === '[Gemini] attempt=1 model=gemini-3.7-flash')).toBe(true);
       expect(
         loggedMessages.some(
           (m) => typeof m === 'string' && m.startsWith('[Gemini] transient_error status=503 retry_in_ms=')
         )
       ).toBe(true);
-      expect(loggedMessages.some((m) => m === '[Gemini] attempt=2 model=gemini-3.8-flash')).toBe(true);
+      expect(loggedMessages.some((m) => m === '[Gemini] attempt=2 model=gemini-3.7-flash')).toBe(true);
       expect(loggedMessages.some((m) => m === '[Gemini] success')).toBe(true);
 
       // Verify prompt content is NOT logged
@@ -764,10 +764,10 @@ describe('GeminiProvider Reliability & Transient Error Retry Suite', () => {
   // =========================================================================
   // 9. Model configuration (gemini-3.8-flash default & configurable)
   // =========================================================================
-  describe('Configurable Model & gemini-3.8-flash Default', () => {
-    it('should default to gemini-3.8-flash', () => {
+  describe('Configurable Model & gemini-3.7-flash Default', () => {
+    it('should default to gemini-3.7-flash', () => {
       const provider = new GeminiProvider({ apiKey: dummyApiKey });
-      expect(provider.getDefaultModel()).toBe('gemini-3.8-flash');
+      expect(provider.getDefaultModel()).toBe('gemini-3.7-flash');
     });
 
     it('should respect custom defaultModel in constructor', () => {
@@ -881,6 +881,7 @@ describe('GeminiProvider Reliability & Transient Error Retry Suite', () => {
 
       const provider = new GeminiProvider({
         apiKey: dummyApiKey,
+        defaultModel: 'gemini-3.8-flash',
         fallbackModel: '', // isolate primary model
         primaryMaxRetries: 0,
         requestTimeoutMs: 50,
@@ -1288,5 +1289,176 @@ describe('GeminiProvider Reliability & Transient Error Retry Suite', () => {
       expect(capturedContents[2]).toEqual({ role: 'user', parts: [{ text: 'Second user message' }] });
     });
   });
+
+  // =========================================================================
+  // 13. Gemini SDK Deadline & Fallback Latency Suite (Minimum 10s Deadline)
+  // =========================================================================
+  describe('Gemini SDK Deadline & Fallback Latency Suite (Minimum 10s Deadline)', () => {
+    it('A: SDK deadline is never below 10s even when options specify a shorter timeout', async () => {
+      let capturedHttpOptions: any = null;
+      const mockGenerate = vi.fn().mockImplementation(async (params) => {
+        capturedHttpOptions = params.config?.httpOptions;
+        return { text: 'ok' };
+      });
+
+      const provider = new GeminiProvider({
+        apiKey: dummyApiKey,
+        generateContentFn: mockGenerate,
+      });
+
+      await provider.generateResponse([{ role: 'user', content: 'test' }], {
+        requestTimeoutMs: 1000, // 1s requested in options
+      });
+
+      expect(capturedHttpOptions).toBeDefined();
+      expect(capturedHttpOptions.timeout).toBeGreaterThanOrEqual(10_000);
+    });
+
+    it('B: primary timeout -> retry (primary attempt 1 times out, attempts fast retry)', async () => {
+      let primaryAttempts = 0;
+      const mockGenerate = vi.fn().mockImplementation(async (params) => {
+        if (params.model === 'gemini-3.7-flash') {
+          primaryAttempts++;
+          if (primaryAttempts === 1) {
+            // Timeout on attempt 1
+            return new Promise((resolve) => setTimeout(() => resolve({ text: 'late' }), 2000));
+          }
+          return { text: 'Primary succeeded on retry!' };
+        }
+        return { text: 'Fallback' };
+      });
+
+      const provider = new GeminiProvider({
+        apiKey: dummyApiKey,
+        defaultModel: 'gemini-3.7-flash',
+        fallbackModel: 'gemini-3.8-flash',
+        primaryMaxRetries: 1,
+        requestTimeoutMs: 50,
+        generateContentFn: mockGenerate,
+        sleepFn: async () => {},
+      });
+
+      const res = await provider.generateResponse([{ role: 'user', content: 'test' }]);
+      expect(res.text).toBe('Primary succeeded on retry!');
+      expect(primaryAttempts).toBe(2);
+    });
+
+    it('C: second primary timeout -> switches immediately to fallback model', async () => {
+      let primaryAttempts = 0;
+      let fallbackAttempts = 0;
+      const mockGenerate = vi.fn().mockImplementation(async (params) => {
+        if (params.model === 'gemini-3.7-flash') {
+          primaryAttempts++;
+          return new Promise((resolve) => setTimeout(() => resolve({ text: 'late' }), 2000));
+        }
+        if (params.model === 'gemini-3.8-flash') {
+          fallbackAttempts++;
+          return { text: 'Fallback succeeded!' };
+        }
+        return { text: 'Other' };
+      });
+
+      const provider = new GeminiProvider({
+        apiKey: dummyApiKey,
+        defaultModel: 'gemini-3.7-flash',
+        fallbackModel: 'gemini-3.8-flash',
+        primaryMaxRetries: 1,
+        requestTimeoutMs: 50,
+        generateContentFn: mockGenerate,
+        sleepFn: async () => {},
+      });
+
+      const res = await provider.generateResponse([{ role: 'user', content: 'test' }]);
+      expect(res.text).toBe('Fallback succeeded!');
+      expect(primaryAttempts).toBe(2);
+      expect(fallbackAttempts).toBe(1);
+    });
+
+    it('D: fallback uses valid >=10s SDK deadline', async () => {
+      let fallbackHttpOptions: any = null;
+      const mockGenerate = vi.fn().mockImplementation(async (params) => {
+        if (params.model === 'gemini-3.7-flash') {
+          return new Promise((resolve) => setTimeout(() => resolve({ text: 'late' }), 2000));
+        }
+        fallbackHttpOptions = params.config?.httpOptions;
+        return { text: 'Fallback OK' };
+      });
+
+      const provider = new GeminiProvider({
+        apiKey: dummyApiKey,
+        defaultModel: 'gemini-3.7-flash',
+        fallbackModel: 'gemini-3.8-flash',
+        primaryMaxRetries: 0,
+        requestTimeoutMs: 50,
+        generateContentFn: mockGenerate,
+        sleepFn: async () => {},
+      });
+
+      await provider.generateResponse([{ role: 'user', content: 'test' }]);
+      expect(fallbackHttpOptions).toBeDefined();
+      expect(fallbackHttpOptions.timeout).toBeGreaterThanOrEqual(10_000);
+    });
+
+    it('E: fallback can successfully return a response after primary failures', async () => {
+      const mockGenerate = vi.fn().mockImplementation(async (params) => {
+        if (params.model === 'gemini-3.7-flash') {
+          const err: any = new Error('503 UNAVAILABLE');
+          err.status = 503;
+          throw err;
+        }
+        return { text: 'Fallback model answered properly' };
+      });
+
+      const provider = new GeminiProvider({
+        apiKey: dummyApiKey,
+        defaultModel: 'gemini-3.7-flash',
+        fallbackModel: 'gemini-3.8-flash',
+        primaryMaxRetries: 1,
+        generateContentFn: mockGenerate,
+        sleepFn: async () => {},
+      });
+
+      const res = await provider.generateResponse([{ role: 'user', content: 'hello' }]);
+      expect(res.text).toBe('Fallback model answered properly');
+    });
+
+    it('F: exact previous 400 "Manually set deadline 5s is too short" is prevented', async () => {
+      // Recreate the exact Google GenAI backend check:
+      // Any request with httpOptions.timeout < 10000 throws:
+      // HTTP 400 INVALID_ARGUMENT: Manually set deadline 5s is too short. Minimum allowed deadline is 10s.
+      const mockRealGeminiSdk = vi.fn().mockImplementation(async (params) => {
+        const timeout = params.config?.httpOptions?.timeout;
+        if (typeof timeout === 'number' && timeout < 10_000) {
+          const err: any = new Error(
+            `HTTP 400 INVALID_ARGUMENT: Manually set deadline ${Math.round(timeout / 1000)}s is too short. Minimum allowed deadline is 10s.`
+          );
+          err.status = 400;
+          throw err;
+        }
+
+        if (params.model === 'gemini-3.7-flash') {
+          // Hangs and times out
+          return new Promise((resolve) => setTimeout(() => resolve({ text: 'late' }), 2000));
+        }
+
+        return { text: 'Fallback succeeded without 400 error!' };
+      });
+
+      const provider = new GeminiProvider({
+        apiKey: dummyApiKey,
+        defaultModel: 'gemini-3.7-flash',
+        fallbackModel: 'gemini-3.8-flash',
+        primaryMaxRetries: 1, // 2 primary attempts
+        requestTimeoutMs: 50,
+        generateContentFn: mockRealGeminiSdk,
+        sleepFn: async () => {},
+      });
+
+      // When primary times out twice and switches to fallback, fallback MUST NOT fail with 400:
+      const res = await provider.generateResponse([{ role: 'user', content: 'test message' }]);
+      expect(res.text).toBe('Fallback succeeded without 400 error!');
+    });
+  });
 });
+
 

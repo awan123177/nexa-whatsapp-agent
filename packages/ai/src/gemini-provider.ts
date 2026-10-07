@@ -378,8 +378,8 @@ export class GeminiProvider implements AIProvider {
       });
     }
     this.client = new GoogleGenAI({ apiKey: options.apiKey });
-    this.defaultModel = options.defaultModel || 'gemini-3.8-flash';
-    this.fallbackModel = options.fallbackModel || 'gemini-3.7-flash';
+    this.defaultModel = options.defaultModel || 'gemini-3.7-flash';
+    this.fallbackModel = options.fallbackModel || 'gemini-3.8-flash';
     this.defaultThinkingLevel = options.defaultThinkingLevel || 'low';
     this.primaryMaxRetries =
       options.primaryMaxRetries ?? (options.maxRetries !== undefined ? options.maxRetries : 1);
@@ -484,8 +484,15 @@ export class GeminiProvider implements AIProvider {
         attempt++;
 
         const elapsedOverall = Date.now() - overallStartTime;
-        const remainingOverallMs = overallDeadlineMs - elapsedOverall;
-        if (remainingOverallMs <= 0) {
+        // Overall deadline check:
+        // When fallback model switches (mIdx > 0), ensure it has a full attempt window
+        // rather than being cut off prematurely by previous primary attempts.
+        const effectiveDeadlineMs =
+          mIdx > 0
+            ? Math.max(overallDeadlineMs, elapsedOverall + requestTimeoutMs)
+            : overallDeadlineMs;
+
+        if (elapsedOverall >= effectiveDeadlineMs) {
           const deadlineErr: any = new Error(
             `Overall AI request deadline of ${overallDeadlineMs}ms exceeded.`
           );
@@ -496,8 +503,14 @@ export class GeminiProvider implements AIProvider {
           break;
         }
 
-        const currentTimeoutMs = Math.min(requestTimeoutMs, Math.max(50, remainingOverallMs));
+        // Application hard timeout: per-request timeout (default 10,000ms)
+        const currentTimeoutMs = requestTimeoutMs;
 
+        // SDK transport deadline: MUST be >= 10,000ms. Never 5 seconds!
+        const sdkDeadlineMs = Math.max(10_000, currentTimeoutMs);
+
+        console.log(`[Gemini] sdk_deadline_ms=${sdkDeadlineMs}`);
+        console.log(`[Gemini] timeout_ms=${currentTimeoutMs}`);
         console.log(`[Gemini] attempt=${attempt} model=${currentModel}`);
         console.log(`[Gemini] request_start model=${currentModel}`);
         const callStartTime = Date.now();
@@ -525,7 +538,7 @@ export class GeminiProvider implements AIProvider {
           config: {
             abortSignal: abortController.signal,
             httpOptions: {
-              timeout: currentTimeoutMs,
+              timeout: sdkDeadlineMs, // ALWAYS >= 10,000ms! Never 5s!
             },
             systemInstruction: options.systemInstruction || undefined,
             temperature: options.temperature ?? 0.2,
@@ -546,6 +559,7 @@ export class GeminiProvider implements AIProvider {
             : this.client.models.generateContent(generateParams);
 
           const response = await Promise.race([sdkPromise, timeoutPromise]);
+          if (timeoutTimer) clearTimeout(timeoutTimer);
 
           const latencyMs = Date.now() - callStartTime;
           console.log(`[Gemini] success model=${currentModel} latency_ms=${latencyMs}`);
@@ -619,6 +633,7 @@ export class GeminiProvider implements AIProvider {
             rawModelParts: candidateParts.length > 0 ? JSON.parse(JSON.stringify(candidateParts)) : undefined,
           };
         } catch (error: any) {
+          if (timeoutTimer) clearTimeout(timeoutTimer);
           lastError = error;
 
           const isTimeout =
