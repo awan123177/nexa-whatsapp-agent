@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { buildApp } from '../apps/api/src/app.js';
 import { InMemoryRepository } from '../packages/database/src/index.js';
 import { MockAIProvider } from '../packages/ai/src/mock-provider.js';
@@ -7,6 +7,7 @@ import { WhatsAppGateway } from '../packages/whatsapp/src/gateway.js';
 
 describe('Fastify REST & Webhook API Suite', () => {
   let app: ReturnType<typeof buildApp>;
+  let whatsapp: WhatsAppGateway;
   const verifyToken = 'test_verify_token_123';
 
   beforeEach(() => {
@@ -15,7 +16,7 @@ describe('Fastify REST & Webhook API Suite', () => {
       text: `Echo: ${messages[messages.length - 1]?.content}`,
     }));
     const toolRegistry = createDefaultToolRegistry({ db });
-    const whatsapp = new WhatsAppGateway({ verifyToken });
+    whatsapp = new WhatsAppGateway({ verifyToken });
 
     app = buildApp({
       db,
@@ -119,5 +120,133 @@ describe('Fastify REST & Webhook API Suite', () => {
     const body = JSON.parse(response.body);
     expect(body.replyText).toContain('Echo: Can you assist me?');
     expect(body.conversationId).toBeDefined();
+  });
+
+  it('duplicate webhook event does not send duplicate reply', async () => {
+    const sendSpy = vi.spyOn(whatsapp, 'sendText');
+
+    const samplePayload = {
+      object: 'whatsapp_business_account',
+      entry: [
+        {
+          id: 'WABA_1',
+          changes: [
+            {
+              field: 'messages',
+              value: {
+                messaging_product: 'whatsapp',
+                metadata: {
+                  phone_number_id: 'PHONE_1',
+                  display_phone_number: '15550001111',
+                },
+                contacts: [{ profile: { name: 'Alice' }, wa_id: '15551234567' }],
+                messages: [
+                  {
+                    from: '15551234567',
+                    id: 'wamid.test_duplicate_wamid',
+                    timestamp: '1740000000',
+                    type: 'text',
+                    text: { body: 'Hello deduplication test' },
+                  },
+                ],
+              },
+            },
+          ],
+        },
+      ],
+    };
+
+    // First webhook delivery
+    const res1 = await app.inject({
+      method: 'POST',
+      url: '/webhook/whatsapp',
+      payload: samplePayload,
+    });
+    expect(res1.statusCode).toBe(200);
+
+    // Allow async worker to complete
+    await new Promise((r) => setTimeout(r, 60));
+
+    // Second webhook delivery with the exact same wamid
+    const res2 = await app.inject({
+      method: 'POST',
+      url: '/webhook/whatsapp',
+      payload: samplePayload,
+    });
+    expect(res2.statusCode).toBe(200);
+
+    await new Promise((r) => setTimeout(r, 60));
+
+    // Verify WhatsApp reply was sent ONLY once
+    expect(sendSpy).toHaveBeenCalledTimes(1);
+    expect(sendSpy).toHaveBeenCalledWith(
+      '15551234567',
+      expect.stringContaining('Echo: Hello deduplication test')
+    );
+
+    sendSpy.mockRestore();
+  });
+
+  it('concurrent duplicate webhook events do not send duplicate reply', async () => {
+    const sendSpy = vi.spyOn(whatsapp, 'sendText');
+
+    const samplePayload = {
+      object: 'whatsapp_business_account',
+      entry: [
+        {
+          id: 'WABA_1',
+          changes: [
+            {
+              field: 'messages',
+              value: {
+                messaging_product: 'whatsapp',
+                metadata: {
+                  phone_number_id: 'PHONE_1',
+                  display_phone_number: '15550001111',
+                },
+                contacts: [{ profile: { name: 'Bob' }, wa_id: '15559876543' }],
+                messages: [
+                  {
+                    from: '15559876543',
+                    id: 'wamid.test_concurrent_dup_wamid',
+                    timestamp: '1740000000',
+                    type: 'text',
+                    text: { body: 'Concurrent test message' },
+                  },
+                ],
+              },
+            },
+          ],
+        },
+      ],
+    };
+
+    // Send two webhook requests concurrently
+    const [res1, res2] = await Promise.all([
+      app.inject({
+        method: 'POST',
+        url: '/webhook/whatsapp',
+        payload: samplePayload,
+      }),
+      app.inject({
+        method: 'POST',
+        url: '/webhook/whatsapp',
+        payload: samplePayload,
+      }),
+    ]);
+
+    expect(res1.statusCode).toBe(200);
+    expect(res2.statusCode).toBe(200);
+
+    await new Promise((r) => setTimeout(r, 60));
+
+    // Exactly one reply sent
+    expect(sendSpy).toHaveBeenCalledTimes(1);
+    expect(sendSpy).toHaveBeenCalledWith(
+      '15559876543',
+      expect.stringContaining('Echo: Concurrent test message')
+    );
+
+    sendSpy.mockRestore();
   });
 });

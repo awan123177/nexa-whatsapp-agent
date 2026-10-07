@@ -16,7 +16,7 @@ const PATTERNS = [
   { regex: /Bearer\s+([A-Za-z0-9_\-\.]{20,})/gi, replacement: 'Bearer [REDACTED_TOKEN]' },
   { regex: /ey[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}/g, replacement: '[REDACTED_JWT]' },
   // Common API key patterns
-  { regex: /(AIza[0-9A-Za-z-_]{35})/g, replacement: '[REDACTED_GEMINI_KEY]' }, // Google API key
+  { regex: /\b(AIza[0-9A-Za-z-_]{30,45})\b/g, replacement: '[REDACTED_GEMINI_KEY]' }, // Google API key
   { regex: /(sk-[a-zA-Z0-9]{20,})/g, replacement: '[REDACTED_API_KEY]' },
   // Passwords in query, JSON, or sentences
   { regex: /\b(password|passwd|pin)\b(?:\s+is|\s*[:=])\s*([^\s,;&]+)/gi, replacement: '$1: [REDACTED_PASSWORD]' },

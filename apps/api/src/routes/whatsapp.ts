@@ -2,6 +2,7 @@ import { FastifyInstance } from 'fastify';
 import { AgentOrchestrator } from '@nexa/agent';
 import { WhatsAppGateway } from '@nexa/whatsapp';
 import { InMemoryRateLimiter } from '@nexa/security';
+import { NexaError } from '@nexa/shared';
 
 export function registerWhatsAppRoutes(
   app: FastifyInstance,
@@ -9,9 +10,23 @@ export function registerWhatsAppRoutes(
     orchestrator: AgentOrchestrator;
     whatsapp: WhatsAppGateway;
     rateLimiter: InMemoryRateLimiter;
+    inFlightMessageIds?: Set<string>;
+    completedMessageIds?: Map<string, { timestamp: number }>;
   }
 ) {
   const { orchestrator, whatsapp, rateLimiter } = options;
+  const inFlightMessageIds = options.inFlightMessageIds || new Set<string>();
+  const completedMessageIds = options.completedMessageIds || new Map<string, { timestamp: number }>();
+  const IDEMPOTENCY_TTL_MS = 15 * 60 * 1000; // 15 minutes TTL
+
+  function cleanExpiredIdempotencyEntries() {
+    const now = Date.now();
+    for (const [id, record] of completedMessageIds.entries()) {
+      if (now - record.timestamp > IDEMPOTENCY_TTL_MS) {
+        completedMessageIds.delete(id);
+      }
+    }
+  }
 
   /**
    * GET /webhook/whatsapp
@@ -61,8 +76,27 @@ export function registerWhatsAppRoutes(
     // 3. Immediately respond 200 OK to Meta to prevent retries/timeouts
     reply.status(200).send({ status: 'received' });
 
-    // 4. Asynchronously process incoming messages via Agent Orchestrator
+    // 4. Asynchronously process incoming messages via Agent Orchestrator with idempotency guard
     for (const msg of incomingMessages) {
+      const messageId = msg.whatsappMessageId;
+
+      // Idempotency check: Ignore duplicate in-flight or already completed messages
+      if (messageId) {
+        cleanExpiredIdempotencyEntries();
+
+        if (inFlightMessageIds.has(messageId)) {
+          console.log(`[WhatsApp Webhook] Duplicate in-flight message ${messageId} ignored.`);
+          continue;
+        }
+
+        if (completedMessageIds.has(messageId)) {
+          console.log(`[WhatsApp Webhook] Duplicate already-completed message ${messageId} ignored.`);
+          continue;
+        }
+
+        inFlightMessageIds.add(messageId);
+      }
+
       (async () => {
         try {
           // Check rate limit per phone number
@@ -109,12 +143,26 @@ export function registerWhatsAppRoutes(
             // Send standard response text
             await whatsapp.sendText(msg.senderPhoneNumber, result.replyText);
           }
+
+          // Mark message as completed in idempotency tracker
+          if (messageId) {
+            completedMessageIds.set(messageId, { timestamp: Date.now() });
+          }
         } catch (err: any) {
           console.error('[WhatsApp Worker Error]', err);
-          await whatsapp.sendText(
-            msg.senderPhoneNumber,
-            'I encountered an unexpected issue while processing your request. Please try again in a moment.'
-          );
+          const userFacingMessage =
+            err instanceof NexaError && err.userFacingMessage
+              ? err.userFacingMessage
+              : 'I encountered an unexpected issue while processing your request. Please try again in a moment.';
+          await whatsapp.sendText(msg.senderPhoneNumber, userFacingMessage);
+
+          if (messageId) {
+            completedMessageIds.set(messageId, { timestamp: Date.now() });
+          }
+        } finally {
+          if (messageId) {
+            inFlightMessageIds.delete(messageId);
+          }
         }
       })().catch((e) => console.error('[WhatsApp Unhandled Async Error]', e));
     }

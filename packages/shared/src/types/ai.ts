@@ -33,6 +33,7 @@ export interface AIToolDeclaration {
 
 export interface AICompletionOptions {
   model?: string;
+  fallbackModel?: string;
   temperature?: number;
   maxTokens?: number;
   systemInstruction?: string;

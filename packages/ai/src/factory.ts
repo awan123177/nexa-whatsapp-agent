@@ -5,6 +5,7 @@ import { MockAIProvider } from './mock-provider.js';
 export function createAIProvider(options: {
   apiKey?: string;
   model?: string;
+  fallbackModel?: string;
   forceMock?: boolean;
 }): AIProvider {
   if (options.forceMock || !options.apiKey) {
@@ -19,5 +20,6 @@ export function createAIProvider(options: {
   return new GeminiProvider({
     apiKey: options.apiKey,
     defaultModel: options.model,
+    fallbackModel: options.fallbackModel,
   });
 }

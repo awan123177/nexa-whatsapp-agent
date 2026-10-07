@@ -25,6 +25,7 @@ async function bootstrap() {
   const aiProvider = createAIProvider({
     apiKey: config.GEMINI_API_KEY,
     model: config.GEMINI_MODEL,
+    fallbackModel: config.GEMINI_FALLBACK_MODEL,
   });
   console.log(`[NEXA] AI Provider initialized: ${aiProvider.name}`);
 

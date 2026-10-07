@@ -21,7 +21,9 @@ services:
       - key: GEMINI_API_KEY
         sync: false
       - key: GEMINI_MODEL
-        value: gemini-2.5-flash
+        value: gemini-3.8-flash
+      - key: GEMINI_FALLBACK_MODEL
+        value: gemini-3.7-flash
 
       # Meta WhatsApp Cloud API
       - key: WHATSAPP_ACCESS_TOKEN
