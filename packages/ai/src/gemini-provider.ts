@@ -439,8 +439,11 @@ export class GeminiProvider implements AIProvider {
       },
     }));
 
-    // Convert Nexa messages to Gemini contents format
-    const rawContents = this.formatMessagesForGemini(messages);
+    // Convert Nexa messages to Gemini contents format (or use rawHistory if provided for active multi-step request)
+    const rawContents =
+      options.rawHistory && options.rawHistory.length > 0
+        ? JSON.parse(JSON.stringify(options.rawHistory))
+        : this.formatMessagesForGemini(messages);
 
     // Extract fallback user text from messages or options for safe conversation repair
     const lastUserMsg = [...messages].reverse().find((m) => m.role === 'user');
@@ -455,6 +458,17 @@ export class GeminiProvider implements AIProvider {
     console.log(`[Gemini] conversation_roles=${conversationRoles}`);
     console.log(`[Gemini] final_turn_role=${finalTurnRole}`);
     console.log(`[Gemini] history_count=${contents.length}`);
+
+    // Sanitized logging for any tool responses in outgoing contents
+    for (const turn of contents) {
+      if (turn.role === 'user' && Array.isArray(turn.parts)) {
+        for (const p of turn.parts) {
+          if (p.functionResponse && p.functionResponse.name) {
+            console.log(`[Gemini] tool_response name=${p.functionResponse.name}`);
+          }
+        }
+      }
+    }
 
     let lastError: any = null;
 
@@ -537,28 +551,72 @@ export class GeminiProvider implements AIProvider {
           console.log(`[Gemini] success model=${currentModel} latency_ms=${latencyMs}`);
           console.log('[Gemini] success');
 
+          const candidate = (response as any).candidates?.[0];
+          const candidateContent = candidate?.content;
+          const candidateParts: any[] = candidateContent?.parts || [];
+
+          // Extract text safely without calling response.text if non-text functionCall parts exist
+          let extractedText = '';
+          if (candidateParts.length > 0) {
+            const textSegments = candidateParts
+              .filter((p: any) => typeof p.text === 'string' && !p.thought)
+              .map((p: any) => p.text);
+            if (textSegments.length > 0) {
+              extractedText = textSegments.join('');
+            }
+          }
+          if (!extractedText) {
+            try {
+              extractedText = response.text || '';
+            } catch {
+              extractedText = '';
+            }
+          }
+
           const toolCalls: AIToolCall[] = [];
           const functionCalls = response.functionCalls;
 
-          if (functionCalls && Array.isArray(functionCalls)) {
+          if (functionCalls && Array.isArray(functionCalls) && functionCalls.length > 0) {
             for (const call of functionCalls) {
+              const tcName = call.name || '';
+              // Match corresponding part in candidateParts
+              const matchingPart = candidateParts.find(
+                (p: any) => p.functionCall && p.functionCall.name === tcName
+              );
+
+              const thoughtSig =
+                matchingPart?.thoughtSignature ||
+                matchingPart?.thought_signature ||
+                (matchingPart?.functionCall as any)?.thoughtSignature ||
+                (matchingPart?.functionCall as any)?.thought_signature ||
+                (call as any).thoughtSignature ||
+                (call as any).thought_signature;
+
+              const hasSig = Boolean(thoughtSig);
+              console.log(`[Gemini] tool_call name=${tcName}`);
+              console.log(`[Gemini] tool_call_signature_present=${hasSig}`);
+
               toolCalls.push({
-                id: (call as any).id || `call_${Math.random().toString(36).substring(2, 9)}`,
-                name: call.name || '',
+                id: (call as any).id || matchingPart?.functionCall?.id || `call_${Math.random().toString(36).substring(2, 9)}`,
+                name: tcName,
                 arguments: (call.args as Record<string, unknown>) || {},
+                thoughtSignature: thoughtSig,
+                rawPart: matchingPart ? JSON.parse(JSON.stringify(matchingPart)) : undefined,
               });
             }
           }
 
           return {
-            text: response.text || '',
+            text: extractedText,
             toolCalls: toolCalls.length > 0 ? toolCalls : undefined,
-            finishReason: (response as any).candidates?.[0]?.finishReason,
+            finishReason: candidate?.finishReason,
             usage: {
               promptTokens: (response as any).usageMetadata?.promptTokenCount || 0,
               completionTokens: (response as any).usageMetadata?.candidatesTokenCount || 0,
               totalTokens: (response as any).usageMetadata?.totalTokenCount || 0,
             },
+            rawModelContent: candidateContent ? JSON.parse(JSON.stringify(candidateContent)) : undefined,
+            rawModelParts: candidateParts.length > 0 ? JSON.parse(JSON.stringify(candidateParts)) : undefined,
           };
         } catch (error: any) {
           lastError = error;
@@ -732,28 +790,51 @@ export class GeminiProvider implements AIProvider {
           parts: [{ text: msg.content }],
         });
       } else if (msg.role === 'assistant') {
-        const parts: any[] = [];
-        if (msg.content) {
-          parts.push({ text: msg.content });
-        }
-        if (msg.toolCalls && msg.toolCalls.length > 0) {
-          for (const tc of msg.toolCalls) {
-            parts.push({
-              functionCall: {
-                name: tc.name,
-                args: tc.arguments,
-              },
-            });
+        // Priority 1: Preserve original raw model content object from SDK
+        if (msg.rawModelContent) {
+          formatted.push(JSON.parse(JSON.stringify(msg.rawModelContent)));
+        } else if (msg.rawModelParts && msg.rawModelParts.length > 0) {
+          // Priority 2: Preserve original raw model parts array from SDK
+          formatted.push({
+            role: 'model',
+            parts: JSON.parse(JSON.stringify(msg.rawModelParts)),
+          });
+        } else {
+          // Priority 3: Reconstruct parts while preserving thoughtSignature and rawPart
+          const parts: any[] = [];
+          if (msg.content) {
+            parts.push({ text: msg.content });
           }
+          if (msg.toolCalls && msg.toolCalls.length > 0) {
+            for (const tc of msg.toolCalls) {
+              if (tc.rawPart) {
+                parts.push(JSON.parse(JSON.stringify(tc.rawPart)));
+              } else {
+                const functionCallObj: any = {
+                  name: tc.name,
+                  args: tc.arguments,
+                };
+                if (tc.thoughtSignature) {
+                  functionCallObj.thoughtSignature = tc.thoughtSignature;
+                }
+                const partObj: any = { functionCall: functionCallObj };
+                if (tc.thoughtSignature) {
+                  partObj.thoughtSignature = tc.thoughtSignature;
+                }
+                parts.push(partObj);
+              }
+            }
+          }
+          formatted.push({
+            role: 'model',
+            parts: parts.length > 0 ? parts : [{ text: '...' }],
+          });
         }
-        formatted.push({
-          role: 'model',
-          parts,
-        });
       } else if (msg.role === 'tool') {
         const parts: any[] = [];
         if (msg.toolResults && msg.toolResults.length > 0) {
           for (const tr of msg.toolResults) {
+            console.log(`[Gemini] tool_response name=${tr.name}`);
             parts.push({
               functionResponse: {
                 name: tr.name,
@@ -761,6 +842,7 @@ export class GeminiProvider implements AIProvider {
                   result: tr.result,
                   isError: tr.isError || false,
                 },
+                ...(tr.toolCallId ? { id: tr.toolCallId } : {}),
               },
             });
           }

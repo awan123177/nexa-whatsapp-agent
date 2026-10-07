@@ -4,6 +4,8 @@ export interface AIToolCall {
   id: string;
   name: string;
   arguments: Record<string, unknown>;
+  thoughtSignature?: string;
+  rawPart?: any;
 }
 
 export interface AIToolResult {
@@ -19,6 +21,8 @@ export interface AIMessage {
   name?: string;
   toolCalls?: AIToolCall[];
   toolResults?: AIToolResult[];
+  rawModelContent?: any;
+  rawModelParts?: any[];
 }
 
 export interface AIToolDeclaration {
@@ -44,6 +48,7 @@ export interface AICompletionOptions {
   currentUserText?: string;
   requestTimeoutMs?: number;
   overallDeadlineMs?: number;
+  rawHistory?: any[];
 }
 
 export interface AIResponse {
@@ -55,9 +60,12 @@ export interface AIResponse {
     completionTokens: number;
     totalTokens: number;
   };
+  rawModelContent?: any;
+  rawModelParts?: any[];
 }
 
 export interface AIProvider {
   name: string;
   generateResponse(messages: AIMessage[], options?: AICompletionOptions): Promise<AIResponse>;
 }
+

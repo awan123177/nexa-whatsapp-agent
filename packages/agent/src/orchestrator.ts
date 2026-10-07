@@ -228,6 +228,9 @@ export class AgentOrchestrator {
     let currentStep = 0;
     let finalReply = '';
 
+    // Active in-memory raw Gemini Content[] history for intermediate tool turns
+    let activeRawHistory: any[] | undefined = undefined;
+
     while (currentStep < this.maxSteps) {
       currentStep++;
 
@@ -240,6 +243,7 @@ export class AgentOrchestrator {
         tools: toolDeclarations,
         thinkingLevel,
         currentUserText: input.text,
+        rawHistory: activeRawHistory,
       });
 
       const stepLatency = Date.now() - stepStartTime;
@@ -256,9 +260,47 @@ export class AgentOrchestrator {
         role: 'assistant',
         content: aiResponse.text || '',
         toolCalls: aiResponse.toolCalls,
+        rawModelContent: aiResponse.rawModelContent,
+        rawModelParts: aiResponse.rawModelParts,
       });
 
+      // Maintain activeRawHistory for multi-step tool execution
+      // Initialize with preceding conversation history up to current user turn
+      if (!activeRawHistory) {
+        activeRawHistory = messages.slice(0, -1).map((m) => {
+          if (m.role === 'user') {
+            return { role: 'user', parts: [{ text: m.content }] };
+          } else if (m.role === 'assistant') {
+            if (m.rawModelContent) return JSON.parse(JSON.stringify(m.rawModelContent));
+            return { role: 'model', parts: [{ text: m.content || '...' }] };
+          }
+          return { role: 'user', parts: [{ text: m.content }] };
+        });
+      }
+
+      // Append model's exact Content object (preserving functionCall and thoughtSignature)
+      if (aiResponse.rawModelContent) {
+        activeRawHistory.push(JSON.parse(JSON.stringify(aiResponse.rawModelContent)));
+      } else if (aiResponse.rawModelParts) {
+        activeRawHistory.push({
+          role: 'model',
+          parts: JSON.parse(JSON.stringify(aiResponse.rawModelParts)),
+        });
+      } else {
+        const modelParts = aiResponse.toolCalls.map((tc) => {
+          if (tc.rawPart) return JSON.parse(JSON.stringify(tc.rawPart));
+          const fnObj: any = { name: tc.name, args: tc.arguments };
+          if (tc.thoughtSignature) fnObj.thoughtSignature = tc.thoughtSignature;
+          return {
+            functionCall: fnObj,
+            ...(tc.thoughtSignature ? { thoughtSignature: tc.thoughtSignature } : {}),
+          };
+        });
+        activeRawHistory.push({ role: 'model', parts: modelParts });
+      }
+
       const toolResultsForNextTurn: any[] = [];
+      const functionResponseParts: any[] = [];
 
       for (const tc of aiResponse.toolCalls) {
         try {
@@ -269,6 +311,17 @@ export class AgentOrchestrator {
             name: tc.name,
             result: result.data || { success: result.success },
             isError: !result.success,
+          });
+
+          functionResponseParts.push({
+            functionResponse: {
+              name: tc.name,
+              response: {
+                result: result.data || { success: result.success },
+                isError: !result.success,
+              },
+              id: tc.id,
+            },
           });
         } catch (err: any) {
           // Check if this was an intentional pause for user confirmation!
@@ -296,6 +349,14 @@ export class AgentOrchestrator {
             result: { error: err.message },
             isError: true,
           });
+
+          functionResponseParts.push({
+            functionResponse: {
+              name: tc.name,
+              response: { error: err.message },
+              id: tc.id,
+            },
+          });
         }
       }
 
@@ -304,6 +365,12 @@ export class AgentOrchestrator {
         role: 'tool',
         content: '',
         toolResults: toolResultsForNextTurn,
+      });
+
+      // Append function response turn to activeRawHistory
+      activeRawHistory.push({
+        role: 'user',
+        parts: functionResponseParts,
       });
     }
 

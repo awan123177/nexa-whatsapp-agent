@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { InMemoryRepository } from '../packages/database/src/index.js';
 import { createDefaultToolRegistry } from '../packages/tools/src/factory.js';
 import { MockAIProvider } from '../packages/ai/src/mock-provider.js';
@@ -423,4 +423,464 @@ describe('Agent Orchestrator & Loop Suite', () => {
     expect(sdkCalls[1][1]).toEqual({ role: 'model', parts: [{ text: 'Reply to Hello NEXA' }] });
     expect(sdkCalls[1][2]).toEqual({ role: 'user', parts: [{ text: 'What can you do?' }] });
   });
+
+  describe('Gemini 3 Function Calling & thoughtSignature Preservation Suite', () => {
+    it('Exact Production Failure Reproduction & Fix: preserves thoughtSignature in multi-step tool calls', async () => {
+      const db = new InMemoryRepository();
+      const toolRegistry = createDefaultToolRegistry({ db });
+      const sdkRequests: any[] = [];
+      let stepCount = 0;
+
+      const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+
+      const geminiProvider = new GeminiProvider({
+        apiKey: 'test-key',
+        generateContentFn: async (params) => {
+          sdkRequests.push(JSON.parse(JSON.stringify(params.contents)));
+          stepCount++;
+
+          // Verify that in all subsequent turns (step > 1), ANY model turn containing
+          // functionCall MUST have thoughtSignature.
+          // Exact reproduction of Google Gemini 3 HTTP 400 rejection:
+          for (const content of params.contents) {
+            if (content.role === 'model' && Array.isArray(content.parts)) {
+              for (const part of content.parts) {
+                if (part.functionCall) {
+                  const hasThoughtSignature =
+                    Boolean(part.thoughtSignature) ||
+                    Boolean(part.thought_signature) ||
+                    Boolean(part.functionCall?.thoughtSignature) ||
+                    Boolean(part.functionCall?.thought_signature);
+
+                  if (!hasThoughtSignature) {
+                    const err: any = new Error(
+                      `HTTP 400 INVALID_ARGUMENT: Function call is missing a thought_signature in functionCall parts. This is required for tools to work correctly. function default_api:${part.functionCall.name}`
+                    );
+                    err.status = 400;
+                    throw err;
+                  }
+                }
+              }
+            }
+          }
+
+          if (stepCount === 1) {
+            // First Gemini response: returns functionCall for web_search WITH thoughtSignature
+            return {
+              candidates: [
+                {
+                  content: {
+                    role: 'model',
+                    parts: [
+                      {
+                        functionCall: {
+                          name: 'web_search',
+                          args: { query: 'tokyo weather' },
+                        },
+                        thoughtSignature: 'opaque_b64_sig_web_search_step1',
+                      },
+                    ],
+                  },
+                },
+              ],
+              functionCalls: [
+                {
+                  name: 'web_search',
+                  args: { query: 'tokyo weather' },
+                },
+              ],
+            };
+          }
+
+          // Second Gemini response: final text response after tool execution
+          return {
+            candidates: [
+              {
+                content: {
+                  role: 'model',
+                  parts: [{ text: 'The weather in Tokyo is sunny and 22C.' }],
+                },
+              },
+            ],
+            text: 'The weather in Tokyo is sunny and 22C.',
+          };
+        },
+      });
+
+      const orchestrator = new AgentOrchestrator(geminiProvider, toolRegistry, db);
+
+      const result = await orchestrator.processMessage({
+        phoneNumber: '+15554443333',
+        name: 'Grace',
+        text: 'What is the weather in Tokyo?',
+        channel: 'whatsapp',
+      });
+
+      // Proof of Fix: The 400 error was not thrown; tool was executed and final reply returned
+      expect(result.replyText).toBe('The weather in Tokyo is sunny and 22C.');
+      expect(result.stepsCount).toBe(2);
+
+      // Verify Second Gemini request contents:
+      // Turn 0: user ('What is the weather in Tokyo?')
+      // Turn 1: model (web_search WITH thoughtSignature preserved!)
+      // Turn 2: user (functionResponse)
+      expect(sdkRequests).toHaveLength(2);
+      const step2Contents = sdkRequests[1];
+      expect(step2Contents).toHaveLength(3);
+
+      const modelTurn = step2Contents[1];
+      expect(modelTurn.role).toBe('model');
+      expect(modelTurn.parts[0].functionCall.name).toBe('web_search');
+      expect(modelTurn.parts[0].thoughtSignature).toBe('opaque_b64_sig_web_search_step1');
+
+      const toolRespTurn = step2Contents[2];
+      expect(toolRespTurn.role).toBe('user');
+      expect(toolRespTurn.parts[0].functionResponse.name).toBe('web_search');
+
+      // Verify sanitized logging (Requirement 16)
+      const logged = logSpy.mock.calls.map((c) => c[0]);
+      expect(logged.some((m) => m === '[Gemini] tool_call name=web_search')).toBe(true);
+      expect(logged.some((m) => m === '[Gemini] tool_call_signature_present=true')).toBe(true);
+      expect(logged.some((m) => m === '[Gemini] tool_response name=web_search')).toBe(true);
+      // Ensure raw thought signature itself is NEVER logged
+      expect(logged.some((m) => typeof m === 'string' && m.includes('opaque_b64_sig_web_search_step1'))).toBe(false);
+
+      logSpy.mockRestore();
+    });
+
+    it('Test A: functionCall signature preserved in model parts', async () => {
+      const db = new InMemoryRepository();
+      const toolRegistry = createDefaultToolRegistry({ db });
+      let capturedStep2Contents: any = null;
+
+      const geminiProvider = new GeminiProvider({
+        apiKey: 'test-key',
+        generateContentFn: async (params) => {
+          if (params.contents.length === 1) {
+            return {
+              candidates: [
+                {
+                  content: {
+                    role: 'model',
+                    parts: [
+                      {
+                        functionCall: {
+                          name: 'web_search',
+                          args: { query: 'test query' },
+                        },
+                        thoughtSignature: 'sig_test_a_123',
+                      },
+                    ],
+                  },
+                },
+              ],
+              functionCalls: [{ name: 'web_search', args: { query: 'test query' } }],
+            };
+          }
+          capturedStep2Contents = params.contents;
+          return { text: 'Done' };
+        },
+      });
+
+      const orchestrator = new AgentOrchestrator(geminiProvider, toolRegistry, db);
+      await orchestrator.processMessage({
+        phoneNumber: '+15551113333',
+        name: 'Henry',
+        text: 'Search for test query',
+        channel: 'whatsapp',
+      });
+
+      expect(capturedStep2Contents).toBeDefined();
+      expect(capturedStep2Contents[1].parts[0].thoughtSignature).toBe('sig_test_a_123');
+    });
+
+    it('Test B: sequential tool calls preserve signatures across multiple turns', async () => {
+      const db = new InMemoryRepository();
+      const toolRegistry = createDefaultToolRegistry({ db });
+      const sdkRequests: any[] = [];
+      let step = 0;
+
+      const geminiProvider = new GeminiProvider({
+        apiKey: 'test-key',
+        generateContentFn: async (params) => {
+          step++;
+          sdkRequests.push(JSON.parse(JSON.stringify(params.contents)));
+
+          // Verify all previous model turns in history have their thought signatures intact
+          for (const content of params.contents) {
+            if (content.role === 'model') {
+              for (const p of content.parts) {
+                if (p.functionCall && !p.thoughtSignature && !p.thought_signature) {
+                  throw new Error(`Missing signature for ${p.functionCall.name}`);
+                }
+              }
+            }
+          }
+
+          if (step === 1) {
+            // Step 1: call web_search
+            return {
+              candidates: [
+                {
+                  content: {
+                    role: 'model',
+                    parts: [
+                      {
+                        functionCall: { name: 'web_search', args: { query: 'first search' } },
+                        thoughtSignature: 'sig_step_1_search',
+                      },
+                    ],
+                  },
+                },
+              ],
+              functionCalls: [{ name: 'web_search', args: { query: 'first search' } }],
+            };
+          }
+
+          if (step === 2) {
+            // Step 2: call calculator
+            return {
+              candidates: [
+                {
+                  content: {
+                    role: 'model',
+                    parts: [
+                      {
+                        functionCall: { name: 'calculator', args: { expression: '10 + 5' } },
+                        thoughtSignature: 'sig_step_2_calc',
+                      },
+                    ],
+                  },
+                },
+              ],
+              functionCalls: [{ name: 'calculator', args: { expression: '10 + 5' } }],
+            };
+          }
+
+          // Step 3: final answer
+          return { text: 'All sequential tools executed successfully.' };
+        },
+      });
+
+      const orchestrator = new AgentOrchestrator(geminiProvider, toolRegistry, db);
+      const res = await orchestrator.processMessage({
+        phoneNumber: '+15552224444',
+        name: 'Ian',
+        text: 'Do two sequential tasks',
+        channel: 'whatsapp',
+      });
+
+      expect(res.replyText).toBe('All sequential tools executed successfully.');
+      expect(step).toBe(3);
+
+      // Verify Step 3 contents:
+      // Turn 0: user prompt
+      // Turn 1: model (web_search with sig_step_1_search)
+      // Turn 2: user (web_search response)
+      // Turn 3: model (calculator with sig_step_2_calc)
+      // Turn 4: user (calculator response)
+      const step3Contents = sdkRequests[2];
+      expect(step3Contents).toHaveLength(5);
+      expect(step3Contents[1].parts[0].thoughtSignature).toBe('sig_step_1_search');
+      expect(step3Contents[3].parts[0].thoughtSignature).toBe('sig_step_2_calc');
+    });
+
+    it('Test C: multiple function calls in single turn preserve correct ordering and signatures', async () => {
+      const db = new InMemoryRepository();
+      const toolRegistry = createDefaultToolRegistry({ db });
+      let capturedStep2: any = null;
+
+      const geminiProvider = new GeminiProvider({
+        apiKey: 'test-key',
+        generateContentFn: async (params) => {
+          if (params.contents.length === 1) {
+            return {
+              candidates: [
+                {
+                  content: {
+                    role: 'model',
+                    parts: [
+                      {
+                        functionCall: { name: 'web_search', args: { query: 'a' } },
+                        thoughtSignature: 'sig_parallel_1',
+                      },
+                      {
+                        functionCall: { name: 'calculator', args: { expression: '1+1' } },
+                        thoughtSignature: 'sig_parallel_2',
+                      },
+                    ],
+                  },
+                },
+              ],
+              functionCalls: [
+                { name: 'web_search', args: { query: 'a' } },
+                { name: 'calculator', args: { expression: '1+1' } },
+              ],
+            };
+          }
+
+          capturedStep2 = params.contents;
+          return { text: 'Parallel tools done' };
+        },
+      });
+
+      const orchestrator = new AgentOrchestrator(geminiProvider, toolRegistry, db);
+      await orchestrator.processMessage({
+        phoneNumber: '+15553335555',
+        name: 'Jack',
+        text: 'Do two parallel tasks',
+        channel: 'whatsapp',
+      });
+
+      expect(capturedStep2).toBeDefined();
+      const modelTurn = capturedStep2[1];
+      expect(modelTurn.parts).toHaveLength(2);
+      expect(modelTurn.parts[0].functionCall.name).toBe('web_search');
+      expect(modelTurn.parts[0].thoughtSignature).toBe('sig_parallel_1');
+      expect(modelTurn.parts[1].functionCall.name).toBe('calculator');
+      expect(modelTurn.parts[1].thoughtSignature).toBe('sig_parallel_2');
+
+      const userResponseTurn = capturedStep2[2];
+      expect(userResponseTurn.parts).toHaveLength(2);
+      expect(userResponseTurn.parts[0].functionResponse.name).toBe('web_search');
+      expect(userResponseTurn.parts[1].functionResponse.name).toBe('calculator');
+    });
+
+    it('Test D: final response after tool execution is persisted cleanly', async () => {
+      const db = new InMemoryRepository();
+      const toolRegistry = createDefaultToolRegistry({ db });
+
+      const geminiProvider = new GeminiProvider({
+        apiKey: 'test-key',
+        generateContentFn: async (params) => {
+          if (params.contents.length === 1) {
+            return {
+              candidates: [
+                {
+                  content: {
+                    role: 'model',
+                    parts: [
+                      {
+                        functionCall: { name: 'web_search', args: { query: 'final test' } },
+                        thoughtSignature: 'sig_final_1',
+                      },
+                    ],
+                  },
+                },
+              ],
+              functionCalls: [{ name: 'web_search', args: { query: 'final test' } }],
+            };
+          }
+          return { text: 'Here is the completed clean reply.' };
+        },
+      });
+
+      const orchestrator = new AgentOrchestrator(geminiProvider, toolRegistry, db);
+      const res = await orchestrator.processMessage({
+        phoneNumber: '+15554446666',
+        name: 'Kate',
+        text: 'Do final test',
+        channel: 'whatsapp',
+      });
+
+      expect(res.replyText).toBe('Here is the completed clean reply.');
+
+      // Verify DB contains only the user query and the final clean assistant text
+      const msgs = await db.getConversationMessages(res.conversationId);
+      expect(msgs).toHaveLength(2);
+      expect(msgs[0].sender_type).toBe('user');
+      expect(msgs[1].sender_type).toBe('assistant');
+      expect(msgs[1].content).toBe('Here is the completed clean reply.');
+    });
+
+    it('Test E: existing user->model->user regression continues to pass with tool history', async () => {
+      const db = new InMemoryRepository();
+      const toolRegistry = createDefaultToolRegistry({ db });
+      const sdkTurnEndRoles: string[] = [];
+
+      const geminiProvider = new GeminiProvider({
+        apiKey: 'test-key',
+        generateContentFn: async (params) => {
+          const lastTurn = params.contents[params.contents.length - 1];
+          sdkTurnEndRoles.push(lastTurn.role);
+          if (lastTurn.role !== 'user') {
+            throw new Error('Requests ending with a model turn are not supported.');
+          }
+          return { text: 'Response OK' };
+        },
+      });
+
+      const orchestrator = new AgentOrchestrator(geminiProvider, toolRegistry, db);
+
+      await orchestrator.processMessage({
+        phoneNumber: '+15555557777',
+        name: 'Leo',
+        text: 'Message 1',
+        channel: 'whatsapp',
+      });
+
+      await orchestrator.processMessage({
+        phoneNumber: '+15555557777',
+        name: 'Leo',
+        text: 'Message 2',
+        channel: 'whatsapp',
+      });
+
+      expect(sdkTurnEndRoles).toEqual(['user', 'user']);
+    });
+
+    it('Test F: no text-only reconstruction of active tool-call history', async () => {
+      const db = new InMemoryRepository();
+      const toolRegistry = createDefaultToolRegistry({ db });
+      let capturedPart: any = null;
+
+      const geminiProvider = new GeminiProvider({
+        apiKey: 'test-key',
+        generateContentFn: async (params) => {
+          if (params.contents.length === 1) {
+            return {
+              candidates: [
+                {
+                  content: {
+                    role: 'model',
+                    parts: [
+                      {
+                        thought: true,
+                        text: 'Thinking about the tool to use...',
+                        thoughtSignature: 'thought_sig_inner',
+                      },
+                      {
+                        functionCall: { name: 'web_search', args: { query: 'deep search' } },
+                        thoughtSignature: 'func_sig_inner',
+                        customMetadata: { origin: 'gemini-3' },
+                      },
+                    ],
+                  },
+                },
+              ],
+              functionCalls: [{ name: 'web_search', args: { query: 'deep search' } }],
+            };
+          }
+
+          // Second request: Inspect that the active tool turn was NOT reduced to plain text
+          capturedPart = params.contents[1].parts[1];
+          return { text: 'Deep search complete' };
+        },
+      });
+
+      const orchestrator = new AgentOrchestrator(geminiProvider, toolRegistry, db);
+      await orchestrator.processMessage({
+        phoneNumber: '+15556668888',
+        name: 'Mia',
+        text: 'Run deep search',
+        channel: 'whatsapp',
+      });
+
+      expect(capturedPart).toBeDefined();
+      expect(capturedPart.functionCall.name).toBe('web_search');
+      expect(capturedPart.thoughtSignature).toBe('func_sig_inner');
+      expect(capturedPart.customMetadata).toEqual({ origin: 'gemini-3' });
+    });
+  });
 });
+
