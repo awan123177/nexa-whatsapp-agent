@@ -1,4 +1,4 @@
-import { GoogleGenAI } from '@google/genai';
+import { GoogleGenAI, ThinkingLevel as GenAIThinkingLevel } from '@google/genai';
 import {
   AIProvider,
   AIMessage,
@@ -6,6 +6,7 @@ import {
   AIResponse,
   AIToolCall,
   NexaError,
+  ThinkingLevel,
 } from '@nexa/shared';
 import { redactString } from '@nexa/security';
 
@@ -13,7 +14,12 @@ export interface GeminiProviderOptions {
   apiKey: string;
   defaultModel?: string;
   fallbackModel?: string;
+  defaultThinkingLevel?: ThinkingLevel;
+  primaryMaxRetries?: number;
+  fallbackMaxRetries?: number;
   maxRetries?: number;
+  requestTimeoutMs?: number;
+  overallDeadlineMs?: number;
   sleepFn?: (ms: number) => Promise<void>;
   generateContentFn?: (params: any) => Promise<any>;
 }
@@ -80,6 +86,15 @@ export function isTransientError(error: any): boolean {
     return false;
   }
 
+  if (
+    error.name === 'TimeoutError' ||
+    error.name === 'AbortError' ||
+    error.code === 'ETIMEDOUT' ||
+    error.code === 'ECONNRESET'
+  ) {
+    return true;
+  }
+
   const status = extractStatusCode(error);
   if (status !== null) {
     if (
@@ -108,6 +123,8 @@ export function isTransientError(error: any): boolean {
     msg.includes('econnreset') ||
     msg.includes('etimedout') ||
     msg.includes('timeout') ||
+    msg.includes('timed out') ||
+    msg.includes('aborted') ||
     msg.includes('deadline_exceeded') ||
     msg.includes('internal') ||
     msg.includes('bad gateway') ||
@@ -204,12 +221,152 @@ export function calculateRetryDelay(
   return Math.round(baseDelay + jitter);
 }
 
+/**
+ * Calculates fast exponential backoff delay with random jitter for low-latency retry.
+ *
+ * Requirements:
+ * - attempt 1: ~500ms + 0..500ms jitter (500–1000ms)
+ * - attempt 2: ~1000ms + 0..500ms jitter (1000–1500ms)
+ * - Respects Retry-After but capped sensibly (default 3000ms) to preserve WhatsApp responsiveness.
+ */
+export function calculateFastRetryDelay(
+  attempt: number,
+  retryAfterHeader?: string | number | null,
+  maxCapMs: number = 5000
+): number {
+  if (retryAfterHeader !== undefined && retryAfterHeader !== null) {
+    const parsed = parseRetryAfter(retryAfterHeader);
+    if (parsed !== null && parsed > 0) {
+      const jitter = Math.floor(Math.random() * 400) + 100;
+      return Math.min(parsed + jitter, maxCapMs);
+    }
+  }
+
+  const normalizedAttempt = Math.max(1, attempt);
+  const baseDelay = 500 * Math.pow(2, normalizedAttempt - 1);
+  const jitter = Math.floor(Math.random() * 500);
+  return Math.min(baseDelay + jitter, maxCapMs);
+}
+
+/**
+ * Maps NEXA internal ThinkingLevel ('low' | 'medium' | 'high')
+ * to Google GenAI SDK ThinkingLevel enum (LOW | MEDIUM | HIGH).
+ */
+export function mapToGenAIThinkingLevel(level?: ThinkingLevel): GenAIThinkingLevel {
+  switch (level) {
+    case 'medium':
+      return GenAIThinkingLevel.MEDIUM;
+    case 'high':
+      return GenAIThinkingLevel.HIGH;
+    case 'low':
+    default:
+      return GenAIThinkingLevel.LOW;
+  }
+}
+
+/**
+ * Validates Gemini conversation contents before generateContent() is invoked.
+ * Requirements:
+ * - contents must be non-empty.
+ * - every role must be valid ('user' or 'model').
+ * - no empty/malformed parts.
+ * - final turn must ALWAYS be a 'user' turn.
+ * - if final turn is unexpectedly 'model', repair it safely with fallbackUserText if available.
+ * - deduplicates accidental duplicate consecutive current-user messages at the end.
+ */
+export function validateGeminiConversation(
+  contents: any[],
+  fallbackUserText?: string
+): any[] {
+  if (!contents || contents.length === 0) {
+    if (fallbackUserText && fallbackUserText.trim().length > 0) {
+      return [{ role: 'user', parts: [{ text: fallbackUserText.trim() }] }];
+    }
+    throw new NexaError('Gemini conversation validation failed: contents cannot be empty.', {
+      code: 'INVALID_CONVERSATION',
+      statusCode: 400,
+      userFacingMessage: 'I had trouble processing the conversation history. Please try again.',
+    });
+  }
+
+  // 1. Validate every turn's role and parts
+  for (let i = 0; i < contents.length; i++) {
+    const turn = contents[i];
+    if (!turn || typeof turn !== 'object') {
+      throw new NexaError(`Gemini conversation validation failed: turn ${i} is malformed.`, {
+        code: 'INVALID_CONVERSATION',
+        statusCode: 400,
+      });
+    }
+
+    if (turn.role !== 'user' && turn.role !== 'model') {
+      throw new NexaError(
+        `Gemini conversation validation failed: turn ${i} has invalid role "${turn.role}". Expected "user" or "model".`,
+        { code: 'INVALID_CONVERSATION', statusCode: 400 }
+      );
+    }
+
+    if (!turn.parts || !Array.isArray(turn.parts) || turn.parts.length === 0) {
+      if (turn.role === 'user' && fallbackUserText) {
+        turn.parts = [{ text: fallbackUserText.trim() }];
+      } else if (turn.role === 'model') {
+        turn.parts = [{ text: '...' }];
+      } else {
+        throw new NexaError(
+          `Gemini conversation validation failed: turn ${i} (${turn.role}) contains empty parts.`,
+          { code: 'INVALID_CONVERSATION', statusCode: 400 }
+        );
+      }
+    }
+  }
+
+  // 2. Prevent accidental duplicate consecutive user turns with identical content at the end
+  if (contents.length >= 2) {
+    const last = contents[contents.length - 1];
+    const secondLast = contents[contents.length - 2];
+    if (
+      last.role === 'user' &&
+      secondLast.role === 'user' &&
+      JSON.stringify(last.parts) === JSON.stringify(secondLast.parts)
+    ) {
+      contents.pop();
+    }
+  }
+
+  // 3. Ensure final role is ALWAYS 'user'
+  const finalTurn = contents[contents.length - 1];
+  if (finalTurn.role !== 'user') {
+    // If final turn is 'model' unexpectedly, repair it only when safe
+    if (fallbackUserText && fallbackUserText.trim().length > 0) {
+      contents.push({
+        role: 'user',
+        parts: [{ text: fallbackUserText.trim() }],
+      });
+    } else {
+      throw new NexaError(
+        'Gemini conversation validation failed: final turn must be a user turn. Requests ending with a model turn are not supported.',
+        {
+          code: 'INVALID_CONVERSATION',
+          statusCode: 400,
+          userFacingMessage: 'Conversation history error: cannot send a request ending with a model turn.',
+        }
+      );
+    }
+  }
+
+  return contents;
+}
+
 export class GeminiProvider implements AIProvider {
   public readonly name = 'gemini';
   private client: GoogleGenAI;
   private defaultModel: string;
   private fallbackModel: string;
-  private maxRetries: number;
+  private defaultThinkingLevel: ThinkingLevel;
+  private primaryMaxRetries: number;
+  private fallbackMaxRetries: number;
+  private requestTimeoutMs: number;
+  private overallDeadlineMs: number;
   private sleepFn: (ms: number) => Promise<void>;
   private generateContentFn?: (params: any) => Promise<any>;
 
@@ -223,7 +380,13 @@ export class GeminiProvider implements AIProvider {
     this.client = new GoogleGenAI({ apiKey: options.apiKey });
     this.defaultModel = options.defaultModel || 'gemini-3.8-flash';
     this.fallbackModel = options.fallbackModel || 'gemini-3.7-flash';
-    this.maxRetries = options.maxRetries ?? 3;
+    this.defaultThinkingLevel = options.defaultThinkingLevel || 'low';
+    this.primaryMaxRetries =
+      options.primaryMaxRetries ?? (options.maxRetries !== undefined ? options.maxRetries : 1);
+    this.fallbackMaxRetries =
+      options.fallbackMaxRetries ?? (options.maxRetries !== undefined ? options.maxRetries : 1);
+    this.requestTimeoutMs = options.requestTimeoutMs ?? 10_000;
+    this.overallDeadlineMs = options.overallDeadlineMs ?? 25_000;
     this.sleepFn = options.sleepFn || ((ms: number) => new Promise((resolve) => setTimeout(resolve, ms)));
     this.generateContentFn = options.generateContentFn;
   }
@@ -236,13 +399,29 @@ export class GeminiProvider implements AIProvider {
     return this.fallbackModel;
   }
 
+  public getDefaultThinkingLevel(): ThinkingLevel {
+    return this.defaultThinkingLevel;
+  }
+
+  public getRequestTimeoutMs(): number {
+    return this.requestTimeoutMs;
+  }
+
+  public getOverallDeadlineMs(): number {
+    return this.overallDeadlineMs;
+  }
+
   async generateResponse(
     messages: AIMessage[],
     options: AICompletionOptions = {}
   ): Promise<AIResponse> {
+    const overallStartTime = Date.now();
     const primaryModel = options.model || this.defaultModel;
     const fallbackModel =
       options.fallbackModel !== undefined ? options.fallbackModel : this.fallbackModel;
+    const thinkingLevel = options.thinkingLevel || this.defaultThinkingLevel || 'low';
+    const requestTimeoutMs = options.requestTimeoutMs ?? this.requestTimeoutMs;
+    const overallDeadlineMs = options.overallDeadlineMs ?? this.overallDeadlineMs;
 
     const modelsToTry = [primaryModel];
     if (fallbackModel && fallbackModel !== primaryModel) {
@@ -261,27 +440,85 @@ export class GeminiProvider implements AIProvider {
     }));
 
     // Convert Nexa messages to Gemini contents format
-    const contents = this.formatMessagesForGemini(messages);
+    const rawContents = this.formatMessagesForGemini(messages);
+
+    // Extract fallback user text from messages or options for safe conversation repair
+    const lastUserMsg = [...messages].reverse().find((m) => m.role === 'user');
+    const currentUserText = options.currentUserText || lastUserMsg?.content || '';
+
+    // Validate and guarantee valid Gemini conversation structure (ends in user turn)
+    const contents = validateGeminiConversation(rawContents, currentUserText);
+
+    // Sanitized conversation structure logging (never logs message text or credentials)
+    const conversationRoles = contents.map((c: any) => c.role).join(',');
+    const finalTurnRole = contents[contents.length - 1]?.role || 'none';
+    console.log(`[Gemini] conversation_roles=${conversationRoles}`);
+    console.log(`[Gemini] final_turn_role=${finalTurnRole}`);
+    console.log(`[Gemini] history_count=${contents.length}`);
 
     let lastError: any = null;
 
     for (let mIdx = 0; mIdx < modelsToTry.length; mIdx++) {
       const currentModel = modelsToTry[mIdx];
       const isLastModel = mIdx === modelsToTry.length - 1;
+      const maxRetries =
+        currentModel === primaryModel ? this.primaryMaxRetries : this.fallbackMaxRetries;
 
       let attempt = 0;
-      // Model retry loop: attempt 1 initial, then up to maxRetries retries
-      while (attempt <= this.maxRetries) {
+      // Fast bounded retry loop
+      while (attempt <= maxRetries) {
         attempt++;
+
+        const elapsedOverall = Date.now() - overallStartTime;
+        const remainingOverallMs = overallDeadlineMs - elapsedOverall;
+        if (remainingOverallMs <= 0) {
+          const deadlineErr: any = new Error(
+            `Overall AI request deadline of ${overallDeadlineMs}ms exceeded.`
+          );
+          deadlineErr.name = 'TimeoutError';
+          deadlineErr.code = 'ETIMEDOUT';
+          deadlineErr.status = 504;
+          lastError = deadlineErr;
+          break;
+        }
+
+        const currentTimeoutMs = Math.min(requestTimeoutMs, Math.max(50, remainingOverallMs));
+
         console.log(`[Gemini] attempt=${attempt} model=${currentModel}`);
+        console.log(`[Gemini] request_start model=${currentModel}`);
+        const callStartTime = Date.now();
+
+        // Hard per-request timeout with AbortController cancellation
+        const abortController = new AbortController();
+        let timeoutTimer: NodeJS.Timeout | null = null;
+
+        const timeoutPromise = new Promise<never>((_, reject) => {
+          timeoutTimer = setTimeout(() => {
+            abortController.abort();
+            const timeoutErr: any = new Error(
+              `Gemini request timed out after ${currentTimeoutMs}ms for model ${currentModel}`
+            );
+            timeoutErr.name = 'TimeoutError';
+            timeoutErr.code = 'ETIMEDOUT';
+            timeoutErr.status = 504;
+            reject(timeoutErr);
+          }, currentTimeoutMs);
+        });
 
         const generateParams = {
           model: currentModel,
           contents,
           config: {
+            abortSignal: abortController.signal,
+            httpOptions: {
+              timeout: currentTimeoutMs,
+            },
             systemInstruction: options.systemInstruction || undefined,
             temperature: options.temperature ?? 0.2,
             maxOutputTokens: options.maxTokens ?? 2048,
+            thinkingConfig: {
+              thinkingLevel: mapToGenAIThinkingLevel(thinkingLevel),
+            },
             tools:
               functionDeclarations && functionDeclarations.length > 0
                 ? [{ functionDeclarations: functionDeclarations as any }]
@@ -290,10 +527,14 @@ export class GeminiProvider implements AIProvider {
         };
 
         try {
-          const response = this.generateContentFn
-            ? await this.generateContentFn(generateParams)
-            : await this.client.models.generateContent(generateParams);
+          const sdkPromise = this.generateContentFn
+            ? this.generateContentFn(generateParams)
+            : this.client.models.generateContent(generateParams);
 
+          const response = await Promise.race([sdkPromise, timeoutPromise]);
+
+          const latencyMs = Date.now() - callStartTime;
+          console.log(`[Gemini] success model=${currentModel} latency_ms=${latencyMs}`);
           console.log('[Gemini] success');
 
           const toolCalls: AIToolCall[] = [];
@@ -322,22 +563,45 @@ export class GeminiProvider implements AIProvider {
         } catch (error: any) {
           lastError = error;
 
+          const isTimeout =
+            error?.name === 'TimeoutError' ||
+            error?.name === 'AbortError' ||
+            error?.code === 'ETIMEDOUT' ||
+            abortController.signal.aborted ||
+            error?.message?.toLowerCase().includes('timed out') ||
+            error?.message?.toLowerCase().includes('aborted');
+
+          if (isTimeout) {
+            console.log(`[Gemini] timeout model=${currentModel} timeout_ms=${currentTimeoutMs}`);
+          }
+
           // Never retry permanent client/auth/validation errors (400, 401, 403, 404, invalid API key)
           if (isPermanentError(error)) {
+            const totalLatencyMs = Date.now() - overallStartTime;
+            console.log(`[Gemini] request_failed latency_ms=${totalLatencyMs}`);
             this.handleFinalError(error);
           }
 
           const isTransient = isTransientError(error);
           if (!isTransient) {
+            const totalLatencyMs = Date.now() - overallStartTime;
+            console.log(`[Gemini] request_failed latency_ms=${totalLatencyMs}`);
             this.handleFinalError(error);
           }
 
-          const status = extractStatusCode(error) || 503;
+          const status = extractStatusCode(error) || (isTimeout ? 504 : 503);
 
-          // If current model still has retries remaining
-          if (attempt <= this.maxRetries) {
+          // If current model still has fast retries remaining
+          if (attempt <= maxRetries) {
+            const remainingBeforeSleep = overallDeadlineMs - (Date.now() - overallStartTime);
+            if (remainingBeforeSleep <= 1000) {
+              break;
+            }
             const retryAfter = extractRetryAfter(error);
-            const delayMs = calculateRetryDelay(attempt, retryAfter);
+            let delayMs = calculateFastRetryDelay(attempt, retryAfter, 5000);
+            // Never let retry delay violate overall request deadline
+            delayMs = Math.min(delayMs, Math.max(0, remainingBeforeSleep - 1500));
+
             console.log(`[Gemini] transient_error status=${status} retry_in_ms=${delayMs}`);
             await this.sleepFn(delayMs);
           } else {
@@ -349,11 +613,22 @@ export class GeminiProvider implements AIProvider {
               );
             }
           }
+        } finally {
+          if (timeoutTimer) {
+            clearTimeout(timeoutTimer);
+          }
+        }
+      }
+
+      if (lastError && (lastError.name === 'TimeoutError' || lastError.code === 'ETIMEDOUT')) {
+        if (Date.now() - overallStartTime >= overallDeadlineMs) {
+          break;
         }
       }
     }
 
-    // All models and retries exhausted; return safe user-facing error
+    const totalLatencyMs = Date.now() - overallStartTime;
+    console.log(`[Gemini] request_failed latency_ms=${totalLatencyMs}`);
     this.handleFinalError(lastError || new Error('All Gemini retry attempts exhausted.'));
   }
 
@@ -375,10 +650,15 @@ export class GeminiProvider implements AIProvider {
       });
     }
 
-    // 2. Service Unavailable / High demand (503)
+    // 2. Service Unavailable / High demand / Timeout (503 / 504)
     if (
       status === 503 ||
+      status === 504 ||
       errMsg.includes('503') ||
+      errMsg.includes('504') ||
+      errMsg.toLowerCase().includes('timeout') ||
+      errMsg.toLowerCase().includes('timed out') ||
+      errMsg.toLowerCase().includes('aborted') ||
       errMsg.toLowerCase().includes('unavailable') ||
       errMsg.toLowerCase().includes('high demand')
     ) {
@@ -417,7 +697,20 @@ export class GeminiProvider implements AIProvider {
       });
     }
 
-    // 5. Default safe failure (existing safe user-facing error)
+    // 5. Client bad request / validation error (400)
+    if (
+      status === 400 ||
+      errMsg.toLowerCase().includes('invalid_argument') ||
+      errMsg.toLowerCase().includes('validation failed')
+    ) {
+      throw new NexaError(`Gemini request error: ${errMsg}`, {
+        code: 'AI_INVALID_REQUEST',
+        statusCode: 400,
+        userFacingMessage: 'I had trouble processing the request format. Please try again.',
+      });
+    }
+
+    // 6. Default safe failure (existing safe user-facing error)
     throw new NexaError(`Gemini generation error: ${errMsg}`, {
       code: 'AI_GENERATION_FAILED',
       statusCode: 502,

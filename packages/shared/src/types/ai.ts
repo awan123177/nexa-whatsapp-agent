@@ -31,13 +31,19 @@ export interface AIToolDeclaration {
   };
 }
 
+export type ThinkingLevel = 'low' | 'medium' | 'high';
+
 export interface AICompletionOptions {
   model?: string;
   fallbackModel?: string;
+  thinkingLevel?: ThinkingLevel;
   temperature?: number;
   maxTokens?: number;
   systemInstruction?: string;
   tools?: AIToolDeclaration[];
+  currentUserText?: string;
+  requestTimeoutMs?: number;
+  overallDeadlineMs?: number;
 }
 
 export interface AIResponse {

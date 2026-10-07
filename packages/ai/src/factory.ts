@@ -1,4 +1,4 @@
-import { AIProvider } from '@nexa/shared';
+import { AIProvider, ThinkingLevel } from '@nexa/shared';
 import { GeminiProvider } from './gemini-provider.js';
 import { MockAIProvider } from './mock-provider.js';
 
@@ -6,6 +6,7 @@ export function createAIProvider(options: {
   apiKey?: string;
   model?: string;
   fallbackModel?: string;
+  thinkingLevel?: ThinkingLevel;
   forceMock?: boolean;
 }): AIProvider {
   if (options.forceMock || !options.apiKey) {
@@ -21,5 +22,6 @@ export function createAIProvider(options: {
     apiKey: options.apiKey,
     defaultModel: options.model,
     fallbackModel: options.fallbackModel,
+    defaultThinkingLevel: options.thinkingLevel || 'low',
   });
 }

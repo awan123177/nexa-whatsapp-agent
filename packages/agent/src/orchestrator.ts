@@ -6,6 +6,7 @@ import {
   MediaType,
   ApprovalRequiredError,
   ToolResult,
+  ThinkingLevel,
 } from '@nexa/shared';
 import { IDatabaseRepository } from '@nexa/database';
 import { ToolRegistry } from '@nexa/tools';
@@ -19,8 +20,11 @@ export interface AgentProcessInput {
   mediaUrl?: string;
   mediaType?: MediaType;
   whatsappMessageId?: string;
+  wamid?: string;
   interactiveButtonId?: string;
   whatsappClient?: any;
+  thinkingLevel?: ThinkingLevel;
+  receivedAt?: number;
 }
 
 export interface AgentProcessOutput {
@@ -30,6 +34,38 @@ export interface AgentProcessOutput {
   approvalPrompt?: string;
   approvalId?: string;
   stepsCount: number;
+}
+
+/**
+ * Determines the appropriate Gemini thinking level:
+ * - 'low' for real-time conversational chat (greetings, simple questions, single-turn replies).
+ * - 'medium' for complex multi-step reasoning, tool synthesis, or explicit requests.
+ */
+export function resolveThinkingLevel(
+  text: string,
+  currentStep: number,
+  explicitLevel?: ThinkingLevel
+): ThinkingLevel {
+  if (explicitLevel) return explicitLevel;
+  if (currentStep > 1) {
+    return 'medium'; // Elevate reasoning when synthesizing tool outputs in multi-step flows
+  }
+  const lower = text.toLowerCase();
+  const complexTriggers = [
+    'compare',
+    'itinerary',
+    'research and compare',
+    'plan a trip',
+    'analyze',
+    'investigate',
+    'multi-step',
+    'detailed comparison',
+    'flight and hotel',
+  ];
+  if (complexTriggers.some((t) => lower.includes(t))) {
+    return 'medium';
+  }
+  return 'low';
 }
 
 export class AgentOrchestrator {
@@ -46,23 +82,29 @@ export class AgentOrchestrator {
    */
   async processMessage(input: AgentProcessInput): Promise<AgentProcessOutput> {
     const channel = input.channel || 'whatsapp';
+    const messageId = input.whatsappMessageId || input.wamid;
 
-    // 1. Identify or create User and Active Conversation
-    const user = await this.db.findOrCreateUserByPhone(input.phoneNumber, input.name);
-    const conversation = await this.db.getOrCreateActiveConversation(user.id, channel);
-
-    // 2. Message Deduplication check (crucial for WhatsApp Cloud API retries)
-    if (input.whatsappMessageId) {
-      const existing = await this.db.getMessageByWhatsAppId(input.whatsappMessageId);
+    // 1. Message Deduplication check (crucial for WhatsApp Cloud API retries)
+    // Check wamid FIRST to avoid unnecessary DB user/conversation queries on duplicates
+    if (messageId) {
+      const existing = await this.db.getMessageByWhatsAppId(messageId);
       if (existing) {
-        console.log(`[AgentOrchestrator] Duplicate WhatsApp message ${input.whatsappMessageId} ignored.`);
+        console.log(`[AgentOrchestrator] Duplicate WhatsApp message ${messageId} ignored.`);
+        const conversationMessages = await this.db.getConversationMessages(existing.conversation_id, 10);
+        const replyMessage = conversationMessages.find(
+          (m) => m.sender_type === 'assistant' && new Date(m.created_at) >= new Date(existing.created_at)
+        );
         return {
-          replyText: '',
-          conversationId: conversation.id,
+          replyText: replyMessage?.content || '',
+          conversationId: existing.conversation_id || '',
           stepsCount: 0,
         };
       }
     }
+
+    // 2. Identify or create User and Active Conversation
+    const user = await this.db.findOrCreateUserByPhone(input.phoneNumber, input.name);
+    const conversation = await this.db.getOrCreateActiveConversation(user.id, channel);
 
     // 3. Persist incoming user message
     const userMessage = await this.db.saveMessage({
@@ -71,7 +113,7 @@ export class AgentOrchestrator {
       content: input.text,
       media_url: input.mediaUrl || null,
       media_type: input.mediaType || null,
-      whatsapp_message_id: input.whatsappMessageId || null,
+      whatsapp_message_id: messageId || null,
       raw_payload: input.interactiveButtonId ? { buttonId: input.interactiveButtonId } : null,
     });
 
@@ -84,8 +126,15 @@ export class AgentOrchestrator {
       recipientPhone: input.phoneNumber || user.phone_number,
     };
 
-    // 4. Check for Pending Approvals
-    const pendingApproval = await this.db.getPendingApproval(conversation.id);
+    // 4. Concurrently fetch pending approvals, user memories, and conversation history
+    // Avoid redundant sequential database roundtrips to minimize time-to-first-token
+    const [pendingApproval, memories, rawHistory] = await Promise.all([
+      this.db.getPendingApproval(conversation.id),
+      this.db.getUserMemories(user.id),
+      this.db.getConversationMessages(conversation.id, 10),
+    ]);
+
+    // 5. Check for Pending Approvals
     if (pendingApproval) {
       const lowerText = input.text.trim().toLowerCase();
       const words = lowerText.split(/[\s,;.!?]+/).filter(Boolean);
@@ -150,29 +199,51 @@ export class AgentOrchestrator {
       // If user said something unrelated, keep approval pending and fall through to normal agent loop
     }
 
-    // 5. Retrieve User Memories and Conversation History
-    const memories = await this.db.getUserMemories(user.id);
-    const rawHistory = await this.db.getConversationMessages(conversation.id, 10);
-
+    // 6. Build Context for Agent Reasoning Loop
     const systemInstruction = buildSystemInstruction(user, memories);
     const messages: AIMessage[] = rawHistory.map((m) => ({
       role: m.sender_type === 'user' ? 'user' : 'assistant',
       content: m.content,
     }));
 
+    // Ensure the final content/turn sent to Gemini is ALWAYS a USER turn.
+    // If history ended with an assistant/model turn, or the current inbound message
+    // is not already at the end of the history array, append the current user message.
+    const lastHistoryMsg = messages[messages.length - 1];
+    const isCurrentUserAlreadyLast =
+      lastHistoryMsg &&
+      lastHistoryMsg.role === 'user' &&
+      lastHistoryMsg.content === input.text;
+
+    if (!isCurrentUserAlreadyLast) {
+      messages.push({
+        role: 'user',
+        content: input.text,
+      });
+    }
+
     const toolDeclarations = this.toolRegistry.getDeclarations();
 
-    // 6. Multi-Step Agent Execution Loop
+    // 7. Multi-Step Agent Execution Loop
     let currentStep = 0;
     let finalReply = '';
 
     while (currentStep < this.maxSteps) {
       currentStep++;
 
+      const thinkingLevel = resolveThinkingLevel(input.text, currentStep, input.thinkingLevel);
+      console.log(`[WhatsApp Path] gemini_request_start step=${currentStep} thinking_level=${thinkingLevel}`);
+      const stepStartTime = Date.now();
+
       const aiResponse = await this.aiProvider.generateResponse(messages, {
         systemInstruction,
         tools: toolDeclarations,
+        thinkingLevel,
+        currentUserText: input.text,
       });
+
+      const stepLatency = Date.now() - stepStartTime;
+      console.log(`[WhatsApp Path] gemini_response_received step=${currentStep} latency_ms=${stepLatency}`);
 
       // Case A: Model returned plain text without calling any tools
       if (!aiResponse.toolCalls || aiResponse.toolCalls.length === 0) {

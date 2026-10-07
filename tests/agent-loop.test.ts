@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest';
 import { InMemoryRepository } from '../packages/database/src/index.js';
 import { createDefaultToolRegistry } from '../packages/tools/src/factory.js';
 import { MockAIProvider } from '../packages/ai/src/mock-provider.js';
+import { GeminiProvider } from '../packages/ai/src/gemini-provider.js';
 import { AgentOrchestrator } from '../packages/agent/src/orchestrator.js';
 
 describe('Agent Orchestrator & Loop Suite', () => {
@@ -180,5 +181,246 @@ describe('Agent Orchestrator & Loop Suite', () => {
     });
 
     expect(cancelResult.replyText).toContain("I've cancelled that action");
+  });
+
+  it('should process simple chat greeting (Hello NEXA) with 1 step, 0 tools, and thinkingLevel: low', async () => {
+    const db = new InMemoryRepository();
+    const toolRegistry = createDefaultToolRegistry({ db });
+    const thinkingLevels: string[] = [];
+
+    const mockAi = new MockAIProvider(async (_messages, options) => {
+      if (options?.thinkingLevel) {
+        thinkingLevels.push(options.thinkingLevel);
+      }
+      return {
+        text: 'Hello! How can I help you today?',
+      };
+    });
+
+    const orchestrator = new AgentOrchestrator(mockAi, toolRegistry, db);
+
+    const result = await orchestrator.processMessage({
+      phoneNumber: '+15551112222',
+      name: 'Alice',
+      text: 'Hello NEXA',
+      channel: 'whatsapp',
+    });
+
+    expect(result.stepsCount).toBe(1);
+    expect(result.replyText).toBe('Hello! How can I help you today?');
+    expect(thinkingLevels).toEqual(['low']);
+  });
+
+  it('should elevate thinkingLevel to medium for complex tasks and subsequent steps', async () => {
+    const db = new InMemoryRepository();
+    const toolRegistry = createDefaultToolRegistry({ db });
+    const recordedThinkingLevels: string[] = [];
+    let step = 0;
+
+    const mockAi = new MockAIProvider(async (_messages, options) => {
+      step++;
+      if (options?.thinkingLevel) {
+        recordedThinkingLevels.push(options.thinkingLevel);
+      }
+
+      if (step === 1) {
+        // Multi-step tool call
+        return {
+          text: '',
+          toolCalls: [
+            {
+              id: 'call_search',
+              name: 'web_search',
+              arguments: { query: 'compare flight prices BLR to DXB' },
+            },
+          ],
+        };
+      }
+
+      return {
+        text: 'Here is the flight comparison.',
+      };
+    });
+
+    const orchestrator = new AgentOrchestrator(mockAi, toolRegistry, db);
+
+    const result = await orchestrator.processMessage({
+      phoneNumber: '+15551112222',
+      name: 'Alice',
+      text: 'Can you compare flight prices from BLR to DXB?',
+      channel: 'whatsapp',
+    });
+
+    expect(result.stepsCount).toBe(2);
+    // Step 1: complex trigger ("compare") -> medium
+    // Step 2: step > 1 -> medium
+    expect(recordedThinkingLevels).toEqual(['medium', 'medium']);
+  });
+
+  it('should short-circuit duplicate messages using wamid idempotency', async () => {
+    const db = new InMemoryRepository();
+    const toolRegistry = createDefaultToolRegistry({ db });
+    let aiCalls = 0;
+
+    const mockAi = new MockAIProvider(async () => {
+      aiCalls++;
+      return { text: 'First reply' };
+    });
+
+    const orchestrator = new AgentOrchestrator(mockAi, toolRegistry, db);
+
+    // First delivery
+    const result1 = await orchestrator.processMessage({
+      phoneNumber: '+15559998888',
+      name: 'Dave',
+      text: 'Hello NEXA',
+      channel: 'whatsapp',
+      wamid: 'wamid.HBgLMTU1NTk5OTg4ODgVAgASGBQzQT',
+    });
+
+    expect(result1.replyText).toBe('First reply');
+    expect(aiCalls).toBe(1);
+
+    // Duplicate delivery with same wamid
+    const result2 = await orchestrator.processMessage({
+      phoneNumber: '+15559998888',
+      name: 'Dave',
+      text: 'Hello NEXA',
+      channel: 'whatsapp',
+      wamid: 'wamid.HBgLMTU1NTk5OTg4ODgVAgASGBQzQT',
+    });
+
+    expect(result2.replyText).toBe('First reply');
+    // AI provider should not have been called again
+    expect(aiCalls).toBe(1);
+  });
+
+  it('Test E: two consecutive WhatsApp messages => each Gemini request ends with the correct current user turn', async () => {
+    const db = new InMemoryRepository();
+    const toolRegistry = createDefaultToolRegistry({ db });
+    const receivedEndTurns: { role: string; content: string }[] = [];
+
+    const mockAi = new MockAIProvider(async (messages) => {
+      const last = messages[messages.length - 1];
+      receivedEndTurns.push({ role: last.role, content: last.content });
+      return { text: `Reply to ${last.content}` };
+    });
+
+    const orchestrator = new AgentOrchestrator(mockAi, toolRegistry, db);
+
+    // Consecutive message 1
+    const res1 = await orchestrator.processMessage({
+      phoneNumber: '+15551234567',
+      name: 'Emma',
+      text: 'First question',
+      channel: 'whatsapp',
+    });
+    expect(res1.replyText).toBe('Reply to First question');
+
+    // Consecutive message 2
+    const res2 = await orchestrator.processMessage({
+      phoneNumber: '+15551234567',
+      name: 'Emma',
+      text: 'Second follow-up question',
+      channel: 'whatsapp',
+    });
+    expect(res2.replyText).toBe('Reply to Second follow-up question');
+
+    // Verify both requests ended with the current user turn
+    expect(receivedEndTurns).toHaveLength(2);
+    expect(receivedEndTurns[0]).toEqual({ role: 'user', content: 'First question' });
+    expect(receivedEndTurns[1]).toEqual({ role: 'user', content: 'Second follow-up question' });
+  });
+
+  it('Test F: assistant response is persisted after generation, not before the next user turn', async () => {
+    const db = new InMemoryRepository();
+    const toolRegistry = createDefaultToolRegistry({ db });
+    let dbStateDuringGeneration: string[] = [];
+
+    const mockAi = new MockAIProvider(async (_messages) => {
+      // Inspect DB messages during generation
+      const user = await db.findOrCreateUserByPhone('+15557778888');
+      const conv = await db.getOrCreateActiveConversation(user.id, 'whatsapp');
+      const currentMsgs = await db.getConversationMessages(conv.id);
+      dbStateDuringGeneration = currentMsgs.map((m) => `${m.sender_type}:${m.content}`);
+      return { text: 'AI generated answer' };
+    });
+
+    const orchestrator = new AgentOrchestrator(mockAi, toolRegistry, db);
+
+    await orchestrator.processMessage({
+      phoneNumber: '+15557778888',
+      name: 'Frank',
+      text: 'What time is it?',
+      channel: 'whatsapp',
+    });
+
+    // During generation, only the user message was in DB
+    expect(dbStateDuringGeneration).toEqual(['user:What time is it?']);
+
+    // After processMessage completes, assistant message is now persisted
+    const user = await db.findOrCreateUserByPhone('+15557778888');
+    const conv = await db.getOrCreateActiveConversation(user.id, 'whatsapp');
+    const finalMsgs = await db.getConversationMessages(conv.id);
+    expect(finalMsgs.map((m) => m.sender_type)).toEqual(['user', 'assistant']);
+    expect(finalMsgs[1].content).toBe('AI generated answer');
+  });
+
+  it('End-to-End Regression: AgentOrchestrator + GeminiProvider across 2 WhatsApp turns (user -> model -> user)', async () => {
+    const db = new InMemoryRepository();
+    const toolRegistry = createDefaultToolRegistry({ db });
+    const sdkCalls: any[] = [];
+
+    const geminiProvider = new GeminiProvider({
+      apiKey: 'test-api-key',
+      generateContentFn: async (params) => {
+        sdkCalls.push(JSON.parse(JSON.stringify(params.contents)));
+        const lastTurn = params.contents[params.contents.length - 1];
+        // Exact real-world Gemini behavior: rejects with HTTP 400 if ending with a model turn
+        if (lastTurn.role === 'model') {
+          const err: any = new Error(
+            'HTTP 400 INVALID_ARGUMENT: Requests ending with a model turn are not supported.'
+          );
+          err.status = 400;
+          throw err;
+        }
+        return { text: `Reply to ${lastTurn.parts[0].text}` };
+      },
+    });
+
+    const orchestrator = new AgentOrchestrator(geminiProvider, toolRegistry, db);
+
+    // Turn 1: Inbound WhatsApp message "Hello NEXA"
+    const turn1Result = await orchestrator.processMessage({
+      phoneNumber: '+15550001111',
+      name: 'Alice',
+      text: 'Hello NEXA',
+      channel: 'whatsapp',
+    });
+    expect(turn1Result.replyText).toBe('Reply to Hello NEXA');
+
+    // Turn 2: Follow-up WhatsApp message "What can you do?"
+    // Persisted history at this point:
+    // [0]: user "Hello NEXA"
+    // [1]: assistant "Reply to Hello NEXA"
+    // When turn 2 is processed, it must construct:
+    // user ("Hello NEXA") -> model ("Reply to Hello NEXA") -> user ("What can you do?")
+    const turn2Result = await orchestrator.processMessage({
+      phoneNumber: '+15550001111',
+      name: 'Alice',
+      text: 'What can you do?',
+      channel: 'whatsapp',
+    });
+    expect(turn2Result.replyText).toBe('Reply to What can you do?');
+
+    // Verify Turn 1 SDK call
+    expect(sdkCalls[0]).toHaveLength(1);
+    expect(sdkCalls[0][0]).toEqual({ role: 'user', parts: [{ text: 'Hello NEXA' }] });
+
+    // Verify Turn 2 SDK call: exact user -> model -> user sequence
+    expect(sdkCalls[1]).toHaveLength(3);
+    expect(sdkCalls[1][0]).toEqual({ role: 'user', parts: [{ text: 'Hello NEXA' }] });
+    expect(sdkCalls[1][1]).toEqual({ role: 'model', parts: [{ text: 'Reply to Hello NEXA' }] });
+    expect(sdkCalls[1][2]).toEqual({ role: 'user', parts: [{ text: 'What can you do?' }] });
   });
 });

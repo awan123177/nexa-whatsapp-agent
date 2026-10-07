@@ -2,11 +2,13 @@ import { describe, it, expect, vi } from 'vitest';
 import {
   GeminiProvider,
   calculateRetryDelay,
+  calculateFastRetryDelay,
   parseRetryAfter,
   extractRetryAfter,
   isPermanentError,
   isTransientError,
   extractStatusCode,
+  validateGeminiConversation,
 } from '../packages/ai/src/gemini-provider.js';
 import { NexaError } from '../packages/shared/src/index.js';
 
@@ -85,6 +87,28 @@ describe('GeminiProvider Reliability & Transient Error Retry Suite', () => {
       expect(delayWithRetryAfter).toBeGreaterThanOrEqual(5100);
       expect(delayWithRetryAfter).toBeLessThanOrEqual(5500);
     });
+
+    it('should calculate fast exponential backoff with jitter within expected bounds', () => {
+      for (let i = 0; i < 20; i++) {
+        const delay1 = calculateFastRetryDelay(1);
+        expect(delay1).toBeGreaterThanOrEqual(500);
+        expect(delay1).toBeLessThanOrEqual(1000);
+
+        const delay2 = calculateFastRetryDelay(2);
+        expect(delay2).toBeGreaterThanOrEqual(1000);
+        expect(delay2).toBeLessThanOrEqual(1500);
+      }
+    });
+
+    it('should respect Retry-After in calculateFastRetryDelay capped sensibly', () => {
+      const delay3s = calculateFastRetryDelay(1, '3');
+      expect(delay3s).toBeGreaterThanOrEqual(3100);
+      expect(delay3s).toBeLessThanOrEqual(3500);
+
+      // Capped at maxCapMs (default 5000ms)
+      const delay60s = calculateFastRetryDelay(1, '60');
+      expect(delay60s).toBe(5000);
+    });
   });
 
   // =========================================================================
@@ -124,9 +148,9 @@ describe('GeminiProvider Reliability & Transient Error Retry Suite', () => {
       expect(response.text).toBe('Response after 503 recovery');
       expect(callCount).toBe(2);
       expect(sleepDelays).toHaveLength(1);
-      // Attempt 1 delay must be approximately 1-2 seconds (1000-2000ms)
-      expect(sleepDelays[0]).toBeGreaterThanOrEqual(1000);
-      expect(sleepDelays[0]).toBeLessThanOrEqual(2000);
+      // Attempt 1 fast retry delay is ~500-1000ms
+      expect(sleepDelays[0]).toBeGreaterThanOrEqual(500);
+      expect(sleepDelays[0]).toBeLessThanOrEqual(1000);
     });
 
     // =======================================================================
@@ -151,6 +175,7 @@ describe('GeminiProvider Reliability & Transient Error Retry Suite', () => {
 
       const provider = new GeminiProvider({
         apiKey: dummyApiKey,
+        primaryMaxRetries: 2,
         generateContentFn: mockGenerate,
         sleepFn: async (ms) => {
           sleepDelays.push(ms);
@@ -165,13 +190,12 @@ describe('GeminiProvider Reliability & Transient Error Retry Suite', () => {
       expect(callCount).toBe(3);
       expect(sleepDelays).toHaveLength(2);
 
-      // Attempt 1: 1000–2000ms (1-2s)
-      expect(sleepDelays[0]).toBeGreaterThanOrEqual(1000);
-      expect(sleepDelays[0]).toBeLessThanOrEqual(2000);
+      // Fast retry delays
+      expect(sleepDelays[0]).toBeGreaterThanOrEqual(500);
+      expect(sleepDelays[0]).toBeLessThanOrEqual(1000);
 
-      // Attempt 2: 2000–4000ms (2-4s)
-      expect(sleepDelays[1]).toBeGreaterThanOrEqual(2000);
-      expect(sleepDelays[1]).toBeLessThanOrEqual(4000);
+      expect(sleepDelays[1]).toBeGreaterThanOrEqual(1000);
+      expect(sleepDelays[1]).toBeLessThanOrEqual(1500);
     });
 
     // =======================================================================
@@ -191,6 +215,7 @@ describe('GeminiProvider Reliability & Transient Error Retry Suite', () => {
       const provider = new GeminiProvider({
         apiKey: dummyApiKey,
         fallbackModel: '', // isolate primary model for this test
+        primaryMaxRetries: 3,
         generateContentFn: mockGenerate,
         sleepFn: async (ms) => {
           sleepDelays.push(ms);
@@ -214,12 +239,12 @@ describe('GeminiProvider Reliability & Transient Error Retry Suite', () => {
 
       // Initial call + 3 retries = 4 total attempts
       expect(sleepDelays.slice(0, 3)).toHaveLength(3);
-      expect(sleepDelays[0]).toBeGreaterThanOrEqual(1000);
-      expect(sleepDelays[0]).toBeLessThanOrEqual(2000);
-      expect(sleepDelays[1]).toBeGreaterThanOrEqual(2000);
-      expect(sleepDelays[1]).toBeLessThanOrEqual(4000);
-      expect(sleepDelays[2]).toBeGreaterThanOrEqual(4000);
-      expect(sleepDelays[2]).toBeLessThanOrEqual(8000);
+      expect(sleepDelays[0]).toBeGreaterThanOrEqual(500);
+      expect(sleepDelays[0]).toBeLessThanOrEqual(1000);
+      expect(sleepDelays[1]).toBeGreaterThanOrEqual(1000);
+      expect(sleepDelays[1]).toBeLessThanOrEqual(1500);
+      expect(sleepDelays[2]).toBeGreaterThanOrEqual(2000);
+      expect(sleepDelays[2]).toBeLessThanOrEqual(2500);
     });
   });
 
@@ -264,7 +289,7 @@ describe('GeminiProvider Reliability & Transient Error Retry Suite', () => {
       ]);
     });
 
-    it('should invoke fallback model after default 3 retries (4 attempts) on primary model', async () => {
+    it('should invoke fallback model promptly after 1 fast retry (2 attempts) on primary model', async () => {
       const modelsCalled: string[] = [];
       const mockGenerate = vi.fn().mockImplementation(async (params) => {
         modelsCalled.push(params.model);
@@ -286,7 +311,7 @@ describe('GeminiProvider Reliability & Transient Error Retry Suite', () => {
 
       const response = await provider.generateResponse([{ role: 'user', content: 'Test' }]);
       expect(response.text).toBe('Fallback success');
-      expect(modelsCalled.filter((m) => m === 'gemini-3.8-flash')).toHaveLength(4);
+      expect(modelsCalled.filter((m) => m === 'gemini-3.8-flash')).toHaveLength(2);
       expect(modelsCalled.filter((m) => m === 'gemini-3.7-flash')).toHaveLength(1);
     });
 
@@ -393,8 +418,8 @@ describe('GeminiProvider Reliability & Transient Error Retry Suite', () => {
       expect(response.text).toBe('Response recovered after 429 backoff');
       expect(callCount).toBe(2);
       expect(sleepDelays).toHaveLength(1);
-      expect(sleepDelays[0]).toBeGreaterThanOrEqual(1000);
-      expect(sleepDelays[0]).toBeLessThanOrEqual(2000);
+      expect(sleepDelays[0]).toBeGreaterThanOrEqual(500);
+      expect(sleepDelays[0]).toBeLessThanOrEqual(1000);
     });
 
     it('should respect Retry-After header during 429 retry', async () => {
@@ -702,6 +727,38 @@ describe('GeminiProvider Reliability & Transient Error Retry Suite', () => {
 
       logSpy.mockRestore();
     });
+
+    it('should log sanitized timing instrumentation for request_start, success, fallback_model_switch, and request_failed', async () => {
+      const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+
+      let callCount = 0;
+      const mockGenerate = vi.fn().mockImplementation(async (params) => {
+        callCount++;
+        if (params.model === 'gemini-3.8-flash') {
+          const err: any = new Error('503 UNAVAILABLE: Busy');
+          err.status = 503;
+          throw err;
+        }
+        return { text: 'Fallback OK' };
+      });
+
+      const provider = new GeminiProvider({
+        apiKey: dummyApiKey,
+        defaultModel: 'gemini-3.8-flash',
+        fallbackModel: 'gemini-3.7-flash',
+        generateContentFn: mockGenerate,
+        sleepFn: async () => {},
+      });
+
+      await provider.generateResponse([{ role: 'user', content: 'Hello timing' }]);
+
+      const loggedMessages = logSpy.mock.calls.map((c) => c[0]);
+      expect(loggedMessages.some((m) => m === '[Gemini] request_start model=gemini-3.8-flash')).toBe(true);
+      expect(loggedMessages.some((m) => typeof m === 'string' && m.startsWith('[Gemini] success model=gemini-3.7-flash latency_ms='))).toBe(true);
+      expect(loggedMessages.some((m) => m === '[Gemini] fallback_model_switch from=gemini-3.8-flash to=gemini-3.7-flash')).toBe(true);
+
+      logSpy.mockRestore();
+    });
   });
 
   // =========================================================================
@@ -745,4 +802,491 @@ describe('GeminiProvider Reliability & Transient Error Retry Suite', () => {
       expect(passedModel).toBe('gemini-2.5-pro');
     });
   });
+
+  // =========================================================================
+  // 10. Thinking Level Configuration (Gemini 3.8 Flash low/medium/high)
+  // =========================================================================
+  describe('Thinking Level Configuration', () => {
+    it('should pass thinkingLevel: low by default in config', async () => {
+      let passedConfig: any = null;
+      const mockGenerate = vi.fn().mockImplementation(async (params) => {
+        passedConfig = params.config;
+        return { text: 'ok' };
+      });
+
+      const provider = new GeminiProvider({
+        apiKey: dummyApiKey,
+        generateContentFn: mockGenerate,
+      });
+
+      await provider.generateResponse([{ role: 'user', content: 'hello' }]);
+      expect(passedConfig?.thinkingConfig?.thinkingLevel).toBe('LOW');
+    });
+
+    it('should pass thinkingLevel: medium when elevated for complex requests', async () => {
+      let passedConfig: any = null;
+      const mockGenerate = vi.fn().mockImplementation(async (params) => {
+        passedConfig = params.config;
+        return { text: 'ok' };
+      });
+
+      const provider = new GeminiProvider({
+        apiKey: dummyApiKey,
+        generateContentFn: mockGenerate,
+      });
+
+      await provider.generateResponse(
+        [{ role: 'user', content: 'compare these products in depth' }],
+        { thinkingLevel: 'medium' }
+      );
+      expect(passedConfig?.thinkingConfig?.thinkingLevel).toBe('MEDIUM');
+    });
+
+    it('should respect custom defaultThinkingLevel configured in provider', async () => {
+      let passedConfig: any = null;
+      const mockGenerate = vi.fn().mockImplementation(async (params) => {
+        passedConfig = params.config;
+        return { text: 'ok' };
+      });
+
+      const provider = new GeminiProvider({
+        apiKey: dummyApiKey,
+        defaultThinkingLevel: 'high',
+        generateContentFn: mockGenerate,
+      });
+
+      expect(provider.getDefaultThinkingLevel()).toBe('high');
+      await provider.generateResponse([{ role: 'user', content: 'test' }]);
+      expect(passedConfig?.thinkingConfig?.thinkingLevel).toBe('HIGH');
+    });
+  });
+
+  // =========================================================================
+  // 11. Hard Per-Request Timeout & Overall AI Deadline Suite
+  // =========================================================================
+  describe('Hard Per-Request Timeout & Overall AI Deadline Suite', () => {
+    it('SDK request hangs -> timeout: aborts underlying request and logs timeout', async () => {
+      const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+      let aborted = false;
+
+      const mockGenerate = vi.fn().mockImplementation(async (params) => {
+        return new Promise((resolve) => {
+          params.config?.abortSignal?.addEventListener('abort', () => {
+            aborted = true;
+          });
+          // Hangs indefinitely without resolving
+          setTimeout(() => resolve({ text: 'late' }), 2000);
+        });
+      });
+
+      const provider = new GeminiProvider({
+        apiKey: dummyApiKey,
+        fallbackModel: '', // isolate primary model
+        primaryMaxRetries: 0,
+        requestTimeoutMs: 50,
+        overallDeadlineMs: 500,
+        generateContentFn: mockGenerate,
+        sleepFn: async () => {},
+      });
+
+      await expect(
+        provider.generateResponse([{ role: 'user', content: 'hello' }])
+      ).rejects.toThrow(NexaError);
+
+      expect(aborted).toBe(true);
+      const loggedMessages = logSpy.mock.calls.map((c) => c[0]);
+      expect(
+        loggedMessages.some(
+          (m) => typeof m === 'string' && m.startsWith('[Gemini] timeout model=gemini-3.8-flash timeout_ms=50')
+        )
+      ).toBe(true);
+
+      logSpy.mockRestore();
+    });
+
+    it('timeout -> fallback: switches to fallback model after primary model times out', async () => {
+      const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+      const modelsCalled: string[] = [];
+
+      const mockGenerate = vi.fn().mockImplementation(async (params) => {
+        modelsCalled.push(params.model);
+        if (params.model === 'gemini-3.8-flash') {
+          // Hangs and times out
+          return new Promise((resolve) => {
+            setTimeout(() => resolve({ text: 'late' }), 2000);
+          });
+        }
+        return { text: 'Fallback succeeded in time!' };
+      });
+
+      const provider = new GeminiProvider({
+        apiKey: dummyApiKey,
+        defaultModel: 'gemini-3.8-flash',
+        fallbackModel: 'gemini-3.7-flash',
+        primaryMaxRetries: 0, // prompt switch on first timeout
+        requestTimeoutMs: 50,
+        overallDeadlineMs: 1000,
+        generateContentFn: mockGenerate,
+        sleepFn: async () => {},
+      });
+
+      const response = await provider.generateResponse([{ role: 'user', content: 'test' }]);
+      expect(response.text).toBe('Fallback succeeded in time!');
+      expect(modelsCalled).toEqual(['gemini-3.8-flash', 'gemini-3.7-flash']);
+
+      const loggedMessages = logSpy.mock.calls.map((c) => c[0]);
+      expect(
+        loggedMessages.some(
+          (m) => m === '[Gemini] fallback_model_switch from=gemini-3.8-flash to=gemini-3.7-flash'
+        )
+      ).toBe(true);
+
+      logSpy.mockRestore();
+    });
+
+    it('503 -> retry -> fallback: retries 503 then switches to fallback model', async () => {
+      const modelsCalled: string[] = [];
+      const mockGenerate = vi.fn().mockImplementation(async (params) => {
+        modelsCalled.push(params.model);
+        if (params.model === 'gemini-3.8-flash') {
+          const err: any = new Error('503 UNAVAILABLE');
+          err.status = 503;
+          throw err;
+        }
+        return { text: 'Recovered on fallback' };
+      });
+
+      const provider = new GeminiProvider({
+        apiKey: dummyApiKey,
+        defaultModel: 'gemini-3.8-flash',
+        fallbackModel: 'gemini-3.7-flash',
+        primaryMaxRetries: 1, // 1 retry then switch
+        generateContentFn: mockGenerate,
+        sleepFn: async () => {},
+      });
+
+      const response = await provider.generateResponse([{ role: 'user', content: 'query' }]);
+      expect(response.text).toBe('Recovered on fallback');
+      expect(modelsCalled).toEqual([
+        'gemini-3.8-flash',
+        'gemini-3.8-flash',
+        'gemini-3.7-flash',
+      ]);
+    });
+
+    it('fallback timeout -> safe error: throws safe user-facing error when both models time out', async () => {
+      const mockGenerate = vi.fn().mockImplementation(async () => {
+        return new Promise((resolve) => setTimeout(() => resolve({ text: 'late' }), 2000));
+      });
+
+      const provider = new GeminiProvider({
+        apiKey: dummyApiKey,
+        defaultModel: 'gemini-3.8-flash',
+        fallbackModel: 'gemini-3.7-flash',
+        primaryMaxRetries: 0,
+        fallbackMaxRetries: 0,
+        requestTimeoutMs: 50,
+        overallDeadlineMs: 500,
+        generateContentFn: mockGenerate,
+        sleepFn: async () => {},
+      });
+
+      try {
+        await provider.generateResponse([{ role: 'user', content: 'query' }]);
+        expect.unreachable();
+      } catch (err: any) {
+        expect(err).toBeInstanceOf(NexaError);
+        expect(err.statusCode).toBe(503);
+        expect(err.code).toBe('AI_SERVICE_UNAVAILABLE');
+        expect(err.userFacingMessage).toBe(
+          'NEXA is currently experiencing high load. Please try again in a moment.'
+        );
+      }
+    });
+
+    it('successful fast request: completes well within timeout without aborting', async () => {
+      let passedAbortSignal: any = null;
+      const mockGenerate = vi.fn().mockImplementation(async (params) => {
+        passedAbortSignal = params.config?.abortSignal;
+        return { text: 'Fast response' };
+      });
+
+      const provider = new GeminiProvider({
+        apiKey: dummyApiKey,
+        requestTimeoutMs: 5000,
+        generateContentFn: mockGenerate,
+      });
+
+      const response = await provider.generateResponse([{ role: 'user', content: 'hi' }]);
+      expect(response.text).toBe('Fast response');
+      expect(passedAbortSignal?.aborted).toBe(false);
+    });
+
+    it('permanent 401/403/404: fails immediately without waiting for timeout or retry', async () => {
+      let callCount = 0;
+      const mockGenerate = vi.fn().mockImplementation(async () => {
+        callCount++;
+        const err: any = new Error('401 UNAUTHENTICATED');
+        err.status = 401;
+        throw err;
+      });
+
+      const provider = new GeminiProvider({
+        apiKey: dummyApiKey,
+        generateContentFn: mockGenerate,
+        sleepFn: async () => {},
+      });
+
+      await expect(
+        provider.generateResponse([{ role: 'user', content: 'test' }])
+      ).rejects.toThrow(NexaError);
+
+      expect(callCount).toBe(1);
+    });
+
+    it('overall deadline: caps total execution time and prevents runaway retries', async () => {
+      let callCount = 0;
+      const mockGenerate = vi.fn().mockImplementation(async () => {
+        callCount++;
+        return new Promise((resolve) => setTimeout(() => resolve({ text: 'late' }), 2000));
+      });
+
+      const provider = new GeminiProvider({
+        apiKey: dummyApiKey,
+        primaryMaxRetries: 5,
+        requestTimeoutMs: 30,
+        overallDeadlineMs: 70, // deadline expires after ~2 timeouts
+        generateContentFn: mockGenerate,
+        sleepFn: async () => {},
+      });
+
+      const startTime = Date.now();
+      await expect(
+        provider.generateResponse([{ role: 'user', content: 'test' }])
+      ).rejects.toThrow(NexaError);
+      const elapsed = Date.now() - startTime;
+
+      // Must have stopped within approximately the deadline without looping 5 times
+      expect(callCount).toBeLessThanOrEqual(3);
+      expect(elapsed).toBeLessThan(500);
+    });
+  });
+
+  // =========================================================================
+  // 12. Conversation Structure Validation & Final User Turn Suite
+  // =========================================================================
+  describe('Conversation Structure Validation & Final User Turn Suite', () => {
+    it('Test A: history ends with model + new user message => valid request ending in user', async () => {
+      let passedContents: any[] = [];
+      const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+
+      const mockGenerate = vi.fn().mockImplementation(async (params) => {
+        passedContents = params.contents;
+        return { text: 'ok' };
+      });
+
+      const provider = new GeminiProvider({
+        apiKey: dummyApiKey,
+        generateContentFn: mockGenerate,
+      });
+
+      // History ending in assistant + current user text supplied
+      await provider.generateResponse(
+        [
+          { role: 'user', content: 'Previous user message' },
+          { role: 'assistant', content: 'Previous assistant reply' },
+        ],
+        { currentUserText: 'New incoming user query' }
+      );
+
+      expect(passedContents.length).toBe(3);
+      expect(passedContents[2].role).toBe('user');
+      expect(passedContents[2].parts[0].text).toBe('New incoming user query');
+
+      const loggedMessages = logSpy.mock.calls.map((c) => c[0]);
+      expect(loggedMessages.some((m) => m === '[Gemini] final_turn_role=user')).toBe(true);
+      expect(loggedMessages.some((m) => m === '[Gemini] conversation_roles=user,model,user')).toBe(true);
+
+      logSpy.mockRestore();
+    });
+
+    it('Test B: history ends with model + current user already included => no duplicate user message', async () => {
+      let passedContents: any[] = [];
+      const mockGenerate = vi.fn().mockImplementation(async (params) => {
+        passedContents = params.contents;
+        return { text: 'ok' };
+      });
+
+      const provider = new GeminiProvider({
+        apiKey: dummyApiKey,
+        generateContentFn: mockGenerate,
+      });
+
+      await provider.generateResponse(
+        [
+          { role: 'user', content: 'First' },
+          { role: 'assistant', content: 'Second' },
+          { role: 'user', content: 'Third' },
+        ],
+        { currentUserText: 'Third' }
+      );
+
+      expect(passedContents.length).toBe(3);
+      expect(passedContents[0].role).toBe('user');
+      expect(passedContents[1].role).toBe('model');
+      expect(passedContents[2].role).toBe('user');
+      expect(passedContents[2].parts[0].text).toBe('Third');
+    });
+
+    it('Test C: history ends with user => valid request', async () => {
+      let passedContents: any[] = [];
+      const mockGenerate = vi.fn().mockImplementation(async (params) => {
+        passedContents = params.contents;
+        return { text: 'ok' };
+      });
+
+      const provider = new GeminiProvider({
+        apiKey: dummyApiKey,
+        generateContentFn: mockGenerate,
+      });
+
+      await provider.generateResponse([{ role: 'user', content: 'Single prompt' }]);
+      expect(passedContents).toHaveLength(1);
+      expect(passedContents[0].role).toBe('user');
+      expect(passedContents[0].parts[0].text).toBe('Single prompt');
+    });
+
+    it('Test D: empty history + user message => valid request', async () => {
+      let passedContents: any[] = [];
+      const mockGenerate = vi.fn().mockImplementation(async (params) => {
+        passedContents = params.contents;
+        return { text: 'ok' };
+      });
+
+      const provider = new GeminiProvider({
+        apiKey: dummyApiKey,
+        generateContentFn: mockGenerate,
+      });
+
+      await provider.generateResponse([], { currentUserText: 'Fresh message' });
+      expect(passedContents).toHaveLength(1);
+      expect(passedContents[0].role).toBe('user');
+      expect(passedContents[0].parts[0].text).toBe('Fresh message');
+    });
+
+    it('validateGeminiConversation unit tests: repair model turn and enforce validation', () => {
+      // 1. Repair model turn with fallback user text
+      const repaired = validateGeminiConversation(
+        [
+          { role: 'user', parts: [{ text: 'hi' }] },
+          { role: 'model', parts: [{ text: 'hello' }] },
+        ],
+        'Follow-up query'
+      );
+      expect(repaired.length).toBe(3);
+      expect(repaired[2].role).toBe('user');
+      expect(repaired[2].parts[0].text).toBe('Follow-up query');
+
+      // 2. Reject model turn without fallback text
+      expect(() => {
+        validateGeminiConversation([
+          { role: 'user', parts: [{ text: 'hi' }] },
+          { role: 'model', parts: [{ text: 'hello' }] },
+        ]);
+      }).toThrow('final turn must be a user turn');
+
+      // 3. Reject empty contents without fallback
+      expect(() => {
+        validateGeminiConversation([]);
+      }).toThrow('contents cannot be empty');
+
+      // 4. Reject invalid role
+      expect(() => {
+        validateGeminiConversation([{ role: 'unknown', parts: [{ text: 'bad' }] }]);
+      }).toThrow('invalid role');
+
+      // 5. Deduplicate identical consecutive user messages at the end
+      const deduped = validateGeminiConversation([
+        { role: 'model', parts: [{ text: 'hi' }] },
+        { role: 'user', parts: [{ text: 'same' }] },
+        { role: 'user', parts: [{ text: 'same' }] },
+      ]);
+      expect(deduped.length).toBe(2);
+      expect(deduped[1].role).toBe('user');
+      expect(deduped[1].parts[0].text).toBe('same');
+    });
+
+    it('Regression: reproduces exact previous 400 error on trailing model turn and proves user->model->user fix', async () => {
+      // 1. Reproduce what the real Gemini API does if contents ends in a 'model' turn:
+      // It returns HTTP 400 INVALID_ARGUMENT "Requests ending with a model turn are not supported."
+      const mockRealGeminiSdk = vi.fn().mockImplementation(async (params) => {
+        const last = params.contents[params.contents.length - 1];
+        if (last.role === 'model') {
+          const err: any = new Error(
+            'HTTP 400 INVALID_ARGUMENT: Requests ending with a model turn are not supported.'
+          );
+          err.status = 400;
+          throw err;
+        }
+        return { text: `Success: handled response for "${last.parts[0].text}"` };
+      });
+
+      // Proof 1: The exact previous bug reproduced.
+      // If raw contents ending in model turn is submitted to Gemini SDK without validation:
+      const rawBuggyContents = [
+        { role: 'user', parts: [{ text: 'First user message' }] },
+        { role: 'model', parts: [{ text: 'First assistant reply' }] },
+      ];
+      await expect(
+        mockRealGeminiSdk({ contents: rawBuggyContents })
+      ).rejects.toThrow('HTTP 400 INVALID_ARGUMENT: Requests ending with a model turn are not supported.');
+
+      // Proof 2: validateGeminiConversation catches unrepairable trailing model turn
+      // and blocks the invalid request before sending to Gemini:
+      const provider = new GeminiProvider({
+        apiKey: dummyApiKey,
+        generateContentFn: mockRealGeminiSdk,
+      });
+
+      await expect(
+        provider.generateResponse([
+          { role: 'assistant', content: 'Only assistant reply without any user context' },
+        ])
+      ).rejects.toThrow('final turn must be a user turn');
+
+      // Proof 3: With the fix in place:
+      // History has: user -> model
+      // New incoming user message is provided: 'Second user message'
+      // Final Gemini contents is validated and constructed as: user -> model -> user
+      let capturedContents: any[] = [];
+      mockRealGeminiSdk.mockImplementation(async (params) => {
+        capturedContents = params.contents;
+        const last = params.contents[params.contents.length - 1];
+        if (last.role === 'model') {
+          const err: any = new Error(
+            'HTTP 400 INVALID_ARGUMENT: Requests ending with a model turn are not supported.'
+          );
+          err.status = 400;
+          throw err;
+        }
+        return { text: `Success: handled response for "${last.parts[0].text}"` };
+      });
+
+      const response = await provider.generateResponse(
+        [
+          { role: 'user', content: 'First user message' },
+          { role: 'assistant', content: 'First assistant reply' },
+        ],
+        { currentUserText: 'Second user message' }
+      );
+
+      // Verify the 400 error is completely avoided and contents is user -> model -> user
+      expect(response.text).toBe('Success: handled response for "Second user message"');
+      expect(capturedContents).toHaveLength(3);
+      expect(capturedContents[0]).toEqual({ role: 'user', parts: [{ text: 'First user message' }] });
+      expect(capturedContents[1]).toEqual({ role: 'model', parts: [{ text: 'First assistant reply' }] });
+      expect(capturedContents[2]).toEqual({ role: 'user', parts: [{ text: 'Second user message' }] });
+    });
+  });
 });
+

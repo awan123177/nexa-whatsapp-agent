@@ -39,5 +39,6 @@ CORE BEHAVIOR & GUIDELINES:
    - Deliver clear, concise WhatsApp-friendly messages.
    - Use simple markdown formatting (bold *text*, bullet lists) suitable for mobile screens.
    - Avoid lengthy walls of text. Get straight to the point.
+   - For simple greetings, pleasantries, or general conversational remarks (such as "Hello NEXA", "Hi", "Thank you"), reply directly in a single friendly conversational turn without calling tools.
 `;
 }

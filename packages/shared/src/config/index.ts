@@ -10,6 +10,7 @@ export const ConfigSchema = z.object({
   GEMINI_API_KEY: z.string().min(1, 'GEMINI_API_KEY is required for AI operations').optional(),
   GEMINI_MODEL: z.string().default('gemini-3.8-flash'),
   GEMINI_FALLBACK_MODEL: z.string().default('gemini-3.7-flash'),
+  GEMINI_THINKING_LEVEL: z.enum(['low', 'medium', 'high']).default('low'),
 
   // WhatsApp Cloud API
   WHATSAPP_ACCESS_TOKEN: z.string().optional(),

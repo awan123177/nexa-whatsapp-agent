@@ -76,6 +76,9 @@ export function registerWhatsAppRoutes(
     // 3. Immediately respond 200 OK to Meta to prevent retries/timeouts
     reply.status(200).send({ status: 'received' });
 
+    const webhookReceivedAt = Date.now();
+    console.log(`[WhatsApp Path] webhook_received count=${incomingMessages.length}`);
+
     // 4. Asynchronously process incoming messages via Agent Orchestrator with idempotency guard
     for (const msg of incomingMessages) {
       const messageId = msg.whatsappMessageId;
@@ -99,6 +102,9 @@ export function registerWhatsAppRoutes(
 
       (async () => {
         try {
+          const agentStartedAt = Date.now();
+          console.log(`[WhatsApp Path] agent_processing_start elapsed_ms=${agentStartedAt - webhookReceivedAt}`);
+
           // Check rate limit per phone number
           const rateCheck = rateLimiter.check(msg.senderPhoneNumber);
           if (!rateCheck.allowed) {
@@ -129,7 +135,11 @@ export function registerWhatsAppRoutes(
             whatsappMessageId: msg.whatsappMessageId,
             interactiveButtonId: msg.interactiveSelection?.id,
             whatsappClient: whatsapp,
+            receivedAt: webhookReceivedAt,
           });
+
+          const sendStartedAt = Date.now();
+          console.log(`[WhatsApp Path] whatsapp_send_start elapsed_ms=${sendStartedAt - webhookReceivedAt}`);
 
           // Send response back to user
           if (result.requiresApproval && result.approvalPrompt && result.approvalId) {
@@ -143,6 +153,11 @@ export function registerWhatsAppRoutes(
             // Send standard response text
             await whatsapp.sendText(msg.senderPhoneNumber, result.replyText);
           }
+
+          const sendCompletedAt = Date.now();
+          console.log(
+            `[WhatsApp Path] whatsapp_send_success send_latency_ms=${sendCompletedAt - sendStartedAt} total_latency_ms=${sendCompletedAt - webhookReceivedAt}`
+          );
 
           // Mark message as completed in idempotency tracker
           if (messageId) {

@@ -160,14 +160,15 @@ export class SupabaseRepository implements IDatabaseRepository {
       .from('messages')
       .select('*')
       .eq('conversation_id', conversationId)
-      .order('created_at', { ascending: true })
+      .order('created_at', { ascending: false })
       .limit(limit);
 
     if (error) {
       throw new Error(`Failed to retrieve messages: ${error.message}`);
     }
 
-    return (data as Message[]) || [];
+    const messages = (data as Message[]) || [];
+    return messages.reverse();
   }
 
   async getMessageByWhatsAppId(whatsappMessageId: string): Promise<Message | null> {
