@@ -56,6 +56,9 @@ export interface AICompletionOptions {
   requestTimeoutMs?: number;
   overallDeadlineMs?: number;
   rawHistory?: any[];
+  isToolUse?: boolean;
+  isCommerceTask?: boolean;
+  isSimpleChat?: boolean;
 }
 
 export interface AIResponse {

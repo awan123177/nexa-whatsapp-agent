@@ -1,6 +1,8 @@
 import {
   AIProvider,
   AIMessage,
+  AIResponse,
+  NexaError,
   ToolExecutionContext,
   ChannelType,
   MediaType,
@@ -393,6 +395,7 @@ export class AgentOrchestrator {
     let currentStep = 0;
     let finalReply = '';
     let latestExecutionToolFailed = false;
+    let modelFailed = false;
     let verifiedSuccess = false;
     let executionToolCalled = false;
 
@@ -418,14 +421,33 @@ export class AgentOrchestrator {
       console.log(`[WhatsApp Path] gemini_request_start step=${currentStep} thinking_level=${thinkingLevel}`);
       const stepStartTime = Date.now();
 
-      const aiResponse = await this.aiProvider.generateResponse(messages, {
-        systemInstruction,
-        tools: toolDeclarations,
-        thinkingLevel,
-        currentUserText: currentTurnContent,
-        currentUserMedia: userMediaPart,
-        rawHistory: activeRawHistory,
-      });
+      let aiResponse: AIResponse;
+      try {
+        aiResponse = await this.aiProvider.generateResponse(messages, {
+          systemInstruction,
+          tools: toolDeclarations,
+          thinkingLevel,
+          currentUserText: currentTurnContent,
+          currentUserMedia: userMediaPart,
+          rawHistory: activeRawHistory,
+          isCommerceTask,
+          isToolUse: isCommerceTask || toolDeclarations.length > 0,
+          overallDeadlineMs: remainingMs,
+        });
+      } catch (geminiErr: any) {
+        modelFailed = true;
+        console.log(`[Agent] model_execution_failed step=${currentStep} error="${geminiErr.message}"`);
+        if (stateMachine.canTransitionTo('FAILED')) {
+          stateMachine.transitionTo('FAILED');
+        }
+        console.log(`[Agent] task_failed reason="model_failed" steps=${currentStep}`);
+
+        finalReply =
+          geminiErr instanceof NexaError && geminiErr.userFacingMessage
+            ? geminiErr.userFacingMessage
+            : "I'm currently having trouble connecting to the AI service due to high demand. Please try again in a moment.";
+        break;
+      }
 
       const stepLatency = Date.now() - stepStartTime;
       console.log(`[WhatsApp Path] gemini_response_received step=${currentStep} latency_ms=${stepLatency}`);
@@ -461,7 +483,9 @@ export class AgentOrchestrator {
 
       // Append model's exact Content object (preserving functionCall and thoughtSignature)
       if (aiResponse.rawModelContent) {
-        activeRawHistory.push(JSON.parse(JSON.stringify(aiResponse.rawModelContent)));
+        const rawModelTurn = JSON.parse(JSON.stringify(aiResponse.rawModelContent));
+        if (!rawModelTurn.role) rawModelTurn.role = 'model';
+        activeRawHistory.push(rawModelTurn);
       } else if (aiResponse.rawModelParts) {
         activeRawHistory.push({
           role: 'model',
@@ -784,12 +808,16 @@ export class AgentOrchestrator {
         stateMachine.transitionTo('FAILED');
       }
       console.log(`[Agent] task_failed reason="action_execution_failed" steps=${currentStep}`);
+    } else if (modelFailed) {
+      if (stateMachine.canTransitionTo('FAILED')) {
+        stateMachine.transitionTo('FAILED');
+      }
     } else if (currentStep >= effectiveMaxSteps && !finalReply) {
       if (stateMachine.canTransitionTo('FAILED')) {
         stateMachine.transitionTo('FAILED');
       }
       console.log(`[Agent] task_failed reason="max_steps_reached" steps=${currentStep}`);
-    } else if (finalReply) {
+    } else if (finalReply && !modelFailed && !latestExecutionToolFailed) {
       if (stateMachine.canTransitionTo('COMPLETED')) {
         stateMachine.transitionTo('COMPLETED');
       }

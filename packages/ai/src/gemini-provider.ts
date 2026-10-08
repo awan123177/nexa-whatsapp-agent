@@ -8,6 +8,9 @@ import {
   AIMediaPart,
   NexaError,
   ThinkingLevel,
+  GEMINI_SDK_TIMEOUT_MS,
+  GEMINI_ATTEMPT_TIMEOUT_MS,
+  GEMINI_TOOL_ATTEMPT_TIMEOUT_MS,
 } from '@nexa/shared';
 import { redactString } from '@nexa/security';
 
@@ -20,6 +23,12 @@ export interface GeminiProviderOptions {
   fallbackMaxRetries?: number;
   maxRetries?: number;
   requestTimeoutMs?: number;
+  attemptTimeoutMs?: number;
+  toolAttemptTimeoutMs?: number;
+  sdkTimeoutMs?: number;
+  geminiSdkTimeoutMs?: number;
+  geminiAttemptTimeoutMs?: number;
+  geminiToolAttemptTimeoutMs?: number;
   overallDeadlineMs?: number;
   sleepFn?: (ms: number) => Promise<void>;
   generateContentFn?: (params: any) => Promise<any>;
@@ -392,6 +401,9 @@ export class GeminiProvider implements AIProvider {
   private primaryMaxRetries: number;
   private fallbackMaxRetries: number;
   private requestTimeoutMs: number;
+  private attemptTimeoutMs: number;
+  private toolAttemptTimeoutMs: number;
+  private sdkTimeoutMs: number;
   private overallDeadlineMs: number;
   private sleepFn: (ms: number) => Promise<void>;
   private generateContentFn?: (params: any) => Promise<any>;
@@ -405,13 +417,24 @@ export class GeminiProvider implements AIProvider {
     }
     this.client = new GoogleGenAI({ apiKey: options.apiKey });
     this.defaultModel = options.defaultModel || 'gemini-3.7-flash';
-    this.fallbackModel = options.fallbackModel || 'gemini-3.8-flash';
+    this.fallbackModel = options.fallbackModel || 'gemini-3.6-flash';
     this.defaultThinkingLevel = options.defaultThinkingLevel || 'low';
     this.primaryMaxRetries =
       options.primaryMaxRetries ?? (options.maxRetries !== undefined ? options.maxRetries : 1);
     this.fallbackMaxRetries =
       options.fallbackMaxRetries ?? (options.maxRetries !== undefined ? options.maxRetries : 1);
-    this.requestTimeoutMs = options.requestTimeoutMs ?? 10_000;
+    this.attemptTimeoutMs =
+      options.geminiAttemptTimeoutMs ??
+      options.attemptTimeoutMs ??
+      options.requestTimeoutMs ??
+      GEMINI_ATTEMPT_TIMEOUT_MS;
+    this.toolAttemptTimeoutMs =
+      options.geminiToolAttemptTimeoutMs ??
+      options.toolAttemptTimeoutMs ??
+      GEMINI_TOOL_ATTEMPT_TIMEOUT_MS;
+    this.sdkTimeoutMs =
+      options.geminiSdkTimeoutMs ?? options.sdkTimeoutMs ?? GEMINI_SDK_TIMEOUT_MS;
+    this.requestTimeoutMs = options.requestTimeoutMs ?? this.attemptTimeoutMs;
     this.overallDeadlineMs = options.overallDeadlineMs ?? 25_000;
     this.sleepFn = options.sleepFn || ((ms: number) => new Promise((resolve) => setTimeout(resolve, ms)));
     this.generateContentFn = options.generateContentFn;
@@ -433,6 +456,18 @@ export class GeminiProvider implements AIProvider {
     return this.requestTimeoutMs;
   }
 
+  public getAttemptTimeoutMs(): number {
+    return this.attemptTimeoutMs;
+  }
+
+  public getToolAttemptTimeoutMs(): number {
+    return this.toolAttemptTimeoutMs;
+  }
+
+  public getSdkTimeoutMs(): number {
+    return this.sdkTimeoutMs;
+  }
+
   public getOverallDeadlineMs(): number {
     return this.overallDeadlineMs;
   }
@@ -446,11 +481,32 @@ export class GeminiProvider implements AIProvider {
     const fallbackModel =
       options.fallbackModel !== undefined ? options.fallbackModel : this.fallbackModel;
     const thinkingLevel = options.thinkingLevel || this.defaultThinkingLevel || 'low';
-    const requestTimeoutMs = options.requestTimeoutMs ?? this.requestTimeoutMs;
+
+    // Fast-path strategy:
+    // Simple chat = 1 fast model attempt
+    // Commerce / tool-use = robust bounded model attempt (18s), transient retries, fallback
+    const isSimpleChat =
+      options.isSimpleChat === true ||
+      (options.isToolUse === false &&
+        !options.isCommerceTask &&
+        (!options.tools || options.tools.length === 0));
+
+    const isToolOrCommerce =
+      !isSimpleChat &&
+      Boolean(
+        options.isCommerceTask ||
+        options.isToolUse ||
+        (options.tools && options.tools.length > 0)
+      );
+
+    const baseAttemptTimeoutMs = isToolOrCommerce
+      ? (options.requestTimeoutMs ?? this.toolAttemptTimeoutMs)
+      : (options.requestTimeoutMs ?? this.attemptTimeoutMs);
+
     const overallDeadlineMs = options.overallDeadlineMs ?? this.overallDeadlineMs;
 
     const modelsToTry = [primaryModel];
-    if (fallbackModel && fallbackModel !== primaryModel) {
+    if (!isSimpleChat && fallbackModel && fallbackModel !== primaryModel) {
       modelsToTry.push(fallbackModel);
     }
 
@@ -501,9 +557,17 @@ export class GeminiProvider implements AIProvider {
 
     for (let mIdx = 0; mIdx < modelsToTry.length; mIdx++) {
       const currentModel = modelsToTry[mIdx];
+      const isFallbackModel = mIdx > 0;
       const isLastModel = mIdx === modelsToTry.length - 1;
-      const maxRetries =
-        currentModel === primaryModel ? this.primaryMaxRetries : this.fallbackMaxRetries;
+      let maxRetries = isSimpleChat
+        ? 0
+        : (currentModel === primaryModel ? this.primaryMaxRetries : this.fallbackMaxRetries);
+
+      // Prevent agent from spending the entire task deadline on model retries
+      const elapsedBeforeModel = Date.now() - overallStartTime;
+      if (isFallbackModel && elapsedBeforeModel > 35_000) {
+        maxRetries = 0; // Fallback gets 1 robust attempt if prior primary attempts took excessive time
+      }
 
       let attempt = 0;
       // Fast bounded retry loop
@@ -514,10 +578,11 @@ export class GeminiProvider implements AIProvider {
         // Overall deadline check:
         // When fallback model switches (mIdx > 0), ensure it has a full attempt window
         // rather than being cut off prematurely by previous primary attempts.
-        const effectiveDeadlineMs =
-          mIdx > 0
-            ? Math.max(overallDeadlineMs, elapsedOverall + requestTimeoutMs)
-            : overallDeadlineMs;
+        const effectiveDeadlineMs = isFallbackModel
+          ? Math.max(overallDeadlineMs, elapsedOverall + baseAttemptTimeoutMs)
+          : overallDeadlineMs;
+
+        const remainingDeadlineMs = Math.max(0, effectiveDeadlineMs - elapsedOverall);
 
         if (elapsedOverall >= effectiveDeadlineMs) {
           const deadlineErr: any = new Error(
@@ -530,16 +595,23 @@ export class GeminiProvider implements AIProvider {
           break;
         }
 
-        // Application hard timeout: per-request timeout (default 10,000ms)
-        const currentTimeoutMs = requestTimeoutMs;
+        // Per-attempt timeout:
+        // For fallback model, it must receive the correct remaining deadline and not a tiny clipped window!
+        let currentTimeoutMs = baseAttemptTimeoutMs;
+        if (!isFallbackModel && remainingDeadlineMs < currentTimeoutMs) {
+          currentTimeoutMs = Math.max(1000, remainingDeadlineMs);
+        }
 
         // SDK transport deadline: MUST be >= 10,000ms. Never 5 seconds!
-        const sdkDeadlineMs = Math.max(10_000, currentTimeoutMs);
+        const sdkDeadlineMs = Math.max(this.sdkTimeoutMs, currentTimeoutMs + 5000);
 
         console.log(`[Gemini] sdk_deadline_ms=${sdkDeadlineMs}`);
         console.log(`[Gemini] timeout_ms=${currentTimeoutMs}`);
         console.log(`[Gemini] attempt=${attempt} model=${currentModel}`);
         console.log(`[Gemini] request_start model=${currentModel}`);
+        console.log(
+          `[Gemini] request_start model=${currentModel} attempt=${attempt} timeout_ms=${currentTimeoutMs} remaining_deadline_ms=${remainingDeadlineMs}`
+        );
         const callStartTime = Date.now();
 
         // Hard per-request timeout with AbortController cancellation
@@ -565,7 +637,7 @@ export class GeminiProvider implements AIProvider {
           config: {
             abortSignal: abortController.signal,
             httpOptions: {
-              timeout: sdkDeadlineMs, // ALWAYS >= 10,000ms! Never 5s!
+              timeout: sdkDeadlineMs, // Transport timeout (30,000ms default)
             },
             systemInstruction: options.systemInstruction || undefined,
             temperature: options.temperature ?? 0.2,
@@ -589,8 +661,17 @@ export class GeminiProvider implements AIProvider {
           if (timeoutTimer) clearTimeout(timeoutTimer);
 
           const latencyMs = Date.now() - callStartTime;
+          const postCallRemainingMs = Math.max(0, effectiveDeadlineMs - (Date.now() - overallStartTime));
           console.log(`[Gemini] success model=${currentModel} latency_ms=${latencyMs}`);
           console.log('[Gemini] success');
+          console.log(
+            `[Gemini] request_success model=${currentModel} attempt=${attempt} latency_ms=${latencyMs} remaining_deadline_ms=${postCallRemainingMs}`
+          );
+          if (isFallbackModel) {
+            console.log(
+              `[Gemini] fallback_success model=${currentModel} attempt=${attempt} latency_ms=${latencyMs} remaining_deadline_ms=${postCallRemainingMs}`
+            );
+          }
 
           const candidate = (response as any).candidates?.[0];
           const candidateContent = candidate?.content;
@@ -696,6 +777,8 @@ export class GeminiProvider implements AIProvider {
           }
 
           const status = extractStatusCode(error) || (isTimeout ? 504 : 503);
+          const callLatencyMs = Date.now() - callStartTime;
+          const postErrorRemainingMs = Math.max(0, effectiveDeadlineMs - (Date.now() - overallStartTime));
 
           // If current model still has fast retries remaining
           if (attempt <= maxRetries) {
@@ -709,6 +792,12 @@ export class GeminiProvider implements AIProvider {
             delayMs = Math.min(delayMs, Math.max(0, remainingBeforeSleep - 1500));
 
             console.log(`[Gemini] transient_error status=${status} retry_in_ms=${delayMs}`);
+            console.log(
+              `[Gemini] transient_error model=${currentModel} attempt=${attempt} error_status=${status} latency_ms=${callLatencyMs} remaining_deadline_ms=${postErrorRemainingMs}`
+            );
+            console.log(
+              `[Gemini] retry_scheduled model=${currentModel} attempt=${attempt} error_status=${status} retry_in_ms=${delayMs} remaining_deadline_ms=${postErrorRemainingMs}`
+            );
             await this.sleepFn(delayMs);
           } else {
             // Retries for current model exhausted
@@ -716,6 +805,9 @@ export class GeminiProvider implements AIProvider {
               const nextModel = modelsToTry[mIdx + 1];
               console.log(
                 `[Gemini] fallback_model_switch from=${currentModel} to=${nextModel}`
+              );
+              console.log(
+                `[Gemini] fallback_model_switch from=${currentModel} to=${nextModel} remaining_deadline_ms=${postErrorRemainingMs}`
               );
             }
           }
@@ -734,6 +826,13 @@ export class GeminiProvider implements AIProvider {
     }
 
     const totalLatencyMs = Date.now() - overallStartTime;
+    const finalRemainingMs = Math.max(0, overallDeadlineMs - totalLatencyMs);
+    const finalStatus = extractStatusCode(lastError) || (lastError?.name === 'TimeoutError' ? 504 : 503);
+    const failedModel = modelsToTry[modelsToTry.length - 1] || primaryModel;
+
+    console.log(
+      `[Gemini] all_attempts_failed model=${failedModel} attempt=${this.fallbackMaxRetries + 1} error_status=${finalStatus} remaining_deadline_ms=${finalRemainingMs}`
+    );
     console.log(`[Gemini] request_failed latency_ms=${totalLatencyMs}`);
     this.handleFinalError(lastError || new Error('All Gemini retry attempts exhausted.'));
   }

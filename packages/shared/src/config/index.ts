@@ -9,8 +9,11 @@ export const ConfigSchema = z.object({
   // Gemini AI
   GEMINI_API_KEY: z.string().min(1, 'GEMINI_API_KEY is required for AI operations').optional(),
   GEMINI_MODEL: z.string().default('gemini-3.7-flash'),
-  GEMINI_FALLBACK_MODEL: z.string().default('gemini-3.8-flash'),
+  GEMINI_FALLBACK_MODEL: z.string().default('gemini-3.6-flash'),
   GEMINI_THINKING_LEVEL: z.enum(['low', 'medium', 'high']).default('low'),
+  GEMINI_SDK_TIMEOUT_MS: z.coerce.number().default(30000),
+  GEMINI_ATTEMPT_TIMEOUT_MS: z.coerce.number().default(10000),
+  GEMINI_TOOL_ATTEMPT_TIMEOUT_MS: z.coerce.number().default(18000),
 
   // WhatsApp Cloud API
   WHATSAPP_ACCESS_TOKEN: z.string().optional(),
@@ -53,15 +56,30 @@ export const ConfigSchema = z.object({
   APPROVAL_TIMEOUT_MINUTES: z.coerce.number().default(60),
 });
 
+export const GEMINI_SDK_TIMEOUT_MS = 30000;
+export const GEMINI_SDK_TIMEOUT = GEMINI_SDK_TIMEOUT_MS;
+export const GEMINI_ATTEMPT_TIMEOUT_MS = 10000;
+export const GEMINI_ATTEMPT_TIMEOUT = GEMINI_ATTEMPT_TIMEOUT_MS;
+export const GEMINI_TOOL_ATTEMPT_TIMEOUT_MS = 18000;
+export const GEMINI_TOOL_ATTEMPT_TIMEOUT = GEMINI_TOOL_ATTEMPT_TIMEOUT_MS;
+
 export const BROWSER_NAVIGATION_TIMEOUT_MS = 25000;
 export const BROWSER_CLICK_TIMEOUT_MS = 12000;
 export const BROWSER_TYPE_TIMEOUT_MS = 12000;
 export const BROWSER_READ_TIMEOUT_MS = 12000;
 export const BROWSER_SCREENSHOT_TIMEOUT_MS = 12000;
 export const BROWSER_ACTION_TIMEOUT_MS = 12000;
+export const BROWSER_TIMEOUT_MS = 25000;
+export const BROWSER_TIMEOUT = BROWSER_NAVIGATION_TIMEOUT_MS;
+
 export const WEB_SEARCH_TIMEOUT_MS = 10000;
 export const DEFAULT_TOOL_TIMEOUT_MS = 7000;
+export const TOOL_TIMEOUT_MS = 7000;
+export const TOOL_TIMEOUT = TOOL_TIMEOUT_MS;
+
 export const TOTAL_AGENT_DEADLINE_MS = 22000;
+export const AGENT_TOTAL_DEADLINE_MS = TOTAL_AGENT_DEADLINE_MS;
+export const AGENT_TOTAL_DEADLINE = TOTAL_AGENT_DEADLINE_MS;
 export const COMMERCE_TASK_DEADLINE_MS = 120000;
 export const MAX_AGENT_STEPS = 5;
 export const COMMERCE_TASK_MAX_STEPS = 25;
