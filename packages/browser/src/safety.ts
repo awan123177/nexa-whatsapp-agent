@@ -1,4 +1,4 @@
-import { SecurityViolationError } from '@nexa/shared';
+import { SecurityViolationError, AuthState } from '@nexa/shared';
 
 function isPrivateOrRestrictedHost(rawHostname: string): boolean {
   // Strip IPv6 square brackets if present (e.g. "[::1]" -> "::1")
@@ -83,6 +83,14 @@ export function validateBrowserUrl(targetUrl: string): URL {
     );
   }
 
+  if (
+    process.env.NODE_ENV === 'test' &&
+    process.env.ALLOW_LOCAL_TEST_HOSTS === 'true' &&
+    (parsed.hostname === '127.0.0.1' || parsed.hostname === 'localhost')
+  ) {
+    return parsed;
+  }
+
   if (isPrivateOrRestrictedHost(parsed.hostname)) {
     throw new SecurityViolationError(
       `Navigation to internal/private network address '${parsed.hostname}' is prohibited.`
@@ -90,6 +98,7 @@ export function validateBrowserUrl(targetUrl: string): URL {
   }
 
   return parsed;
+
 }
 
 /**
@@ -139,3 +148,66 @@ export function detectCaptchaOrBotBlock(pageContent: string): {
 
   return { detected: false };
 }
+
+export interface AuthDetectionResult {
+  required: boolean;
+  state: AuthState;
+  type?: string;
+  message?: string;
+}
+
+/**
+ * Detects whether an opened page requires user login, MFA, OTP, or CAPTCHA.
+ */
+export function detectAuthenticationRequirement(
+  pageContent: string,
+  currentUrl: string
+): AuthDetectionResult {
+  const botCheck = detectCaptchaOrBotBlock(pageContent);
+  if (botCheck.detected) {
+    const isBlock = botCheck.type?.toLowerCase().includes('challenge') || botCheck.type?.toLowerCase().includes('blocked');
+    return {
+      required: true,
+      state: isBlock ? 'BLOCKED' : 'CAPTCHA_REQUIRED',
+      type: botCheck.type,
+      message: botCheck.message,
+    };
+  }
+
+  const urlLower = currentUrl.toLowerCase();
+  const contentLower = pageContent.toLowerCase();
+
+  const isAuthUrl =
+    urlLower.includes('/login') ||
+    urlLower.includes('/signin') ||
+    urlLower.includes('/sign-in') ||
+    urlLower.includes('/auth') ||
+    urlLower.includes('accounts.');
+
+  const isAuthContent =
+    contentLower.includes('please login') ||
+    contentLower.includes('please log in') ||
+    contentLower.includes('sign in to continue') ||
+    contentLower.includes('enter your mobile number') ||
+    contentLower.includes('enter mobile number to login') ||
+    contentLower.includes('login / sign up') ||
+    contentLower.includes('login or register') ||
+    contentLower.includes('verify otp') ||
+    contentLower.includes('needs you to sign in') ||
+    contentLower.includes('sign in first');
+
+  if (isAuthUrl || isAuthContent) {
+    return {
+      required: true,
+      state: 'AUTH_REQUIRED',
+      type: 'Login Required',
+      message: 'Website requires user authentication before continuing.',
+    };
+  }
+
+  return {
+    required: false,
+    state: 'AUTH_NOT_REQUIRED',
+  };
+}
+

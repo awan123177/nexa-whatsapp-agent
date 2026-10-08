@@ -57,6 +57,14 @@ export class PermissionEngine {
         'metadata.google.internal',
         '::1',
       ];
+      if (
+        process.env.NODE_ENV === 'test' &&
+        process.env.ALLOW_LOCAL_TEST_HOSTS === 'true' &&
+        (hostname === '127.0.0.1' || hostname === 'localhost')
+      ) {
+        return;
+      }
+
       for (const blocked of blockedHosts) {
         if (hostname === blocked || hostname.startsWith(blocked)) {
           throw new SecurityViolationError(`Access to internal/private resource '${hostname}' is prohibited.`);

@@ -55,6 +55,13 @@ export class InMemoryRepository implements IDatabaseRepository {
       role: 'user',
       status: 'active',
       preferences: {},
+      preferred_name: null,
+      name_confirmed: false,
+      name_source: null,
+      preferred_title: null,
+      title_confirmed: false,
+      title_source: null,
+      memory_version: 1,
       created_at: new Date().toISOString(),
       updated_at: new Date().toISOString(),
     };
@@ -63,7 +70,34 @@ export class InMemoryRepository implements IDatabaseRepository {
   }
 
   async getUserById(id: string): Promise<User | null> {
-    return this.users.get(id) || null;
+    const user = this.users.get(id);
+    if (!user) return null;
+
+    // Backward compatibility: Populate top-level fields from preferences if missing
+    if (user.preferences) {
+      if (user.preferred_name === undefined) {
+        user.preferred_name = (user.preferences.preferred_name as string) || null;
+      }
+      if (user.name_confirmed === undefined) {
+        user.name_confirmed = Boolean(user.preferences.name_confirmed);
+      }
+      if (user.name_source === undefined) {
+        user.name_source = (user.preferences.name_source as any) || null;
+      }
+      if (user.preferred_title === undefined) {
+        user.preferred_title = (user.preferences.preferred_title as string) || null;
+      }
+      if (user.title_confirmed === undefined) {
+        user.title_confirmed = Boolean(user.preferences.title_confirmed);
+      }
+      if (user.title_source === undefined) {
+        user.title_source = (user.preferences.title_source as any) || null;
+      }
+      if (user.memory_version === undefined) {
+        user.memory_version = (user.preferences.memory_version as number) || 1;
+      }
+    }
+    return user;
   }
 
   async updateUser(userId: string, updates: Partial<User>): Promise<User> {
@@ -71,12 +105,61 @@ export class InMemoryRepository implements IDatabaseRepository {
     if (!user) {
       throw new Error(`User not found: ${userId}`);
     }
-    const updatedPreferences = {
+    const updatedPreferences: Record<string, unknown> = {
       ...user.preferences,
       ...(updates.preferences || {}),
     };
+
+    if (updates.preferred_name !== undefined) {
+      updatedPreferences.preferred_name = updates.preferred_name;
+    }
+    if (updates.name_confirmed !== undefined) {
+      updatedPreferences.name_confirmed = updates.name_confirmed;
+    }
+    if (updates.name_source !== undefined) {
+      updatedPreferences.name_source = updates.name_source;
+    }
+    if (updates.preferred_title !== undefined) {
+      updatedPreferences.preferred_title = updates.preferred_title;
+    }
+    if (updates.title_confirmed !== undefined) {
+      updatedPreferences.title_confirmed = updates.title_confirmed;
+    }
+    if (updates.title_source !== undefined) {
+      updatedPreferences.title_source = updates.title_source;
+    }
+    if (updates.memory_version !== undefined) {
+      updatedPreferences.memory_version = updates.memory_version;
+    }
+
     Object.assign(user, updates, {
       preferences: updatedPreferences,
+      preferred_name:
+        updatedPreferences.preferred_name !== undefined
+          ? (updatedPreferences.preferred_name as string)
+          : (user.preferred_name ?? null),
+      name_confirmed:
+        updatedPreferences.name_confirmed !== undefined
+          ? Boolean(updatedPreferences.name_confirmed)
+          : Boolean(user.name_confirmed),
+      name_source:
+        updatedPreferences.name_source !== undefined
+          ? (updatedPreferences.name_source as any)
+          : (user.name_source ?? null),
+      preferred_title:
+        updatedPreferences.preferred_title !== undefined
+          ? (updatedPreferences.preferred_title as string)
+          : (user.preferred_title ?? null),
+      title_confirmed:
+        updatedPreferences.title_confirmed !== undefined
+          ? Boolean(updatedPreferences.title_confirmed)
+          : Boolean(user.title_confirmed),
+      title_source:
+        updatedPreferences.title_source !== undefined
+          ? (updatedPreferences.title_source as any)
+          : (user.title_source ?? null),
+      memory_version:
+        (updatedPreferences.memory_version as number) ?? user.memory_version ?? 1,
       updated_at: new Date().toISOString(),
     });
     return user;
@@ -205,6 +288,9 @@ export class InMemoryRepository implements IDatabaseRepository {
       existing.value = data.value;
       existing.confidence = data.confidence;
       existing.metadata = data.metadata;
+      if (data.source !== undefined) existing.source = data.source;
+      if (data.confirmed !== undefined) existing.confirmed = data.confirmed;
+      if (data.version !== undefined) existing.version = data.version;
       existing.updated_at = now;
       return existing;
     }
@@ -212,6 +298,9 @@ export class InMemoryRepository implements IDatabaseRepository {
     const memory: Memory = {
       ...data,
       id: crypto.randomUUID(),
+      source: data.source || 'USER_PROVIDED',
+      confirmed: data.confirmed !== false,
+      version: data.version || 1,
       created_at: now,
       updated_at: now,
     };

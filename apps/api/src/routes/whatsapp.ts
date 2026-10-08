@@ -203,12 +203,30 @@ export function registerWhatsAppRoutes(
             completedMessageIds.set(messageId, { timestamp: Date.now() });
           }
         } catch (err: any) {
-          console.error('[WhatsApp Worker Error]', err);
-          const userFacingMessage =
+          let userFacingMessage =
             err instanceof NexaError && err.userFacingMessage
               ? err.userFacingMessage
-              : 'I encountered an unexpected issue while processing your request. Please try again in a moment.';
+              : undefined;
+
+          if (!userFacingMessage) {
+            const msgLower = (err?.message || '').toLowerCase();
+            if (msgLower.includes('gemini') || msgLower.includes('ai') || msgLower.includes('model')) {
+              userFacingMessage = "I'm having trouble reaching my AI service right now. Give me a moment and try again.";
+            } else if (msgLower.includes('browser') || msgLower.includes('chromium') || msgLower.includes('playwright')) {
+              userFacingMessage = "I couldn't open that site right now.";
+            } else if (msgLower.includes('search') || msgLower.includes('duckduckgo')) {
+              userFacingMessage = "I couldn't reach live web search right now, so I don't want to give you outdated information.";
+            } else if (msgLower.includes('booking') || msgLower.includes('flight') || msgLower.includes('hotel')) {
+              userFacingMessage = "I couldn't verify the booking, so I haven't marked it as booked.";
+            } else if (msgLower.includes('payment') || msgLower.includes('wallet') || msgLower.includes('transfer')) {
+              userFacingMessage = "The payment didn't complete, so I haven't marked it as successful.";
+            } else {
+              userFacingMessage = 'I encountered an unexpected issue while processing your request. Please try again in a moment.';
+            }
+          }
+
           await whatsapp.sendText(msg.senderPhoneNumber, userFacingMessage);
+
 
           if (messageId) {
             completedMessageIds.set(messageId, { timestamp: Date.now() });

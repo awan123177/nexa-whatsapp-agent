@@ -89,9 +89,13 @@ export class SupabaseRepository implements IDatabaseRepository {
     if (!data) return null;
     const user = data as User;
     if (user.preferences) {
-      user.preferred_name = user.preferences.preferred_name as string;
-      user.name_confirmed = Boolean(user.preferences.name_confirmed);
-      user.name_source = user.preferences.name_source as any;
+      user.preferred_name = (user.preferences.preferred_name as string) || user.preferred_name || null;
+      user.name_confirmed = Boolean(user.preferences.name_confirmed ?? user.name_confirmed);
+      user.name_source = (user.preferences.name_source as any) || user.name_source || null;
+      user.preferred_title = (user.preferences.preferred_title as string) || user.preferred_title || null;
+      user.title_confirmed = Boolean(user.preferences.title_confirmed ?? user.title_confirmed);
+      user.title_source = (user.preferences.title_source as any) || user.title_source || null;
+      user.memory_version = (user.preferences.memory_version as number) || user.memory_version || 1;
     }
     return user;
   }
@@ -102,6 +106,14 @@ export class SupabaseRepository implements IDatabaseRepository {
       ...(existing?.preferences || {}),
       ...(updates.preferences || {}),
     };
+    if (updates.preferred_name !== undefined) updatedPreferences.preferred_name = updates.preferred_name;
+    if (updates.name_confirmed !== undefined) updatedPreferences.name_confirmed = updates.name_confirmed;
+    if (updates.name_source !== undefined) updatedPreferences.name_source = updates.name_source;
+    if (updates.preferred_title !== undefined) updatedPreferences.preferred_title = updates.preferred_title;
+    if (updates.title_confirmed !== undefined) updatedPreferences.title_confirmed = updates.title_confirmed;
+    if (updates.title_source !== undefined) updatedPreferences.title_source = updates.title_source;
+    if (updates.memory_version !== undefined) updatedPreferences.memory_version = updates.memory_version;
+
     const dbPayload: any = {
       ...updates,
       preferences: updatedPreferences,
@@ -110,6 +122,10 @@ export class SupabaseRepository implements IDatabaseRepository {
     delete dbPayload.preferred_name;
     delete dbPayload.name_confirmed;
     delete dbPayload.name_source;
+    delete dbPayload.preferred_title;
+    delete dbPayload.title_confirmed;
+    delete dbPayload.title_source;
+    delete dbPayload.memory_version;
 
     const { data, error } = await this.client
       .from('users')
@@ -126,6 +142,10 @@ export class SupabaseRepository implements IDatabaseRepository {
     res.preferred_name = (updatedPreferences.preferred_name as string) || null;
     res.name_confirmed = Boolean(updatedPreferences.name_confirmed);
     res.name_source = (updatedPreferences.name_source as any) || null;
+    res.preferred_title = (updatedPreferences.preferred_title as string) || null;
+    res.title_confirmed = Boolean(updatedPreferences.title_confirmed);
+    res.title_source = (updatedPreferences.title_source as any) || null;
+    res.memory_version = (updatedPreferences.memory_version as number) || 1;
     return res;
   }
 
@@ -647,7 +667,7 @@ export class SupabaseRepository implements IDatabaseRepository {
   async saveWalletLimits(data: WalletLimit): Promise<WalletLimit> {
     const { data: saved, error } = await this.client
       .from('wallet_limits')
-      .upsert(data)
+      .upsert(data, { onConflict: 'wallet_id' })
       .select()
       .single();
 

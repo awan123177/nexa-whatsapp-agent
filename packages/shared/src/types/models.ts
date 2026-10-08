@@ -1,6 +1,7 @@
 export type UserRole = 'user' | 'admin' | 'tester';
 export type UserStatus = 'active' | 'suspended' | 'pending';
 export type NameSource = 'USER_PROVIDED' | 'USER_CONFIRMED' | 'WHATSAPP_PROFILE_UNCONFIRMED';
+export type TitleSource = 'USER_PROVIDED' | 'USER_CONFIRMED' | null;
 
 export interface User {
   id: string;
@@ -12,6 +13,10 @@ export interface User {
   preferred_name?: string | null;
   name_confirmed?: boolean;
   name_source?: NameSource | null;
+  preferred_title?: string | null;
+  title_confirmed?: boolean;
+  title_source?: TitleSource | null;
+  memory_version?: number;
   created_at: string;
   updated_at: string;
 }
@@ -56,7 +61,26 @@ export interface Message {
   created_at: string;
 }
 
-export type MemoryCategory = 'preference' | 'travel' | 'profile' | 'fact' | 'work';
+export type MemoryCategory =
+  | 'identity'
+  | 'preferences'
+  | 'communication_style'
+  | 'travel_preferences'
+  | 'shopping_preferences'
+  | 'food_preferences'
+  | 'work_preferences'
+  | 'important_context'
+  | 'saved_places'
+  | 'saved_airports'
+  | 'saved_merchants'
+  | 'wallet_preferences'
+  | 'booking_preferences'
+  | 'other_user_preferences'
+  | 'preference'
+  | 'travel'
+  | 'profile'
+  | 'fact'
+  | 'work';
 
 export interface Memory {
   id: string;
@@ -65,6 +89,9 @@ export interface Memory {
   key: string;
   value: string;
   confidence: number;
+  source?: 'USER_PROVIDED' | 'USER_CONFIRMED' | 'INFERRED' | 'SYSTEM' | null;
+  confirmed?: boolean;
+  version?: number;
   source_message_id?: string | null;
   metadata: Record<string, unknown>;
   created_at: string;

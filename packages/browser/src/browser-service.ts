@@ -1,6 +1,6 @@
 import { chromium, Browser, BrowserContext, Page } from 'playwright';
 import { NexaError, ToolExecutionError, BrowserOpenResult } from '@nexa/shared';
-import { validateBrowserUrl, detectCaptchaOrBotBlock } from './safety.js';
+import { validateBrowserUrl, detectCaptchaOrBotBlock, detectAuthenticationRequirement } from './safety.js';
 import { PermissionEngine } from '@nexa/security';
 
 export interface ScreenshotOptions {
@@ -161,12 +161,17 @@ export class PlaywrightBrowserService {
       if (botCheck.detected) {
         const latency = Date.now() - startNav;
         console.log(`[Browser] open_failed latency_ms=${latency} error_type=BOT_BLOCKED`);
+        const isBlock = botCheck.type?.toLowerCase().includes('challenge') || botCheck.type?.toLowerCase().includes('blocked');
         return {
           success: false,
-          errorType: 'BOT_BLOCKED',
+          errorType: isBlock ? 'BOT_BLOCKED' : 'CAPTCHA_REQUIRED',
           message: `Automated access restricted by ${botCheck.type}: ${botCheck.message}`,
+          authState: isBlock ? 'BLOCKED' : 'CAPTCHA_REQUIRED',
         };
       }
+
+      // Check Authentication Requirement (e.g. login required on e-commerce / service portal)
+      const authCheck = detectAuthenticationRequirement(bodyHtml, this.activeUrl);
 
       const text = await page.evaluate(() => document.body.innerText || '').catch(() => '');
       const contentSnippet = text.slice(0, 2500).replace(/\s+/g, ' ').trim();
@@ -180,7 +185,9 @@ export class PlaywrightBrowserService {
         status,
         title,
         text: contentSnippet,
+        authState: authCheck.state,
       };
+
     } catch (err: any) {
       if (abortListener && options?.signal) {
         options.signal.removeEventListener('abort', abortListener);

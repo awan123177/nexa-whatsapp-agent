@@ -1,5 +1,5 @@
-import { User, Message, NameSource } from '@nexa/shared';
-import { IDatabaseRepository } from '@nexa/database';
+import { User, Message, NameSource, TitleSource } from '@nexa/shared';
+import { IDatabaseRepository, MemoryService } from '@nexa/database';
 
 export interface IdentityCheckResult {
   handled: boolean;
@@ -16,6 +16,12 @@ const COMMON_STOP_WORDS = new Set([
   'send', 'money', 'pay', 'payment', 'transfer', 'balance', 'wallet', 'screenshot',
   'open', 'website', 'url', 'browser', 'google', 'today', 'tomorrow', 'none',
   'nothing', 'idk', 'dont', 'know', 'tell', 'me', 'joke', 'news', 'can',
+]);
+
+const RECOGNIZED_TITLES = new Set([
+  'boss', 'captain', 'chief', 'commander', 'sir', 'maam', "ma'am",
+  'doc', 'doctor', 'king', 'queen', 'president', 'bhai', 'bro',
+  'master', 'sensei', 'leader', 'lord',
 ]);
 
 export class IdentityManager {
@@ -38,6 +44,73 @@ export class IdentityManager {
           .join('-');
       })
       .join(' ');
+  }
+
+  /**
+   * Capitalizes and normalizes titles (e.g. "boss" -> "Boss", "captain" -> "Captain", "doc" -> "Doctor").
+   */
+  static formatTitle(raw: string): string {
+    const clean = raw.trim().toLowerCase();
+    if (clean === 'dr' || clean === 'doctor' || clean === 'doc') return 'Doctor';
+    if (clean === "ma'am" || clean === 'maam') return "Ma'am";
+    return clean.charAt(0).toUpperCase() + clean.slice(1);
+  }
+
+  /**
+   * Detects title declarations, replacements, or revocations (e.g. "Call me boss", "Don't call me boss", "Call me captain").
+   */
+  static detectTitle(text: string): {
+    hasTitle: boolean;
+    title?: string;
+    isRevocation?: boolean;
+    removedTitle?: string;
+    newTitle?: string;
+  } {
+    const lower = text.toLowerCase().trim();
+
+    // 1. Replacement: "Don't call me boss, call me captain" or "Don't call me boss. Call me captain"
+    const matchReplace = lower.match(/(?:don['’]?t\s+call\s+me|stop\s+calling\s+me)\s+([a-zA-Z]+)[,.\s]+(?:call\s+me|you\s+can\s+call\s+me)\s+([a-zA-Z]+)/i);
+    if (matchReplace) {
+      const removed = matchReplace[1]?.trim().toLowerCase();
+      const added = matchReplace[2]?.trim().toLowerCase();
+      if (RECOGNIZED_TITLES.has(removed) || RECOGNIZED_TITLES.has(added)) {
+        return {
+          hasTitle: true,
+          isRevocation: false,
+          removedTitle: this.formatTitle(removed),
+          newTitle: this.formatTitle(added),
+          title: this.formatTitle(added),
+        };
+      }
+    }
+
+    // 2. Revocation: "Don't call me boss anymore", "Don't call me boss", "Stop calling me boss"
+    const matchRevoke = lower.match(/(?:don['’]?t\s+call\s+me|stop\s+calling\s+me)\s+([a-zA-Z]+)(?:\s+anymore)?/i);
+    if (matchRevoke && matchRevoke[1]) {
+      const target = matchRevoke[1].trim().toLowerCase();
+      if (RECOGNIZED_TITLES.has(target) || target === 'boss') {
+        return {
+          hasTitle: true,
+          isRevocation: true,
+          removedTitle: this.formatTitle(target),
+        };
+      }
+    }
+
+    // 3. Declaration: "Call me boss", "You can call me boss", "From now call me boss", "From now on call me boss", "Call me captain"
+    const matchDecl = lower.match(/(?:(?:from\s+now\s+(?:on\s+)?)?(?:you\s+can\s+)?call\s+me)\s+([a-zA-Z]+)(?:\s+(?:from\s+now\s+on|please))?/i);
+    if (matchDecl && matchDecl[1]) {
+      const candidate = matchDecl[1].trim().toLowerCase();
+      if (RECOGNIZED_TITLES.has(candidate)) {
+        return {
+          hasTitle: true,
+          isRevocation: false,
+          title: this.formatTitle(candidate),
+        };
+      }
+    }
+
+    return { hasTitle: false };
   }
 
   /**
@@ -236,6 +309,21 @@ export class IdentityManager {
     // Determine first contact status (<= 1 message in history, i.e., current message)
     const isFirstContact = conversationHistory.length <= 1;
 
+    // Resolve Title State
+    let preferredTitle =
+      (user.preferences?.preferred_title as string) ||
+      user.preferred_title ||
+      null;
+
+    let titleConfirmed = Boolean(
+      user.preferences?.title_confirmed ?? user.title_confirmed
+    );
+
+    let titleSource =
+      (user.preferences?.title_source as TitleSource) ||
+      user.title_source ||
+      null;
+
     // Production observability logging (Strictly sanitized, no user personal name)
     console.log(`[Identity] first_contact=${isFirstContact}`);
     console.log(`[Identity] preferred_name_present=${Boolean(preferredName)}`);
@@ -243,8 +331,97 @@ export class IdentityManager {
     if (nameSource) {
       console.log(`[Identity] name_source=${nameSource}`);
     }
+    console.log(`[Identity] preferred_title_present=${Boolean(preferredTitle)}`);
+    console.log(`[Identity] title_confirmed=${titleConfirmed}`);
+    if (titleSource) {
+      console.log(`[Identity] title_source=${titleSource}`);
+    }
 
-    // 2. Check for Name Corrections (Rules 4 & 5)
+    // Automatically extract and immediately persist explicit durable preferences
+    const explicitPrefs = MemoryService.extractExplicitPreferences(trimmedText);
+    for (const pref of explicitPrefs) {
+      await db.saveMemory({
+        user_id: user.id,
+        category: pref.category,
+        key: pref.key,
+        value: pref.value,
+        confidence: 1.0,
+        source: 'USER_PROVIDED',
+        confirmed: true,
+        version: 1,
+        metadata: {},
+      });
+      console.log('[Memory] write_success');
+    }
+
+    // 2. Check for Title Revocation or Replacement
+    const titleCheck = this.detectTitle(trimmedText);
+    if (titleCheck.hasTitle) {
+      // 2a. Title Revocation (e.g. "Don't call me boss anymore", "Don't call me boss")
+      if (titleCheck.isRevocation) {
+        user = await db.updateUser(user.id, {
+          preferred_title: null,
+          title_confirmed: false,
+          title_source: null,
+          preferences: {
+            ...user.preferences,
+            preferred_title: null,
+            title_confirmed: false,
+            title_source: null,
+          },
+        });
+
+        try {
+          const memories = await db.getUserMemories(user.id, 'identity');
+          const titleMem = memories.find((m) => m.key === 'preferred_title');
+          if (titleMem) {
+            await db.deleteMemory(titleMem.id, user.id);
+          }
+        } catch {}
+
+        return {
+          handled: true,
+          replyText: `Got it, I won't call you ${titleCheck.removedTitle || 'that'} anymore.`,
+          user,
+        };
+      }
+
+      // 2b. Title Replacement (e.g. "Don't call me boss, call me captain")
+      if (titleCheck.removedTitle && titleCheck.newTitle) {
+        const newTitle = titleCheck.newTitle;
+        user = await db.updateUser(user.id, {
+          preferred_title: newTitle,
+          title_confirmed: true,
+          title_source: 'USER_PROVIDED',
+          preferences: {
+            ...user.preferences,
+            preferred_title: newTitle,
+            title_confirmed: true,
+            title_source: 'USER_PROVIDED',
+          },
+        });
+
+        await db.saveMemory({
+          user_id: user.id,
+          category: 'identity',
+          key: 'preferred_title',
+          value: newTitle,
+          confidence: 1.0,
+          source: 'USER_PROVIDED',
+          confirmed: true,
+          version: 1,
+          metadata: {},
+        });
+
+        return {
+          handled: true,
+          replyText: `Understood! I'll call you ${newTitle} from now on.`,
+          user,
+        };
+      }
+    }
+
+    // 3. Check for Name Corrections (Rules 4 & 5)
     // E.g. "Don't call me Awan, call me Rahul" or "Don't call me Awan"
     const correction = this.detectCorrection(trimmedText);
     if (correction.isCorrection) {
@@ -337,6 +514,114 @@ export class IdentityManager {
           lastAssistantMsg.content.includes("What should I use instead?") ||
           lastAssistantMsg.content.includes("What should I call you?"))) ||
       hasAskedName;
+
+    // 4. Check for Title Declaration or Compound Introduction (e.g. "I'm Awan Warsi. Call me Boss.", "Call me boss")
+    if (titleCheck.hasTitle && !titleCheck.isRevocation && titleCheck.title) {
+      const assignedTitle = titleCheck.title;
+      const textWithoutTitle = trimmedText
+        .replace(/(?:(?:from\s+now\s+(?:on\s+)?)?(?:you\s+can\s+)?call\s+me)\s+[a-zA-Z]+/i, '')
+        .trim();
+      const extractedCompoundName = this.extractName(textWithoutTitle);
+
+      const isCompound =
+        Boolean(extractedCompoundName) &&
+        (/^(?:hello|hi|hey)?[,\s]*(?:i['’]?m|my\s+name\s+is|this\s+is)\s+/i.test(trimmedText) ||
+          lastAskedForName);
+
+      if (isCompound && extractedCompoundName) {
+        user = await db.updateUser(user.id, {
+          name: extractedCompoundName,
+          preferred_name: extractedCompoundName,
+          name_confirmed: true,
+          name_source: 'USER_PROVIDED',
+          preferred_title: assignedTitle,
+          title_confirmed: true,
+          title_source: 'USER_PROVIDED',
+          preferences: {
+            ...user.preferences,
+            preferred_name: extractedCompoundName,
+            name_confirmed: true,
+            name_source: 'USER_PROVIDED',
+            preferred_title: assignedTitle,
+            title_confirmed: true,
+            title_source: 'USER_PROVIDED',
+            has_asked_name: true,
+          },
+        });
+
+        await db.saveMemory({
+          user_id: user.id,
+          category: 'profile',
+          key: 'preferred_name',
+          value: extractedCompoundName,
+          confidence: 1.0,
+          source: 'USER_PROVIDED',
+          confirmed: true,
+          version: 1,
+          metadata: {},
+        });
+
+        await db.saveMemory({
+          user_id: user.id,
+          category: 'identity',
+          key: 'preferred_title',
+          value: assignedTitle,
+          confidence: 1.0,
+          source: 'USER_PROVIDED',
+          confirmed: true,
+          version: 1,
+          metadata: {},
+        });
+
+        return {
+          handled: true,
+          replyText: `Nice to meet you, ${assignedTitle}! What can I help you with?`,
+          user,
+        };
+      }
+
+      // Standalone Title Declaration ("Call me boss", "you can call me boss", "from now call me boss")
+      user = await db.updateUser(user.id, {
+        preferred_title: assignedTitle,
+        title_confirmed: true,
+        title_source: 'USER_PROVIDED',
+        preferences: {
+          ...user.preferences,
+          preferred_title: assignedTitle,
+          title_confirmed: true,
+          title_source: 'USER_PROVIDED',
+        },
+      });
+
+      await db.saveMemory({
+        user_id: user.id,
+        category: 'identity',
+        key: 'preferred_title',
+        value: assignedTitle,
+        confidence: 1.0,
+        source: 'USER_PROVIDED',
+        confirmed: true,
+        version: 1,
+        metadata: {},
+      });
+
+      if (lastAskedForName) {
+        return {
+          handled: true,
+          replyText: `Nice to meet you, ${assignedTitle}! What can I help you with?`,
+          user,
+        };
+      }
+
+      const isOnlyTitle = /^(?:(?:from\s+now\s+(?:on\s+)?)?(?:you\s+can\s+)?call\s+me)\s+[a-zA-Z]+[.!?]*$/i.test(trimmedText);
+      if (isOnlyTitle) {
+        return {
+          handled: true,
+          replyText: `Sure, ${assignedTitle}.`,
+          user,
+        };
+      }
+    }
 
     if (lastAskedForName && !nameConfirmed) {
       const extracted = this.extractName(trimmedText);

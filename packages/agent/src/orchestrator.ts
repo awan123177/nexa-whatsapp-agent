@@ -8,6 +8,7 @@ import {
   ToolResult,
   ThinkingLevel,
   NameSource,
+  TitleSource,
   BROWSER_NAVIGATION_TIMEOUT_MS,
   BROWSER_SCREENSHOT_TIMEOUT_MS,
   BROWSER_ACTION_TIMEOUT_MS,
@@ -16,7 +17,7 @@ import {
   TOTAL_AGENT_DEADLINE_MS,
   MAX_AGENT_STEPS,
 } from '@nexa/shared';
-import { IDatabaseRepository } from '@nexa/database';
+import { IDatabaseRepository, MemoryService } from '@nexa/database';
 import { ToolRegistry } from '@nexa/tools';
 import { buildSystemInstruction } from './prompts.js';
 import { IdentityManager } from './identity.js';
@@ -28,6 +29,9 @@ export interface AgentProcessInput {
   preferredName?: string;
   nameConfirmed?: boolean;
   nameSource?: NameSource;
+  preferredTitle?: string;
+  titleConfirmed?: boolean;
+  titleSource?: TitleSource;
   text: string;
   channel?: ChannelType;
   mediaUrl?: string;
@@ -196,10 +200,9 @@ export class AgentOrchestrator {
       recipientPhone: input.phoneNumber || user.phone_number,
     };
 
-    // 4. Concurrently fetch pending approvals, user memories, and conversation history
-    const [pendingApproval, memories, rawHistory] = await Promise.all([
+    // 4. Concurrently fetch pending approvals and conversation history
+    const [pendingApproval, rawHistory] = await Promise.all([
       this.db.getPendingApproval(conversation.id),
-      this.db.getUserMemories(user.id),
       this.db.getConversationMessages(conversation.id, 10),
     ]);
 
@@ -297,7 +300,9 @@ export class AgentOrchestrator {
       // If user said something unrelated, keep approval pending and fall through to normal agent loop
     }
 
-    // 7. Build Context for Agent Reasoning Loop
+    // 7. Build Context for Agent Reasoning Loop with Intent-Relevant Memories
+    const memoryService = new MemoryService(this.db);
+    const memories = await memoryService.getRelevantMemories(user.id, input.text || '');
     const systemInstruction = buildSystemInstruction(user, memories);
     const messages: AIMessage[] = rawHistory.map((m) => ({
       role: m.sender_type === 'user' ? 'user' : 'assistant',

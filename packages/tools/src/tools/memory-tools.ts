@@ -12,19 +12,41 @@ const FORBIDDEN_MEMORY_PATTERNS = [
   /(AIza[0-9A-Za-z-_]{35})/,
 ];
 
+const MEMORY_CATEGORIES = [
+  'identity',
+  'preferences',
+  'communication_style',
+  'travel_preferences',
+  'shopping_preferences',
+  'food_preferences',
+  'work_preferences',
+  'important_context',
+  'saved_places',
+  'saved_airports',
+  'saved_merchants',
+  'wallet_preferences',
+  'booking_preferences',
+  'other_user_preferences',
+  'preference',
+  'travel',
+  'profile',
+  'fact',
+  'work',
+] as const;
+
 export function createMemoryTools(db: IDatabaseRepository): BaseTool[] {
   const saveMemoryTool: BaseTool = {
     name: 'save_memory',
     description: 'Saves important user preferences, personal details, travel habits, or recurring instructions to long-term memory. NEVER save passwords, OTPs, or financial secrets.',
     riskLevel: 'low_risk',
     parametersSchema: z.object({
-      category: z.enum(['preference', 'travel', 'profile', 'fact', 'work']).describe('Category of the memory'),
+      category: z.enum(MEMORY_CATEGORIES).describe('Category of the memory'),
       key: z.string().min(2).max(100).describe('Short descriptive key (e.g. dietary_preference, seat_preference, home_city)'),
       value: z.string().min(1).max(1000).describe('The memory value to save'),
       confidence: z.number().min(0).max(1).default(1.0).describe('Confidence score from 0 to 1'),
     }),
     requiresApproval: () => ({ required: false }),
-    execute: async (args: { category: 'preference' | 'travel' | 'profile' | 'fact' | 'work'; key: string; value: string; confidence: number }, context: ToolExecutionContext): Promise<ToolResult> => {
+    execute: async (args: { category: typeof MEMORY_CATEGORIES[number]; key: string; value: string; confidence: number }, context: ToolExecutionContext): Promise<ToolResult> => {
       // 1. Strict safety check: Never store sensitive credentials, OTPs, or passwords
       const combined = `${args.key} ${args.value}`.toLowerCase();
       for (const pattern of FORBIDDEN_MEMORY_PATTERNS) {
@@ -42,11 +64,15 @@ export function createMemoryTools(db: IDatabaseRepository): BaseTool[] {
         key: args.key,
         value: args.value,
         confidence: args.confidence,
+        source: 'USER_PROVIDED',
+        confirmed: true,
         source_message_id: context.messageId || null,
         metadata: {
           savedViaChannel: context.sourceChannel,
         },
       });
+
+      console.log('[Memory] write_success');
 
       return {
         success: true,
@@ -65,11 +91,13 @@ export function createMemoryTools(db: IDatabaseRepository): BaseTool[] {
     description: 'Retrieves stored user memories and preferences by category or all memories.',
     riskLevel: 'read_only',
     parametersSchema: z.object({
-      category: z.enum(['preference', 'travel', 'profile', 'fact', 'work']).optional().describe('Optional category filter'),
+      category: z.enum(MEMORY_CATEGORIES).optional().describe('Optional category filter'),
     }),
     requiresApproval: () => ({ required: false }),
-    execute: async (args: { category?: 'preference' | 'travel' | 'profile' | 'fact' | 'work' }, context: ToolExecutionContext): Promise<ToolResult> => {
+    execute: async (args: { category?: typeof MEMORY_CATEGORIES[number] }, context: ToolExecutionContext): Promise<ToolResult> => {
       const memories = await db.getUserMemories(context.user.id, args.category);
+      console.log('[Memory] read_success');
+      console.log(`[Memory] user_memory_available=${memories.length > 0}`);
       return {
         success: true,
         data: {
