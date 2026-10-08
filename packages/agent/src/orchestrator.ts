@@ -23,12 +23,21 @@ import {
   MAX_AGENT_STEPS,
   COMMERCE_TASK_MAX_STEPS,
   COMMERCE_TASK_DEADLINE_MS,
+  COMPUTER_USE_TASK_DEADLINE_MS,
+  REQUEST_MESSAGE_DEADLINE_MS,
+  MessageIntent,
+  ActiveRequestContext,
 } from '@nexa/shared';
 import { IDatabaseRepository, MemoryService } from '@nexa/database';
 import { ToolRegistry, merchantResolver } from '@nexa/tools';
 import { buildSystemInstruction } from './prompts.js';
 import { IdentityManager } from './identity.js';
 import { TaskStateMachine } from './task-state-machine.js';
+import {
+  isCancellationMessage,
+  isContinuationMessage,
+  classifyMessageIntent,
+} from './request-context.js';
 
 export interface AgentProcessInput {
   phoneNumber: string;
@@ -231,6 +240,36 @@ export class AgentOrchestrator {
       this.db.getConversationMessages(conversation.id, 10),
     ]);
 
+    // Context Isolation & Boundary Setup (Bug 1 & Bug 6)
+    const hasPreviousUnfinishedCommerce = rawHistory.some(
+      (m) =>
+        m.sender_type === 'user' &&
+        /\b(order|buy|cart|checkout|instamart|blinkit|zepto|amazon|swiggy)\b/i.test(m.content || '')
+    );
+
+    const isCancel = isCancellationMessage(input.text || '');
+    const isContinue = !isCancel && hasPreviousUnfinishedCommerce && isContinuationMessage(input.text || '');
+
+    const currentRequestId = `req_${Date.now()}_${Math.random().toString(36).substring(2, 8)}`;
+    const currentActiveTaskId = isContinue
+      ? `task_${conversation.id}_resumed`
+      : `task_${conversation.id}_${Date.now()}`;
+
+    console.log(`[Context] request_created requestId=${currentRequestId} taskId=${currentActiveTaskId}`);
+
+    const intent = classifyMessageIntent(input.text || '', {
+      isContinuation: isContinue,
+      isCancellation: isCancel,
+    });
+    console.log(`[Context] request_intent_classified intent=${intent} requestId=${currentRequestId}`);
+
+    if (isCancel) {
+      console.log(`[Context] stale_context_rejected reason="user_cancelled"`);
+      console.log(`[Context] previous_task_not_resumed reason="user_cancelled"`);
+    } else if (hasPreviousUnfinishedCommerce && !isContinue) {
+      console.log(`[Context] previous_task_not_resumed reason="no_explicit_continuation"`);
+    }
+
     // 5. Identity & Preferred Name Onboarding Flow
     const identityResult = await IdentityManager.handleInboundMessage({
       user,
@@ -364,7 +403,51 @@ export class AgentOrchestrator {
       lastHistoryMsg.media = userMediaPart;
     }
 
-    const toolDeclarations = this.toolRegistry.getDeclarations();
+    // Intent Tool Gate (Bug 6)
+    const allDeclarations = this.toolRegistry.getDeclarations();
+    let toolDeclarations: typeof allDeclarations = [];
+
+    if (intent === 'CONVERSATION') {
+      // Pure conversation / capabilities / greetings: NO tools provided so Gemini cannot call shopping_search
+      toolDeclarations = [];
+    } else if (intent === 'RESEARCH') {
+      // Web search and browser tools only; no commerce, booking, or financial tools
+      toolDeclarations = allDeclarations.filter(
+        (t) =>
+          !t.name.startsWith('shopping_') &&
+          !t.name.startsWith('wallet_') &&
+          !t.name.startsWith('book_') &&
+          !['search_products', 'compare_prices', 'send_email'].includes(t.name)
+      );
+    } else if (intent === 'SHOPPING') {
+      // Shopping and browser tools
+      toolDeclarations = allDeclarations.filter(
+        (t) =>
+          !t.name.startsWith('book_') &&
+          !['send_email', 'create_calendar_event', 'create_reminder'].includes(t.name)
+      );
+    } else if (intent === 'TRAVEL') {
+      // Travel and browser tools
+      toolDeclarations = allDeclarations.filter(
+        (t) =>
+          !t.name.startsWith('shopping_') &&
+          !['send_email', 'create_calendar_event', 'create_reminder'].includes(t.name)
+      );
+    } else if (intent === 'EMAIL') {
+      toolDeclarations = allDeclarations.filter(
+        (t) => t.name.includes('email') || t.name.startsWith('memory_')
+      );
+    } else if (intent === 'CALENDAR') {
+      toolDeclarations = allDeclarations.filter(
+        (t) => t.name.includes('calendar') || t.name.includes('reminder') || t.name.startsWith('memory_')
+      );
+    } else if (intent === 'WALLET') {
+      toolDeclarations = allDeclarations.filter(
+        (t) => t.name.startsWith('wallet_') || t.name === 'approval_action' || t.name.startsWith('memory_')
+      );
+    } else {
+      toolDeclarations = allDeclarations;
+    }
 
     // Exact Merchant Resolution & Commerce Task Routing
     const resolvedMerchant = merchantResolver.resolve(input.text || '');
@@ -373,15 +456,24 @@ export class AgentOrchestrator {
     }
 
     const isCommerceTask =
+      intent === 'SHOPPING' ||
       Boolean(resolvedMerchant) ||
-      /\b(order|buy|cart|checkout|book|booking|purchase)\b/i.test(input.text || '');
+      (isContinue && hasPreviousUnfinishedCommerce);
 
-    const effectiveMaxSteps = isCommerceTask
-      ? Math.max(this.maxSteps, this.commerceMaxSteps)
-      : this.maxSteps;
-    const effectiveDeadlineMs = isCommerceTask
-      ? Math.max(this.totalDeadlineMs, this.commerceDeadlineMs)
-      : this.totalDeadlineMs;
+    let effectiveMaxSteps = this.maxSteps;
+    let effectiveDeadlineMs = this.totalDeadlineMs;
+
+    if (isCommerceTask) {
+      effectiveMaxSteps = Math.max(this.maxSteps, this.commerceMaxSteps);
+      effectiveDeadlineMs = Math.max(this.totalDeadlineMs, this.commerceDeadlineMs);
+    } else if (intent === 'RESEARCH') {
+      effectiveMaxSteps = 10;
+      effectiveDeadlineMs =
+        this.totalDeadlineMs >= TOTAL_AGENT_DEADLINE_MS
+          ? Math.max(this.totalDeadlineMs, COMPUTER_USE_TASK_DEADLINE_MS)
+          : this.totalDeadlineMs;
+    }
+
     const planName = isCommerceTask
       ? (resolvedMerchant ? `commerce_order_${resolvedMerchant.merchantId}` : 'commerce_order_execution')
       : 'understand_and_execute';
@@ -398,8 +490,9 @@ export class AgentOrchestrator {
     let modelFailed = false;
     let verifiedSuccess = false;
     let executionToolCalled = false;
+    let deadlineApproaching = false;
 
-    console.log(`[Agent] task_created taskId=${conversation.id}_${Date.now()} user=${user.id}`);
+    console.log(`[Agent] task_created taskId=${currentActiveTaskId} user=${user.id}`);
     console.log(`[Agent] plan_created plan="${planName}" maxSteps=${effectiveMaxSteps}`);
 
     // Active in-memory raw Gemini Content[] history for intermediate tool turns
@@ -411,6 +504,11 @@ export class AgentOrchestrator {
       const remainingMs = effectiveDeadlineMs - elapsedMs;
       if (remainingMs <= 3000) {
         console.log(`[Agent] deadline_approaching remaining_ms=${remainingMs}`);
+        deadlineApproaching = true;
+        if (stateMachine.canTransitionTo('FAILED')) {
+          stateMachine.transitionTo('FAILED');
+        }
+        console.log(`[Agent] task_failed reason="deadline_approaching" steps=${currentStep}`);
         break;
       }
 
@@ -509,6 +607,46 @@ export class AgentOrchestrator {
 
       for (const tc of aiResponse.toolCalls) {
         const tcName = tc.name;
+
+        // Verify request ID and task ID boundaries (Bug 1, Rule 9)
+        const tcRequestId = (tc as any).requestId || currentRequestId;
+        const tcTaskId = (tc as any).taskId || currentActiveTaskId;
+
+        if (tcRequestId !== currentRequestId || tcTaskId !== currentActiveTaskId) {
+          console.log(`[Context] stale_tool_call_rejected tool=${tcName} tool_call_id=${tc.id}`);
+          const staleMsg = `Tool call ${tcName} rejected: stale tool call from different request or task context.`;
+          toolResultsForNextTurn.push({
+            toolCallId: tc.id,
+            name: tcName,
+            result: { error: staleMsg },
+            isError: true,
+          });
+          functionResponseParts.push({
+            functionResponse: {
+              name: tcName,
+              response: { error: staleMsg },
+              id: tc.id,
+            },
+          });
+          continue;
+        }
+
+        // Tag tool call with active context boundaries
+        (tc as any).requestId = currentRequestId;
+        (tc as any).taskId = currentActiveTaskId;
+
+        // Dynamic Computer-Use Deadline Extension (Bug 2)
+        const isBrowserTool = tcName.startsWith('browser_');
+        if (
+          isBrowserTool &&
+          this.totalDeadlineMs >= TOTAL_AGENT_DEADLINE_MS &&
+          effectiveDeadlineMs < COMPUTER_USE_TASK_DEADLINE_MS
+        ) {
+          console.log(`[Agent] deadline_extended task_type="computer_use" new_deadline_ms=${COMPUTER_USE_TASK_DEADLINE_MS}`);
+          effectiveDeadlineMs = COMPUTER_USE_TASK_DEADLINE_MS;
+          effectiveMaxSteps = Math.max(effectiveMaxSteps, 10);
+        }
+
         executionToolCalled = true;
         if (stateMachine.canTransitionTo('EXECUTING')) {
           stateMachine.transitionTo('EXECUTING');
@@ -767,7 +905,10 @@ export class AgentOrchestrator {
       console.log(`[Agent] task_failed reason="max_steps_reached" steps=${currentStep}`);
     }
 
-    if (!finalReply) {
+    if (deadlineApproaching) {
+      finalReply =
+        "I was unable to complete the request within the allocated time limit. Please try again or simplify your request.";
+    } else if (!finalReply) {
       const networkToolNames = [
         'web_search',
         'browser_open',
@@ -803,7 +944,9 @@ export class AgentOrchestrator {
       }
     }
 
-    if (latestExecutionToolFailed) {
+    if (deadlineApproaching) {
+      // Already transitioned to FAILED and logged [Agent] task_failed reason="deadline_approaching"
+    } else if (latestExecutionToolFailed) {
       if (stateMachine.canTransitionTo('FAILED')) {
         stateMachine.transitionTo('FAILED');
       }
@@ -817,7 +960,7 @@ export class AgentOrchestrator {
         stateMachine.transitionTo('FAILED');
       }
       console.log(`[Agent] task_failed reason="max_steps_reached" steps=${currentStep}`);
-    } else if (finalReply && !modelFailed && !latestExecutionToolFailed) {
+    } else if (finalReply && !modelFailed && !latestExecutionToolFailed && !deadlineApproaching) {
       if (stateMachine.canTransitionTo('COMPLETED')) {
         stateMachine.transitionTo('COMPLETED');
       }

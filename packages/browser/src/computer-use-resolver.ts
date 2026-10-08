@@ -77,12 +77,15 @@ export class ComputerUseResolver {
             confidence: number;
           }> = [];
 
-          const allInputs = Array.from(document.querySelectorAll('input, [role="searchbox"], [role="search"] input'));
+          const allInputs = Array.from(
+            document.querySelectorAll('input, textarea, [role="searchbox"], [role="search"] input, [role="search"] textarea, [role="combobox"]')
+          );
           for (let i = 0; i < allInputs.length; i++) {
-            const input = allInputs[i] as HTMLInputElement;
+            const input = allInputs[i] as HTMLElement;
             if (!isVisible(input)) continue;
 
-            const type = (input.getAttribute('type') || 'text').toLowerCase();
+            const tag = input.tagName.toLowerCase();
+            const type = (input.getAttribute('type') || (tag === 'textarea' ? 'text' : 'text')).toLowerCase();
             if (['hidden', 'password', 'submit', 'button', 'checkbox', 'radio'].includes(type)) continue;
 
             const placeholder = input.getAttribute('placeholder') || '';
@@ -97,6 +100,10 @@ export class ComputerUseResolver {
 
             if (type === 'search' || input.getAttribute('role') === 'searchbox') {
               confidence = 0.95;
+            } else if (name === 'q' || ariaLabel.toLowerCase() === 'search') {
+              confidence = 0.95;
+            } else if (tag === 'textarea' && (name === 'q' || ariaLabel.toLowerCase().includes('search'))) {
+              confidence = 0.95;
             } else if (searchTerms.some((t) => combined.includes(t))) {
               confidence = 0.9;
             } else if (i === 0) {
@@ -108,15 +115,15 @@ export class ComputerUseResolver {
             if (id) {
               selector = `#${CSS.escape(id)}`;
             } else if (name) {
-              selector = `input[name="${CSS.escape(name)}"]`;
+              selector = `${tag}[name="${CSS.escape(name)}"]`;
             } else if (testId) {
               selector = `[data-testid="${CSS.escape(testId)}"]`;
             } else if (ariaLabel) {
-              selector = `input[aria-label="${CSS.escape(ariaLabel)}"]`;
+              selector = `${tag}[aria-label="${CSS.escape(ariaLabel)}"]`;
             } else if (placeholder) {
-              selector = `input[placeholder="${CSS.escape(placeholder)}"]`;
+              selector = `${tag}[placeholder="${CSS.escape(placeholder)}"]`;
             } else {
-              selector = `input[type="${type}"]:nth-of-type(${i + 1})`;
+              selector = `${tag}:nth-of-type(${i + 1})`;
             }
 
             searchInputs.push({
@@ -298,9 +305,41 @@ export class ComputerUseResolver {
     const start = Date.now();
     const cleanTarget = target.trim();
 
+    // Tag-agnostic [name="..."] attribute lookup (e.g. input[name="q"] -> [name="q"] matching <textarea name="q">)
+    const nameMatch = cleanTarget.match(/^(?:input|textarea)?\[name=["']?([^"'\]]+)["']?\]$/i);
+    if (nameMatch && nameMatch[1]) {
+      const nameAttr = nameMatch[1];
+      const agnosticSelector = `[name="${nameAttr}"]`;
+      try {
+        const handle = await page.$(agnosticSelector);
+        if (handle) {
+          const latency = Date.now() - start;
+          console.log(
+            `[ComputerUse] target_resolved action=resolve target_type=${targetType || 'search_box'} matched_by=name latency_ms=${latency} selector="${agnosticSelector}"`
+          );
+          return {
+            selector: agnosticSelector,
+            confidence: 0.95,
+            targetType: targetType || (nameAttr === 'q' ? 'search_box' : 'custom'),
+            description: `Element with name="${nameAttr}"`,
+            name: nameAttr,
+            matchedBy: 'name',
+          };
+        }
+      } catch {}
+    }
+
     // 1. If targetType is 'search_box' or target expresses a search intent
-    if (targetType === 'search_box' || /(search|find|query)/i.test(cleanTarget)) {
-      const observation = await this.observePage(page);
+    const isSearchTarget =
+      targetType === 'search_box' ||
+      /(search|find|query|\[name=["']?q["']?\]|name=['"]?q['"]?)/i.test(cleanTarget);
+
+    if (isSearchTarget) {
+      let observation = await this.observePage(page);
+      if (observation.searchInputs.length === 0) {
+        await new Promise((r) => setTimeout(r, 350));
+        observation = await this.observePage(page);
+      }
       if (observation.searchInputs.length > 0) {
         const best = observation.searchInputs[0];
         const latency = Date.now() - start;

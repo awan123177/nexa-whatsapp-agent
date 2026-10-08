@@ -121,7 +121,7 @@ export interface ResolvedTarget {
   name?: string;
   text?: string;
   coordinates?: { x: number; y: number };
-  matchedBy: 'id' | 'role' | 'placeholder' | 'aria' | 'text' | 'css' | 'heuristics' | 'coordinates';
+  matchedBy: 'id' | 'role' | 'placeholder' | 'aria' | 'text' | 'css' | 'heuristics' | 'coordinates' | 'name';
 }
 
 export interface PageObservation {

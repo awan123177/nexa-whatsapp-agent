@@ -45,3 +45,23 @@ export type ShoppingStepState =
   | 'ORDER_VERIFIED'
   | 'COMPLETED'
   | 'FAILED';
+
+export type MessageIntent =
+  | 'CONVERSATION'
+  | 'RESEARCH'
+  | 'SHOPPING'
+  | 'TRAVEL'
+  | 'EMAIL'
+  | 'CALENDAR'
+  | 'WALLET'
+  | 'OTHER';
+
+export interface ActiveRequestContext {
+  requestId: string;
+  taskId: string;
+  intent: MessageIntent;
+  userMessage: string;
+  isContinuation: boolean;
+  resumedTaskId?: string;
+  timestamp: number;
+}

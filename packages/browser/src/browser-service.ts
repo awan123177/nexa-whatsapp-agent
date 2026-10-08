@@ -16,6 +16,7 @@ import {
   BROWSER_READ_TIMEOUT_MS,
   BROWSER_SCREENSHOT_TIMEOUT_MS,
   BROWSER_ACTION_TIMEOUT_MS,
+  BROWSER_READINESS_TIMEOUT_MS,
 } from '@nexa/shared';
 import { validateBrowserUrl, detectCaptchaOrBotBlock, detectAuthenticationRequirement } from './safety.js';
 import { computerUseResolver, ComputerUseResolver } from './computer-use-resolver.js';
@@ -264,6 +265,66 @@ export class PlaywrightBrowserService {
     }
   }
 
+  /**
+   * Bounded browser page readiness handling.
+   * Ensures DOM is loaded, bounds networkidle wait, and polls for interactive elements.
+   */
+  async waitForPageReady(
+    pageInstance?: Page | null,
+    timeoutMs = BROWSER_READINESS_TIMEOUT_MS
+  ): Promise<{ ready: boolean; latencyMs: number; elementsCount: number }> {
+    const start = Date.now();
+    const page = pageInstance || (await this.ensurePage());
+
+    try {
+      if (page.waitForLoadState) {
+        await page.waitForLoadState('domcontentloaded', { timeout: Math.min(timeoutMs, 4000) }).catch(() => {});
+      }
+    } catch {}
+
+    try {
+      if (page.waitForLoadState) {
+        await page.waitForLoadState('networkidle', { timeout: 2000 }).catch(() => {});
+      }
+    } catch {}
+
+    let elementsCount = 0;
+    const pollIntervalMs = 250;
+    const maxPollTimeMs = Math.max(1000, timeoutMs - (Date.now() - start));
+    const pollDeadline = Date.now() + maxPollTimeMs;
+
+    while (Date.now() < pollDeadline) {
+      if (!page || (page.isClosed && page.isClosed())) break;
+      try {
+        if (page.evaluate) {
+          elementsCount = await page.evaluate(() => {
+            const els = document.querySelectorAll(
+              'input, textarea, button, a[href], [role="button"], [role="searchbox"], [role="search"], [role="combobox"]'
+            );
+            let visible = 0;
+            for (let i = 0; i < Math.min(els.length, 60); i++) {
+              const el = els[i];
+              const rect = el.getBoundingClientRect();
+              if (rect.width > 0 && rect.height > 0) visible++;
+            }
+            return visible;
+          }).catch(() => 0);
+        }
+
+        if (elementsCount > 0) {
+          break;
+        }
+      } catch {}
+
+      await new Promise((r) => setTimeout(r, pollIntervalMs));
+    }
+
+    const latencyMs = Date.now() - start;
+    const currentUrl = (page && page.url) ? page.url() : (this.activeUrl || '');
+    console.log(`[Browser] page_ready url="${sanitizeUrlForLogs(currentUrl)}" latency_ms=${latencyMs} elements_count=${elementsCount}`);
+    return { ready: elementsCount > 0, latencyMs, elementsCount };
+  }
+
   async openPage(targetUrl: string, options?: BrowserOpenOptions): Promise<BrowserOpenResult> {
     const startNav = Date.now();
     const timeoutMs = options?.timeoutMs ?? BROWSER_NAVIGATION_TIMEOUT_MS;
@@ -323,6 +384,9 @@ export class PlaywrightBrowserService {
         waitUntil: 'domcontentloaded',
         timeout: timeoutMs,
       });
+
+      // Bounded wait for page readiness
+      await this.waitForPageReady(page, 4000).catch(() => {});
 
       if (abortListener && options?.signal) {
         options.signal.removeEventListener('abort', abortListener);
@@ -545,20 +609,37 @@ export class PlaywrightBrowserService {
 
       let effectiveSelector = selector;
       try {
-        await page.waitForSelector(selector, { timeout: Math.min(timeoutMs, 4000) });
+        await page.waitForSelector(selector, { timeout: Math.min(timeoutMs, 3000) });
         await page.fill(selector, text);
       } catch (directErr) {
-        // Adaptive resolution: if selector was a search box or generic input
-        const isSearch = /(search|find|query)/i.test(selector);
-        const resolved = await computerUseResolver
-          .resolveTarget(page, selector, isSearch ? 'search_box' : undefined)
-          .catch(() => null);
-        if (resolved) {
-          effectiveSelector = resolved.selector;
-          await page.waitForSelector(effectiveSelector, { timeout: timeoutMs });
-          await page.fill(effectiveSelector, text);
-        } else {
-          throw directErr;
+        let tagAgnosticMatched = false;
+        const nameMatch = selector.match(/^(?:input|textarea)?\[name=["']?([^"'\]]+)["']?\]$/i);
+        if (nameMatch && nameMatch[1]) {
+          const agnostic = `[name="${nameMatch[1]}"]`;
+          const el = await page.$(agnostic).catch(() => null);
+          if (el) {
+            effectiveSelector = agnostic;
+            await page.fill(effectiveSelector, text);
+            tagAgnosticMatched = true;
+          }
+        }
+
+        if (!tagAgnosticMatched) {
+          // Bounded page readiness retry if interactive elements were temporarily absent
+          await this.waitForPageReady(page, 3000).catch(() => {});
+
+          // Adaptive resolution: if selector was a search box, name="q", or generic input
+          const isSearch = /(search|find|query|\[name=["']?q["']?\]|name=['"]?q['"]?)/i.test(selector);
+          const resolved = await computerUseResolver
+            .resolveTarget(page, selector, isSearch ? 'search_box' : undefined)
+            .catch(() => null);
+          if (resolved) {
+            effectiveSelector = resolved.selector;
+            await page.waitForSelector(effectiveSelector, { timeout: timeoutMs });
+            await page.fill(effectiveSelector, text);
+          } else {
+            throw directErr;
+          }
         }
       }
 

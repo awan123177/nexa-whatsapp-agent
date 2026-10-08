@@ -234,7 +234,14 @@ describe('NEXA Adaptive Computer-Use & Commerce Execution Suite', () => {
   it('7. Full Smoke Test: "Order a Diet Coke from Instamart" (Steps A through L end-to-end)', async () => {
     const consoleSpy = vi.spyOn(console, 'log');
 
-    // A. Open merchant
+    // A. Open merchant (mock external network navigation for deterministic test execution)
+    vi.spyOn(browserService, 'openPage').mockResolvedValue({
+      success: true,
+      finalUrl: 'https://www.swiggy.com/instamart',
+      status: 200,
+      title: 'Swiggy Instamart - Online Grocery',
+      text: 'Swiggy Instamart home page with search bar for groceries and drinks',
+    });
     const openRes = await browserService.openPage('https://www.swiggy.com/instamart');
     expect(openRes.success).toBe(true);
 
