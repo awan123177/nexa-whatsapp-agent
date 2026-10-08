@@ -10,6 +10,7 @@ import {
   isCancellationMessage,
   isContinuationMessage,
 } from '../packages/agent/src/request-context.js';
+import { TaskStateMachine } from '../packages/agent/src/task-state-machine.js';
 import {
   TOTAL_AGENT_DEADLINE_MS,
   COMPUTER_USE_TASK_DEADLINE_MS,
@@ -508,5 +509,335 @@ describe('NEXA Context Isolation, Agent Deadline & Browser Readiness Suite', () 
     expect(logs.some((l) => l.includes('[Agent] task_completed'))).toBe(false);
 
     expect(result.replyText).toContain('time limit');
+  });
+
+  // =========================================================================
+  // 11. Greeting after travel: User sends greeting after previous travel booking query -> CONVERSATION, 0 tools, no travel resumed
+  // =========================================================================
+  it('11. Greeting after previous travel booking query classifies as CONVERSATION and does not resume travel task', async () => {
+    const logs: string[] = [];
+    const consoleSpy = vi.spyOn(console, 'log').mockImplementation((...args) => {
+      logs.push(args.join(' '));
+    });
+
+    const user = await db.findOrCreateUserByPhone('+919999900011', 'Traveler');
+    user.preferred_name = 'Traveler';
+    user.name_confirmed = true;
+    const conversation = await db.getOrCreateActiveConversation(user.id, 'whatsapp');
+
+    // Prior travel history
+    await db.saveMessage({
+      conversation_id: conversation.id,
+      sender_type: 'user',
+      content: 'Book a flight to Mumbai tomorrow',
+    });
+    await db.saveMessage({
+      conversation_id: conversation.id,
+      sender_type: 'assistant',
+      content: 'I found 3 flights to Mumbai.',
+    });
+
+    let toolsPassed: any[] = [];
+    const mockAi = new MockAIProvider(async (messages, options) => {
+      toolsPassed = options?.tools || [];
+      return {
+        text: 'Hello Traveler! How can I help you today?',
+      };
+    });
+
+    const orchestrator = new AgentOrchestrator(mockAi, toolRegistry, db);
+    const result = await orchestrator.processMessage({
+      phoneNumber: '+919999900011',
+      name: 'Traveler',
+      preferredName: 'Traveler',
+      nameConfirmed: true,
+      text: 'Hello NEXA',
+      channel: 'whatsapp',
+    });
+
+    consoleSpy.mockRestore();
+
+    expect(logs.some((l) => l.includes('[Context] previous_task_not_resumed reason="no_explicit_continuation"'))).toBe(true);
+    expect(logs.some((l) => l.includes('[Context] request_intent_classified intent=CONVERSATION'))).toBe(true);
+    expect(toolsPassed).toEqual([]);
+    expect(result.replyText).toContain('Hello Traveler');
+  });
+
+  // =========================================================================
+  // 12. Slow page load with 0 interactive elements -> waitForPageReady returns ready=false gracefully
+  // =========================================================================
+  it('12. waitForPageReady returns ready=false gracefully when timeout expires with 0 interactive elements', async () => {
+    const mockBlankPage: any = {
+      url: () => 'https://example.com/blank',
+      isClosed: () => false,
+      waitForLoadState: async () => {},
+      evaluate: async () => 0,
+    };
+
+    const readiness = await browserService.waitForPageReady(mockBlankPage, 300);
+    expect(readiness.ready).toBe(false);
+    expect(readiness.elementsCount).toBe(0);
+    expect(readiness.latencyMs).toBeGreaterThanOrEqual(250);
+  });
+
+  // =========================================================================
+  // 13. Tool failure transitions to FAILED and NEVER logs [Agent] task_completed
+  // =========================================================================
+  it('13. Tool failure transitions task to FAILED and never logs task_completed', async () => {
+    const logs: string[] = [];
+    const consoleSpy = vi.spyOn(console, 'log').mockImplementation((...args) => {
+      logs.push(args.join(' '));
+    });
+
+    const failingRegistry = createDefaultToolRegistry({ db, browserService });
+    const mockFailTool: BaseTool = {
+      name: 'browser_failing_tool',
+      description: 'A tool that fails',
+      riskLevel: 'read_only',
+      parametersSchema: z.object({ query: z.string() }),
+      requiresApproval: () => ({ required: false }),
+      execute: async () => {
+        return { success: false, error: 'Database connection failed' };
+      },
+    };
+    failingRegistry.register(mockFailTool);
+
+    let step = 0;
+    const mockAi = new MockAIProvider(async () => {
+      step++;
+      if (step === 1) {
+        return {
+          text: '',
+          toolCalls: [{ id: 'fail_tc1', name: 'browser_failing_tool', arguments: { query: 'test' } }],
+        };
+      }
+      return { text: 'I noticed the action failed and could not be completed.' };
+    });
+
+    const orchestrator = new AgentOrchestrator(mockAi, failingRegistry, db);
+    const result = await orchestrator.processMessage({
+      phoneNumber: '+919999900013',
+      name: 'FailUser',
+      preferredName: 'FailUser',
+      nameConfirmed: true,
+      text: 'Execute failing action',
+      channel: 'whatsapp',
+    });
+
+    consoleSpy.mockRestore();
+
+    expect(logs.some((l) => l.includes('[Agent] task_failed reason="action_execution_failed"'))).toBe(true);
+    expect(logs.some((l) => l.includes('[Agent] task_completed'))).toBe(false);
+    expect(result.replyText).toContain('failed');
+  });
+
+  // =========================================================================
+  // 14. Terminal state guarantees: TaskStateMachine forbids illegal transitions
+  // =========================================================================
+  it('14. TaskStateMachine strictly enforces terminal state boundaries (FAILED/CANCELLED/COMPLETED)', () => {
+    // 1. FAILED cannot transition to COMPLETED or CANCELLED
+    const failedSm = new TaskStateMachine('FAILED');
+    expect(failedSm.isTerminal()).toBe(true);
+    expect(failedSm.canTransitionTo('COMPLETED')).toBe(false);
+    expect(failedSm.canTransitionTo('CANCELLED')).toBe(false);
+    expect(() => failedSm.transitionTo('COMPLETED')).toThrow(/Illegal task state transition: FAILED -> COMPLETED/);
+
+    // 2. CANCELLED cannot transition to COMPLETED or FAILED
+    const cancelledSm = new TaskStateMachine('CANCELLED');
+    expect(cancelledSm.isTerminal()).toBe(true);
+    expect(cancelledSm.canTransitionTo('COMPLETED')).toBe(false);
+    expect(cancelledSm.canTransitionTo('FAILED')).toBe(false);
+    expect(() => cancelledSm.transitionTo('COMPLETED')).toThrow(/Illegal task state transition: CANCELLED -> COMPLETED/);
+
+    // 3. COMPLETED cannot transition to FAILED or CANCELLED
+    const completedSm = new TaskStateMachine('COMPLETED');
+    expect(completedSm.isTerminal()).toBe(true);
+    expect(completedSm.canTransitionTo('FAILED')).toBe(false);
+    expect(completedSm.canTransitionTo('CANCELLED')).toBe(false);
+    expect(() => completedSm.transitionTo('FAILED')).toThrow(/Illegal task state transition: COMPLETED -> FAILED/);
+
+    // 4. Active state can transition to CANCELLED
+    const activeSm = new TaskStateMachine('EXECUTING');
+    expect(activeSm.isTerminal()).toBe(false);
+    expect(activeSm.canTransitionTo('CANCELLED')).toBe(true);
+    activeSm.transitionTo('CANCELLED');
+    expect(activeSm.getState()).toBe('CANCELLED');
+    expect(activeSm.isTerminal()).toBe(true);
+  });
+
+  // =========================================================================
+  // 15. Intent Tool Gate: CONVERSATION intent receives strictly zero tool declarations
+  // =========================================================================
+  it('15. CONVERSATION intent provides strictly empty toolDeclarations to Gemini', async () => {
+    let toolsPassed: any[] = [];
+    const mockAi = new MockAIProvider(async (messages, options) => {
+      toolsPassed = options?.tools || [];
+      return { text: 'I am doing great, thank you!' };
+    });
+
+    const orchestrator = new AgentOrchestrator(mockAi, toolRegistry, db);
+    await orchestrator.processMessage({
+      phoneNumber: '+919999900015',
+      name: 'ChatUser',
+      preferredName: 'ChatUser',
+      nameConfirmed: true,
+      text: 'How are you doing today?',
+      channel: 'whatsapp',
+    });
+
+    expect(toolsPassed).toHaveLength(0);
+  });
+
+  // =========================================================================
+  // 16. Intent Tool Gate: SHOPPING intent filters out travel and email tools
+  // =========================================================================
+  it('16. SHOPPING intent provides commerce tools and excludes travel booking / email tools', async () => {
+    let toolsPassed: any[] = [];
+    const mockAi = new MockAIProvider(async (messages, options) => {
+      toolsPassed = options?.tools || [];
+      return { text: 'Looking up products...' };
+    });
+
+    const orchestrator = new AgentOrchestrator(mockAi, toolRegistry, db);
+    await orchestrator.processMessage({
+      phoneNumber: '+919999900016',
+      name: 'ShopUser',
+      preferredName: 'ShopUser',
+      nameConfirmed: true,
+      text: 'Order groceries on Blinkit',
+      channel: 'whatsapp',
+    });
+
+    expect(toolsPassed.length).toBeGreaterThan(0);
+    expect(toolsPassed.some((t) => t.name.startsWith('book_'))).toBe(false);
+    expect(toolsPassed.some((t) => t.name === 'send_email')).toBe(false);
+  });
+
+  // =========================================================================
+  // 17. Intent Tool Gate: RESEARCH intent excludes commerce and wallet tools
+  // =========================================================================
+  it('17. RESEARCH intent excludes shopping, wallet, and booking tools', async () => {
+    let toolsPassed: any[] = [];
+    const mockAi = new MockAIProvider(async (messages, options) => {
+      toolsPassed = options?.tools || [];
+      return { text: 'Searching information...' };
+    });
+
+    const orchestrator = new AgentOrchestrator(mockAi, toolRegistry, db);
+    await orchestrator.processMessage({
+      phoneNumber: '+919999900017',
+      name: 'ResearchUser',
+      preferredName: 'ResearchUser',
+      nameConfirmed: true,
+      text: 'What is the capital of France and its history?',
+      channel: 'whatsapp',
+    });
+
+    expect(toolsPassed.length).toBeGreaterThan(0);
+    expect(toolsPassed.some((t) => t.name.startsWith('shopping_'))).toBe(false);
+    expect(toolsPassed.some((t) => t.name.startsWith('wallet_'))).toBe(false);
+    expect(toolsPassed.some((t) => t.name.startsWith('book_'))).toBe(false);
+  });
+
+  // =========================================================================
+  // 18. User rejection of pending approval transitions to CANCELLED and logs task_cancelled
+  // =========================================================================
+  it('18. Rejection of pending approval transitions to CANCELLED and never logs task_completed', async () => {
+    const logs: string[] = [];
+    const consoleSpy = vi.spyOn(console, 'log').mockImplementation((...args) => {
+      logs.push(args.join(' '));
+    });
+
+    const user = await db.findOrCreateUserByPhone('+919999900018', 'RejectUser');
+    user.preferred_name = 'RejectUser';
+    user.name_confirmed = true;
+    const conversation = await db.getOrCreateActiveConversation(user.id, 'whatsapp');
+
+    // Create pending approval
+    await db.createApproval({
+      conversation_id: conversation.id,
+      user_id: user.id,
+      tool_name: 'wallet_pay',
+      arguments: { amount_minor: 50000, recipient: 'Merchant' },
+      summary: 'Payment of ₹500 to Merchant',
+      impact_level: 'critical',
+      status: 'pending',
+      expires_at: new Date(Date.now() + 60000).toISOString(),
+      metadata: {},
+    });
+
+    const mockAi = new MockAIProvider(async () => ({ text: '' }));
+    const orchestrator = new AgentOrchestrator(mockAi, toolRegistry, db);
+    const result = await orchestrator.processMessage({
+      phoneNumber: '+919999900018',
+      name: 'RejectUser',
+      preferredName: 'RejectUser',
+      nameConfirmed: true,
+      text: 'No, cancel it',
+      channel: 'whatsapp',
+    });
+
+    consoleSpy.mockRestore();
+
+    expect(logs.some((l) => l.includes('[Agent] task_cancelled reason="user_rejected"'))).toBe(true);
+    expect(logs.some((l) => l.includes('[Agent] task_completed'))).toBe(false);
+    expect(result.replyText).toContain('cancelled that action');
+  });
+
+  // =========================================================================
+  // 19. Confirmed action failure transitions to FAILED and never logs task_completed
+  // =========================================================================
+  it('19. Confirmed action failure transitions to FAILED and never logs task_completed', async () => {
+    const logs: string[] = [];
+    const consoleSpy = vi.spyOn(console, 'log').mockImplementation((...args) => {
+      logs.push(args.join(' '));
+    });
+
+    const user = await db.findOrCreateUserByPhone('+919999900019', 'ConfirmFailUser');
+    user.preferred_name = 'ConfirmFailUser';
+    user.name_confirmed = true;
+    const conversation = await db.getOrCreateActiveConversation(user.id, 'whatsapp');
+
+    // Register a tool that fails when confirmed
+    const customRegistry = createDefaultToolRegistry({ db, browserService });
+    const mockFailingPaymentTool: BaseTool = {
+      name: 'failing_action_tool',
+      description: 'Fails upon confirmation',
+      riskLevel: 'critical',
+      parametersSchema: z.object({ amount: z.number() }),
+      requiresApproval: () => ({ required: true, summary: 'Action' }),
+      execute: async () => {
+        return { success: false, error: 'Insufficient funds in payment gateway' };
+      },
+    };
+    customRegistry.register(mockFailingPaymentTool);
+
+    await db.createApproval({
+      conversation_id: conversation.id,
+      user_id: user.id,
+      tool_name: 'failing_action_tool',
+      arguments: { amount: 100 },
+      summary: 'Action for ₹100',
+      impact_level: 'critical',
+      status: 'pending',
+      expires_at: new Date(Date.now() + 60000).toISOString(),
+      metadata: {},
+    });
+
+    const mockAi = new MockAIProvider(async () => ({ text: '' }));
+    const orchestrator = new AgentOrchestrator(mockAi, customRegistry, db);
+    await orchestrator.processMessage({
+      phoneNumber: '+919999900019',
+      name: 'ConfirmFailUser',
+      preferredName: 'ConfirmFailUser',
+      nameConfirmed: true,
+      text: 'Yes, proceed',
+      channel: 'whatsapp',
+    });
+
+    consoleSpy.mockRestore();
+
+    expect(logs.some((l) => l.includes('[Agent] task_failed reason="confirmed_action_failed"'))).toBe(true);
+    expect(logs.some((l) => l.includes('[Agent] task_completed'))).toBe(false);
   });
 });

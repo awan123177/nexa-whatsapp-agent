@@ -14,7 +14,8 @@ const CONTINUATION_PATTERNS = [
 
 // Conversational / Greeting / Capability patterns
 const CONVERSATION_PATTERNS = [
-  /^\s*(?:hi|hello|hey|yo|greetings|good (?:morning|afternoon|evening))\b/i,
+  /^\s*(?:hi|hello|hey|yo|greetings|good (?:morning|afternoon|evening|day))\b/i,
+  /\b(?:how are you|how's it going|how are things|how do you do|what's up|sup)\b/i,
   /\b(?:what can you do|who are you|who built you|who created you|who made you|help|capabilities|how does this work)\b/i,
   /\b(?:thank you|thanks|bye|goodbye|see you|ok|okay|cool|nice)\b/i,
 ];

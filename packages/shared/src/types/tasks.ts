@@ -10,7 +10,8 @@ export type TaskState =
   | 'RECOVERING'
   | 'COMPLETED'
   | 'FAILED'
-  | 'BLOCKED';
+  | 'BLOCKED'
+  | 'CANCELLED';
 
 export interface TaskCheckpoint {
   taskId: string;

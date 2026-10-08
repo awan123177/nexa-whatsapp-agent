@@ -246,9 +246,14 @@ export class AgentOrchestrator {
         m.sender_type === 'user' &&
         /\b(order|buy|cart|checkout|instamart|blinkit|zepto|amazon|swiggy)\b/i.test(m.content || '')
     );
+    const hasPreviousUnfinishedTask = rawHistory.some(
+      (m) =>
+        m.sender_type === 'user' &&
+        /\b(order|buy|cart|checkout|instamart|blinkit|zepto|amazon|swiggy|flight|hotel|booking|book)\b/i.test(m.content || '')
+    );
 
     const isCancel = isCancellationMessage(input.text || '');
-    const isContinue = !isCancel && hasPreviousUnfinishedCommerce && isContinuationMessage(input.text || '');
+    const isContinue = !isCancel && hasPreviousUnfinishedTask && isContinuationMessage(input.text || '');
 
     const currentRequestId = `req_${Date.now()}_${Math.random().toString(36).substring(2, 8)}`;
     const currentActiveTaskId = isContinue
@@ -266,9 +271,11 @@ export class AgentOrchestrator {
     if (isCancel) {
       console.log(`[Context] stale_context_rejected reason="user_cancelled"`);
       console.log(`[Context] previous_task_not_resumed reason="user_cancelled"`);
-    } else if (hasPreviousUnfinishedCommerce && !isContinue) {
+    } else if (hasPreviousUnfinishedTask && !isContinue) {
       console.log(`[Context] previous_task_not_resumed reason="no_explicit_continuation"`);
     }
+
+    const stateMachine = new TaskStateMachine('CREATED');
 
     // 5. Identity & Preferred Name Onboarding Flow
     const identityResult = await IdentityManager.handleInboundMessage({
@@ -286,6 +293,9 @@ export class AgentOrchestrator {
     context.user = user;
 
     if (identityResult.handled && identityResult.replyText) {
+      if (stateMachine.canTransitionTo('COMPLETED')) {
+        stateMachine.transitionTo('COMPLETED');
+      }
       console.log(`[Agent] task_completed steps=0`);
       await this.db.saveMessage({
         conversation_id: conversation.id,
@@ -302,6 +312,9 @@ export class AgentOrchestrator {
 
     // 6. Check for Pending Approvals
     if (pendingApproval) {
+      if (stateMachine.canTransitionTo('WAITING_APPROVAL')) {
+        stateMachine.transitionTo('WAITING_APPROVAL');
+      }
       const lowerText = input.text.trim().toLowerCase();
       const words = lowerText.split(/[\s,;.!?]+/).filter(Boolean);
       const isApproved =
@@ -334,7 +347,17 @@ export class AgentOrchestrator {
           executionResult.userFacingMessage ||
           `Action confirmed and completed: ${pendingApproval.summary}`;
 
-        console.log(`[Agent] task_completed steps=1`);
+        if (executionResult.success) {
+          if (stateMachine.canTransitionTo('COMPLETED')) {
+            stateMachine.transitionTo('COMPLETED');
+          }
+          console.log(`[Agent] task_completed steps=1`);
+        } else {
+          if (stateMachine.canTransitionTo('FAILED')) {
+            stateMachine.transitionTo('FAILED');
+          }
+          console.log(`[Agent] task_failed reason="confirmed_action_failed" steps=1`);
+        }
         await this.db.saveMessage({
           conversation_id: conversation.id,
           sender_type: 'assistant',
@@ -351,7 +374,10 @@ export class AgentOrchestrator {
         await this.db.updateApprovalStatus(pendingApproval.id, 'rejected');
         const reply = "Understood. I've cancelled that action. How else can I help you?";
 
-        console.log(`[Agent] task_completed steps=1`);
+        if (stateMachine.canTransitionTo('CANCELLED')) {
+          stateMachine.transitionTo('CANCELLED');
+        }
+        console.log(`[Agent] task_cancelled reason="user_rejected" steps=1`);
         await this.db.saveMessage({
           conversation_id: conversation.id,
           sender_type: 'assistant',
@@ -456,9 +482,10 @@ export class AgentOrchestrator {
     }
 
     const isCommerceTask =
-      intent === 'SHOPPING' ||
-      Boolean(resolvedMerchant) ||
-      (isContinue && hasPreviousUnfinishedCommerce);
+      intent !== 'CONVERSATION' &&
+      (intent === 'SHOPPING' ||
+        Boolean(resolvedMerchant) ||
+        (isContinue && hasPreviousUnfinishedCommerce));
 
     let effectiveMaxSteps = this.maxSteps;
     let effectiveDeadlineMs = this.totalDeadlineMs;
@@ -478,7 +505,6 @@ export class AgentOrchestrator {
       ? (resolvedMerchant ? `commerce_order_${resolvedMerchant.merchantId}` : 'commerce_order_execution')
       : 'understand_and_execute';
 
-    const stateMachine = new TaskStateMachine('CREATED');
     if (stateMachine.canTransitionTo('PLANNING')) {
       stateMachine.transitionTo('PLANNING');
     }
@@ -963,8 +989,10 @@ export class AgentOrchestrator {
     } else if (finalReply && !modelFailed && !latestExecutionToolFailed && !deadlineApproaching) {
       if (stateMachine.canTransitionTo('COMPLETED')) {
         stateMachine.transitionTo('COMPLETED');
+        console.log(`[Agent] task_completed steps=${currentStep}`);
+      } else {
+        console.log(`[Agent] task_completion_blocked current_state=${stateMachine.getState()}`);
       }
-      console.log(`[Agent] task_completed steps=${currentStep}`);
     }
 
     // 9. Persist final assistant reply
