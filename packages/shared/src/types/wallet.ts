@@ -135,6 +135,9 @@ export function formatMinorUnits(amountMinor: number, currency = 'INR'): string 
  * Example: 499 -> 49900, "499.50" -> 49950
  */
 export function parseToMinorUnits(amount: number | string): number {
+  if (amount === undefined || amount === null) {
+    return 0;
+  }
   if (typeof amount === 'number') {
     return Math.round(amount * 100);
   }

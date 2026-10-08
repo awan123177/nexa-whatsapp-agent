@@ -74,6 +74,8 @@ export function resolveToolTimeout(toolName: string, defaultTimeout = DEFAULT_TO
     case 'browser_type':
     case 'browser_scroll':
     case 'browser_wait':
+    case 'browser_verify_cart':
+    case 'browser_restore_session':
       return BROWSER_ACTION_TIMEOUT_MS; // 10000
     case 'web_search':
       return WEB_SEARCH_TIMEOUT_MS; // 10000
@@ -222,6 +224,7 @@ export class AgentOrchestrator {
     context.user = user;
 
     if (identityResult.handled && identityResult.replyText) {
+      console.log(`[Agent] task_completed steps=0`);
       await this.db.saveMessage({
         conversation_id: conversation.id,
         sender_type: 'assistant',
@@ -269,6 +272,7 @@ export class AgentOrchestrator {
           executionResult.userFacingMessage ||
           `Action confirmed and completed: ${pendingApproval.summary}`;
 
+        console.log(`[Agent] task_completed steps=1`);
         await this.db.saveMessage({
           conversation_id: conversation.id,
           sender_type: 'assistant',
@@ -285,6 +289,7 @@ export class AgentOrchestrator {
         await this.db.updateApprovalStatus(pendingApproval.id, 'rejected');
         const reply = "Understood. I've cancelled that action. How else can I help you?";
 
+        console.log(`[Agent] task_completed steps=1`);
         await this.db.saveMessage({
           conversation_id: conversation.id,
           sender_type: 'assistant',
@@ -342,6 +347,9 @@ export class AgentOrchestrator {
     let currentStep = 0;
     let finalReply = '';
 
+    console.log(`[Agent] task_created taskId=${conversation.id}_${Date.now()} user=${user.id}`);
+    console.log(`[Agent] plan_created plan="understand_and_execute" maxSteps=${this.maxSteps}`);
+
     // Active in-memory raw Gemini Content[] history for intermediate tool turns
     let activeRawHistory: any[] | undefined = undefined;
 
@@ -355,6 +363,7 @@ export class AgentOrchestrator {
       }
 
       currentStep++;
+      console.log(`[Agent] step_started step=${currentStep}`);
 
       const thinkingLevel = resolveThinkingLevel(currentTurnContent, currentStep, input.thinkingLevel);
       console.log(`[WhatsApp Path] gemini_request_start step=${currentStep} thinking_level=${thinkingLevel}`);
@@ -374,6 +383,7 @@ export class AgentOrchestrator {
 
       // Case A: Model returned plain text without calling any tools
       if (!aiResponse.toolCalls || aiResponse.toolCalls.length === 0) {
+        console.log(`[Agent] step_completed step=${currentStep}`);
         finalReply = aiResponse.text;
         break;
       }
@@ -428,6 +438,9 @@ export class AgentOrchestrator {
         const tcName = tc.name;
         const signature = normalizeToolSignature(tcName, tc.arguments as Record<string, unknown>);
         console.log(`[Agent] step=${currentStep} tool=${tcName}`);
+        if (tcName.includes('verify')) {
+          console.log(`[Agent] verification_started tool=${tcName}`);
+        }
 
         // Check 1: Tool disabled for this session due to repeated failures (2 or more)
         if (disabledTools.has(tcName)) {
@@ -503,6 +516,12 @@ export class AgentOrchestrator {
 
           if (result.success) {
             console.log(`[Agent] tool_success name=${tcName}`);
+            if (tcName.includes('verify')) {
+              console.log(`[Agent] verification_passed tool=${tcName}`);
+            }
+            if (tcName.includes('restore')) {
+              console.log(`[Agent] recovery_completed tool=${tcName} status="recovered"`);
+            }
             toolResultsForNextTurn.push({
               toolCallId: tc.id,
               name: tcName,
@@ -555,7 +574,8 @@ export class AgentOrchestrator {
           }
 
           // Check if this was an intentional pause for user confirmation!
-          if (err instanceof ApprovalRequiredError) {
+          if (err instanceof ApprovalRequiredError || err?.name === 'ApprovalRequiredError') {
+            console.log(`[Agent] step_completed step=${currentStep} status="awaiting_approval"`);
             await this.db.saveMessage({
               conversation_id: conversation.id,
               sender_type: 'assistant',
@@ -588,6 +608,10 @@ export class AgentOrchestrator {
             err.name === 'ToolTimeoutError' ||
             (err.message && err.message.toLowerCase().includes('timed out')) ||
             abortController.signal.aborted;
+
+          if (isTimeout || tcName.startsWith('browser_')) {
+            console.log(`[Agent] recovery_started tool=${tcName} reason="${errMsg}"`);
+          }
 
           const errorPayload: Record<string, unknown> = isTimeout
             ? { success: false, errorType: 'TIMEOUT', error: errMsg, message: errMsg }
@@ -624,10 +648,13 @@ export class AgentOrchestrator {
           parts: functionResponseParts,
         });
       }
+
+      console.log(`[Agent] step_completed step=${currentStep}`);
     }
 
     if (currentStep >= this.maxSteps && !finalReply) {
       console.log(`[Agent] max_steps_reached limit=${this.maxSteps}`);
+      console.log(`[Agent] task_failed reason="max_steps_reached" steps=${currentStep}`);
     }
 
     if (!finalReply) {
@@ -658,6 +685,10 @@ export class AgentOrchestrator {
         finalReply =
           "I have gathered the information for your request. Let me know if you would like me to take any further action!";
       }
+    }
+
+    if (finalReply) {
+      console.log(`[Agent] task_completed steps=${currentStep}`);
     }
 
     // 9. Persist final assistant reply

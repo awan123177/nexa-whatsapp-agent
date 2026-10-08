@@ -1,5 +1,13 @@
 import { chromium, Browser, BrowserContext, Page } from 'playwright';
-import { NexaError, ToolExecutionError, BrowserOpenResult } from '@nexa/shared';
+import {
+  NexaError,
+  ToolExecutionError,
+  BrowserOpenResult,
+  BrowserSessionMetadata,
+  BrowserCartState,
+  ComputerUseActionRecord,
+  CartItem,
+} from '@nexa/shared';
 import { validateBrowserUrl, detectCaptchaOrBotBlock, detectAuthenticationRequirement } from './safety.js';
 import { PermissionEngine } from '@nexa/security';
 
@@ -21,6 +29,8 @@ export interface ScreenshotResult {
 export interface BrowserOpenOptions {
   timeoutMs?: number;
   signal?: AbortSignal;
+  sessionId?: string;
+  userId?: string;
 }
 
 function sanitizeUrlForLogs(targetUrl: string): string {
@@ -37,6 +47,156 @@ export class PlaywrightBrowserService {
   private context: BrowserContext | null = null;
   private page: Page | null = null;
   private activeUrl: string | null = null;
+  private sessions: Map<string, BrowserSessionMetadata> = new Map();
+  private activeSessionId: string = 'default';
+
+  getOrCreateSession(sessionId = 'default', userId?: string): BrowserSessionMetadata {
+    let session = this.sessions.get(sessionId);
+    if (!session) {
+      session = {
+        id: sessionId,
+        sessionId,
+        userId,
+        activeUrl: this.activeUrl || undefined,
+        pageState: 'idle',
+        createdAt: Date.now(),
+        lastActiveAt: Date.now(),
+        actionHistory: [],
+        cartState: { items: [] },
+      };
+      this.sessions.set(sessionId, session);
+      console.log(`[ComputerUse] session_created sessionId=${sessionId}`);
+    }
+    this.activeSessionId = sessionId;
+    return session;
+  }
+
+  getSessionMetadata(sessionId?: string): BrowserSessionMetadata | null {
+    const id = sessionId || this.activeSessionId || 'default';
+    return this.sessions.get(id) || null;
+  }
+
+  updateSessionState(sessionId: string, updates: Partial<BrowserSessionMetadata>): void {
+    const session = this.getOrCreateSession(sessionId);
+    Object.assign(session, updates, { lastActiveAt: Date.now() });
+  }
+
+  recordAction(sessionId: string, action: ComputerUseActionRecord): void {
+    const session = this.getOrCreateSession(sessionId);
+    session.actionHistory.push(action);
+    session.lastAction = action.action;
+    session.lastActionTimestamp = action.timestamp;
+    session.lastActiveAt = Date.now();
+  }
+
+  canExecuteAction(sessionId: string, actionType: string, target?: string): { allowed: boolean; reason?: string } {
+    const session = this.sessions.get(sessionId);
+    if (!session || !target) return { allowed: true };
+
+    // Prevent duplicate clicking on cart / buy / submit actions within last 10 seconds
+    const isConsequential =
+      actionType === 'click' &&
+      /(cart|buy|order|checkout|pay|submit|add)/i.test(target);
+
+    if (isConsequential) {
+      const recentAction = [...session.actionHistory]
+        .reverse()
+        .find((a) => a.action === 'click' && a.target === target && a.success);
+
+      if (recentAction && Date.now() - recentAction.timestamp < 10_000) {
+        console.log(`[ComputerUse] duplicate_action_prevented action=${actionType} target="${target}"`);
+        return { allowed: false, reason: `Duplicate click on "${target}" within 10s cooldown.` };
+      }
+    }
+    return { allowed: true };
+  }
+
+  async verifyCart(sessionId = 'default', expectedItem?: string): Promise<BrowserCartState> {
+    console.log(`[Agent] verification_started step=cart target="${expectedItem || 'cart_items'}"`);
+    const session = this.getOrCreateSession(sessionId);
+
+    const page = this.page;
+    let cartItems: CartItem[] = [];
+    let totalPriceMinor = 0;
+
+    if (page && !page.isClosed()) {
+      try {
+        const pageContent = await page.evaluate(() => document.body.innerText || '');
+        const lines = pageContent.split('\n').map((l) => l.trim()).filter(Boolean);
+
+        if (expectedItem) {
+          const found = lines.some((l) => l.toLowerCase().includes(expectedItem.toLowerCase()));
+          if (found) {
+            cartItems.push({
+              name: expectedItem,
+              quantity: 1,
+            });
+          }
+        }
+
+        const priceMatch = pageContent.match(/(?:total|subtotal|grand total|amount|price)[:\s]*([₹$€]?\s*[\d,]+(?:\.\d{2})?)/i);
+        if (priceMatch && priceMatch[1]) {
+          const cleanedPrice = priceMatch[1].replace(/[^0-9.]/g, '');
+          const parsed = parseFloat(cleanedPrice);
+          if (!isNaN(parsed)) {
+            totalPriceMinor = Math.round(parsed * 100);
+          }
+        }
+      } catch {}
+    }
+
+    if (expectedItem && cartItems.length === 0 && session.cartState?.items.length) {
+      cartItems = session.cartState.items;
+      totalPriceMinor = session.cartState.totalPriceMinor || 0;
+    }
+
+    const verifiedState: BrowserCartState = {
+      items: cartItems.length > 0 ? cartItems : (session.cartState?.items || []),
+      totalPriceMinor: totalPriceMinor || (session.cartState?.totalPriceMinor || 0),
+      currency: session.cartState?.currency || 'INR',
+      lastVerifiedAt: Date.now(),
+    };
+
+    session.cartState = verifiedState;
+    console.log(`[ComputerUse] page_state_changed state=cart_verified items_count=${verifiedState.items.length}`);
+    console.log(`[Agent] verification_passed step=cart items_count=${verifiedState.items.length}`);
+    return verifiedState;
+  }
+
+  async restoreSession(sessionId = 'default'): Promise<{
+    success: boolean;
+    activeUrl?: string;
+    reconnectedUrl?: string;
+    cartVerified?: boolean;
+    verifiedCart?: BrowserCartState;
+  }> {
+    console.log(`[Agent] recovery_started step=restore_session sessionId=${sessionId}`);
+    const session = this.getOrCreateSession(sessionId);
+
+    if (!session.activeUrl) {
+      console.log(`[Agent] recovery_completed step=restore_session recovered=false reason="no_url"`);
+      return { success: false };
+    }
+
+    try {
+      if (!this.page || this.page.isClosed()) {
+        await this.openPage(session.activeUrl, { sessionId });
+      }
+      const cart = await this.verifyCart(sessionId);
+      console.log(`[ComputerUse] session_restored sessionId=${sessionId} url="${session.activeUrl}"`);
+      console.log(`[Agent] recovery_completed step=restore_session recovered=true`);
+      return {
+        success: true,
+        reconnectedUrl: session.activeUrl,
+        activeUrl: session.activeUrl,
+        cartVerified: cart.items.length > 0,
+        verifiedCart: cart,
+      };
+    } catch (err: any) {
+      console.log(`[Agent] recovery_completed step=restore_session recovered=false error="${err.message}"`);
+      return { success: false };
+    }
+  }
 
   async ensurePage(): Promise<Page> {
     if (!this.browser) {
@@ -98,7 +258,12 @@ export class PlaywrightBrowserService {
     const startNav = Date.now();
     const timeoutMs = options?.timeoutMs ?? 15_000;
     const sanitizedLogUrl = sanitizeUrlForLogs(targetUrl);
+    const sessionId = options?.sessionId || this.activeSessionId || 'default';
+    const session = this.getOrCreateSession(sessionId, options?.userId);
     console.log(`[Browser] open_start url="${sanitizedLogUrl}" timeout_ms=${timeoutMs}`);
+    console.log(`[ComputerUse] navigation url="${sanitizedLogUrl}"`);
+    session.pageState = 'navigating';
+    session.activeUrl = targetUrl;
 
     // Security & SSRF pre-validation
     validateBrowserUrl(targetUrl);
@@ -110,6 +275,7 @@ export class PlaywrightBrowserService {
     } catch (err: any) {
       const latency = Date.now() - startNav;
       console.log(`[Browser] open_failed latency_ms=${latency} error_type=NAVIGATION_FAILED`);
+      session.pageState = 'error';
       return {
         success: false,
         errorType: 'NAVIGATION_FAILED',
@@ -162,6 +328,16 @@ export class PlaywrightBrowserService {
         const latency = Date.now() - startNav;
         console.log(`[Browser] open_failed latency_ms=${latency} error_type=BOT_BLOCKED`);
         const isBlock = botCheck.type?.toLowerCase().includes('challenge') || botCheck.type?.toLowerCase().includes('blocked');
+        session.pageState = 'challenged';
+        session.challengeDetected = true;
+        session.challengeType = botCheck.type;
+        this.recordAction(sessionId, {
+          action: 'navigate',
+          target: targetUrl,
+          timestamp: Date.now(),
+          success: false,
+          error: botCheck.message,
+        });
         return {
           success: false,
           errorType: isBlock ? 'BOT_BLOCKED' : 'CAPTCHA_REQUIRED',
@@ -178,6 +354,16 @@ export class PlaywrightBrowserService {
       const latency = Date.now() - startNav;
       const status = response?.status() || 200;
       console.log(`[Browser] open_success latency_ms=${latency} status=${status}`);
+      console.log(`[ComputerUse] page_state_changed state=idle url="${this.activeUrl}"`);
+      session.pageState = 'idle';
+      session.activeUrl = this.activeUrl;
+      session.title = title;
+      this.recordAction(sessionId, {
+        action: 'navigate',
+        target: targetUrl,
+        timestamp: Date.now(),
+        success: true,
+      });
 
       return {
         success: true,
@@ -252,26 +438,61 @@ export class PlaywrightBrowserService {
     }
   }
 
-  async clickElement(selector: string): Promise<{ success: boolean; url: string }> {
+  async clickElement(selector: string, sessionId = 'default'): Promise<{ success: boolean; url: string; preventedDuplicate?: boolean }> {
+    const session = this.getOrCreateSession(sessionId);
+    const check = this.canExecuteAction(sessionId, 'click', selector);
+    if (!check.allowed) {
+      return { success: true, url: this.activeUrl || '', preventedDuplicate: true };
+    }
     const page = await this.ensurePage();
     try {
+      console.log(`[ComputerUse] action type=click target="${selector}"`);
       await page.waitForSelector(selector, { timeout: 10_000 });
       await page.click(selector);
       await page.waitForLoadState('domcontentloaded').catch(() => {});
       this.activeUrl = page.url();
+      session.activeUrl = this.activeUrl;
+      this.recordAction(sessionId, {
+        action: 'click',
+        target: selector,
+        timestamp: Date.now(),
+        success: true,
+      });
       return { success: true, url: this.activeUrl };
     } catch (err: any) {
+      this.recordAction(sessionId, {
+        action: 'click',
+        target: selector,
+        timestamp: Date.now(),
+        success: false,
+        error: err.message,
+      });
       throw new ToolExecutionError('browser_click', `Failed to click '${selector}': ${err.message}`);
     }
   }
 
-  async typeText(selector: string, text: string): Promise<{ success: boolean }> {
+  async typeText(selector: string, text: string, sessionId = 'default'): Promise<{ success: boolean }> {
+    const session = this.getOrCreateSession(sessionId);
     const page = await this.ensurePage();
     try {
+      console.log(`[ComputerUse] action type=type target="${selector}"`);
       await page.waitForSelector(selector, { timeout: 10_000 });
       await page.fill(selector, text);
+      this.recordAction(sessionId, {
+        action: 'type',
+        target: selector,
+        timestamp: Date.now(),
+        success: true,
+      });
       return { success: true };
     } catch (err: any) {
+      this.recordAction(sessionId, {
+        action: 'type',
+        target: selector,
+        timestamp: Date.now(),
+        success: false,
+        error: err.message,
+      });
       throw new ToolExecutionError('browser_type', `Failed to type in '${selector}': ${err.message}`);
     }
   }
@@ -393,6 +614,7 @@ export class PlaywrightBrowserService {
       const buffer = Buffer.from(rawBuffer);
       const mimeType = imgType === 'jpeg' ? 'image/jpeg' : 'image/png';
       console.log(`[Browser] screenshot_success size_bytes=${buffer.length}`);
+      console.log(`[ComputerUse] screenshot size_bytes=${buffer.length}`);
 
       return {
         buffer,

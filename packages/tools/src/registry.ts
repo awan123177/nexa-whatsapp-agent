@@ -129,6 +129,9 @@ export class ToolRegistry {
     try {
       result = await tool.execute(parsedArgs, context);
     } catch (err: any) {
+      if (err instanceof ApprovalRequiredError || err?.name === 'ApprovalRequiredError') {
+        throw err;
+      }
       executionError = err.message || 'Unknown error during execution';
       result = {
         success: false,

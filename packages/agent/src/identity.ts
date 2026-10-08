@@ -161,6 +161,28 @@ export class IdentityManager {
   }
 
   /**
+   * Detects questions inquiring about NEXA's creator, builder, founder, or developer.
+   */
+  static detectCreatorQuestion(text: string): boolean {
+    const clean = text
+      .toLowerCase()
+      .trim()
+      .replace(/[?!.,;:]+$/, '');
+
+    const patterns = [
+      /\bwho\s+(?:built|created|made|developed|programmed|founded|designed)\s+(?:you|u|nexa)\b/i,
+      /\bwho(?:'s|\s+is)\s+(?:your|the)\s+(?:creator|builder|developer|founder|maker|author|owner)\b/i,
+      /\bwho(?:'s|\s+is)\s+behind\s+(?:you|u|nexa)\b/i,
+      /\bwho\s+owns\s+(?:you|u|nexa)\b/i,
+      /\bwho(?:'s|\s+is)\s+nexa(?:'s)?\s+(?:creator|builder|developer|founder|maker)\b/i,
+      /\bwho\s+(?:runs|started)\s+nexa\b/i,
+      /\bwho\s+(?:is|was)\s+(?:the\s+)?(?:developer|founder|creator|builder)\s+of\s+nexa\b/i,
+    ];
+
+    return patterns.some((p) => p.test(clean));
+  }
+
+  /**
    * Extracts preferred name from an introduction phrase in conversational speech.
    */
   static extractName(text: string): string | null {
@@ -495,6 +517,15 @@ export class IdentityManager {
       return {
         handled: true,
         replyText: `Should I call you ${opt1} or ${opt2}?`,
+        user,
+      };
+    }
+
+    // 4. Check for Creator / Builder Questions ("Who built you?", "Who created you?", etc.)
+    if (this.detectCreatorQuestion(trimmedText)) {
+      return {
+        handled: true,
+        replyText: "I was built by Awan Warsi — he's the creator behind NEXA.",
         user,
       };
     }

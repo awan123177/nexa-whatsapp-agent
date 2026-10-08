@@ -76,6 +76,14 @@ export class MemoryService {
     // Reject secrets
     MemoryService.validateSafeContent(key, value);
 
+    // Creator identity is a permanent system-level property, not user memory
+    const normalizedKey = key.trim().toLowerCase();
+    if (['creator', 'builder', 'developer', 'founder', 'nexa_creator', 'nexa_builder'].includes(normalizedKey)) {
+      throw new SecurityViolationError(
+        'Creator identity is a permanent system-level property and cannot be overwritten by user memory.'
+      );
+    }
+
     const memory = await this.db.saveMemory({
       user_id: userId,
       category,

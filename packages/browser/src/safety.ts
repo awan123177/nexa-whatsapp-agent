@@ -111,11 +111,15 @@ export function detectCaptchaOrBotBlock(pageContent: string): {
 } {
   const contentLower = pageContent.toLowerCase();
 
+  // 1. Cloudflare & Turnstile Challenges
   if (
     contentLower.includes('cf-browser-verification') ||
     contentLower.includes('turnstile') ||
-    contentLower.includes('cloudflare ray id') && contentLower.includes('challenge')
+    contentLower.includes('challenges.cloudflare.com') ||
+    (contentLower.includes('cloudflare ray id') && contentLower.includes('challenge')) ||
+    (contentLower.includes('just a moment...') && contentLower.includes('cloudflare'))
   ) {
+    console.log('[ComputerUse] challenge_detected type="Cloudflare Challenge"');
     return {
       detected: true,
       type: 'Cloudflare Challenge',
@@ -124,11 +128,30 @@ export function detectCaptchaOrBotBlock(pageContent: string): {
     };
   }
 
+  // 2. "Verify you are human" / Generic Human Verification
+  if (
+    contentLower.includes('verify you are human') ||
+    contentLower.includes('verify that you are human') ||
+    contentLower.includes('confirm you are human') ||
+    contentLower.includes('checking your browser before accessing')
+  ) {
+    console.log('[ComputerUse] challenge_detected type="Human Verification Challenge"');
+    return {
+      detected: true,
+      type: 'Human Verification Challenge',
+      message:
+        'This website requires interactive "Verify you are human" confirmation. Automated browsing is paused for safety.',
+    };
+  }
+
+  // 3. Google reCAPTCHA
   if (
     contentLower.includes('g-recaptcha') ||
     contentLower.includes('recaptcha/api.js') ||
-    contentLower.includes('please solve this recaptcha')
+    contentLower.includes('please solve this recaptcha') ||
+    contentLower.includes('recaptcha-anchor')
   ) {
+    console.log('[ComputerUse] challenge_detected type="Google reCAPTCHA"');
     return {
       detected: true,
       type: 'Google reCAPTCHA',
@@ -137,12 +160,32 @@ export function detectCaptchaOrBotBlock(pageContent: string): {
     };
   }
 
+  // 4. hCaptcha
   if (contentLower.includes('hcaptcha') || contentLower.includes('hcaptcha.com')) {
+    console.log('[ComputerUse] challenge_detected type="hCaptcha"');
     return {
       detected: true,
       type: 'hCaptcha',
       message:
         'This website requires solving an hCaptcha. Automated completion is not permitted.',
+    };
+  }
+
+  // 5. Bot Protection / Access-Denied Challenges (DataDome, PerimeterX, AWS WAF, Akamai)
+  if (
+    contentLower.includes('datadome') ||
+    contentLower.includes('perimeterx') ||
+    contentLower.includes('px-captcha') ||
+    contentLower.includes('geo.captcha') ||
+    (contentLower.includes('access denied') && contentLower.includes('security reasons')) ||
+    (contentLower.includes('blocked') && contentLower.includes('automated request'))
+  ) {
+    console.log('[ComputerUse] challenge_detected type="Bot Protection Challenge"');
+    return {
+      detected: true,
+      type: 'Bot Protection Challenge',
+      message:
+        'Website bot protection has flagged automated browsing. Security controls require human verification.',
     };
   }
 

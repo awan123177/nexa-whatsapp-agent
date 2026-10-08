@@ -397,4 +397,45 @@ CREATE INDEX IF NOT EXISTS idx_wallet_audit_logs_wallet_id ON wallet_audit_logs(
 CREATE INDEX IF NOT EXISTS idx_wallet_audit_logs_action ON wallet_audit_logs(action);
 CREATE INDEX IF NOT EXISTS idx_wallet_audit_logs_created_at ON wallet_audit_logs(created_at DESC);
 
+-- ====================================================================
+-- 14. COMPUTER-USE & TASKS V2 (Browser Sessions & Plan Execution State)
+-- ====================================================================
+CREATE TABLE IF NOT EXISTS browser_sessions (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    session_id VARCHAR(255) NOT NULL,
+    user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+    active_url TEXT,
+    auth_state VARCHAR(50) DEFAULT 'IDLE' NOT NULL CHECK (auth_state IN (
+        'IDLE',
+        'AUTH_REQUIRED',
+        'AUTHENTICATED',
+        'CAPTCHA_REQUIRED',
+        'BLOCKED',
+        'ERROR'
+    )),
+    metadata JSONB DEFAULT '{}'::jsonb NOT NULL,
+    cart_state JSONB DEFAULT '{"items": [], "totalMinor": 0, "currency": "INR", "itemCount": 0, "verified": false}'::jsonb NOT NULL,
+    action_history JSONB DEFAULT '[]'::jsonb NOT NULL,
+    last_action_at TIMESTAMPTZ DEFAULT NOW() NOT NULL,
+    created_at TIMESTAMPTZ DEFAULT NOW() NOT NULL,
+    updated_at TIMESTAMPTZ DEFAULT NOW() NOT NULL,
+    CONSTRAINT uq_browser_sessions_session_id UNIQUE (session_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_browser_sessions_session_id ON browser_sessions(session_id);
+CREATE INDEX IF NOT EXISTS idx_browser_sessions_user_id ON browser_sessions(user_id);
+CREATE INDEX IF NOT EXISTS idx_browser_sessions_auth_state ON browser_sessions(auth_state);
+CREATE INDEX IF NOT EXISTS idx_browser_sessions_last_action_at ON browser_sessions(last_action_at DESC);
+
+DROP TRIGGER IF EXISTS update_browser_sessions_updated_at ON browser_sessions;
+CREATE TRIGGER update_browser_sessions_updated_at
+    BEFORE UPDATE ON browser_sessions
+    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS plan JSONB DEFAULT '[]'::jsonb NOT NULL;
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS current_step INTEGER DEFAULT 0 NOT NULL;
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS verification_state JSONB DEFAULT '{"verified": false}'::jsonb NOT NULL;
+
+CREATE INDEX IF NOT EXISTS idx_tasks_current_step ON tasks(current_step);
+
 

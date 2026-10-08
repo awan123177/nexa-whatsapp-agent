@@ -25,3 +25,47 @@ export type BrowserOpenFailure = {
 
 export type BrowserOpenResult = BrowserOpenSuccess | BrowserOpenFailure;
 
+export interface CartItem {
+  id?: string;
+  name: string;
+  priceMinor?: number;
+  formattedPrice?: string;
+  quantity: number;
+  url?: string;
+}
+
+export interface BrowserCartState {
+  items: CartItem[];
+  totalPriceMinor?: number;
+  formattedTotal?: string;
+  currency?: string;
+  lastVerifiedAt?: number;
+}
+
+export interface ComputerUseActionRecord {
+  action: 'navigate' | 'click' | 'type' | 'scroll' | 'wait' | 'screenshot' | 'verify_cart' | 'restore';
+  target?: string;
+  timestamp: number;
+  success: boolean;
+  error?: string;
+  details?: Record<string, unknown>;
+}
+
+export interface BrowserSessionMetadata {
+  id: string;
+  sessionId?: string;
+  userId?: string;
+  activeUrl?: string;
+  title?: string;
+  lastAction?: string;
+  lastActionTimestamp?: number;
+  cartState?: BrowserCartState;
+  pageState?: 'idle' | 'navigating' | 'authenticating' | 'challenged' | 'error';
+  challengeDetected?: boolean;
+  challengeType?: string;
+  createdAt: number;
+  lastActiveAt: number;
+  actionHistory: ComputerUseActionRecord[];
+}
+
+

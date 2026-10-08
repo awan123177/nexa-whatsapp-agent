@@ -16,12 +16,15 @@ export function createBrowserTools(
     riskLevel: 'read_only',
     parametersSchema: z.object({
       url: z.string().url().describe('The destination URL (must start with http:// or https://)'),
+      sessionId: z.string().optional().describe('Optional reusable browser session identifier'),
     }),
     requiresApproval: () => ({ required: false }),
-    execute: async (args: { url: string }, context: ToolExecutionContext): Promise<ToolResult> => {
+    execute: async (args: { url: string; sessionId?: string }, context: ToolExecutionContext): Promise<ToolResult> => {
       const result = await browserService.openPage(args.url, {
         timeoutMs: context.timeoutMs ?? 15_000,
         signal: context.abortSignal,
+        sessionId: args.sessionId || context.user?.id || 'default',
+        userId: context.user?.id,
       });
       if (!result.success) {
         return {
@@ -73,10 +76,14 @@ export function createBrowserTools(
     riskLevel: 'medium_risk',
     parametersSchema: z.object({
       selector: z.string().describe('CSS selector of the element to click (e.g. button#submit, a.nav-link)'),
+      sessionId: z.string().optional().describe('Optional browser session identifier'),
     }),
     requiresApproval: () => ({ required: false }),
-    execute: async (args: { selector: string }, context: ToolExecutionContext): Promise<ToolResult> => {
-      const data = await withAbortCleanup(browserService.clickElement(args.selector), context);
+    execute: async (args: { selector: string; sessionId?: string }, context: ToolExecutionContext): Promise<ToolResult> => {
+      const data = await withAbortCleanup(
+        browserService.clickElement(args.selector, args.sessionId || context.user?.id || 'default'),
+        context
+      );
       return { success: true, data };
     },
   };
@@ -88,10 +95,14 @@ export function createBrowserTools(
     parametersSchema: z.object({
       selector: z.string().describe('CSS selector of the input field'),
       text: z.string().describe('The text to enter'),
+      sessionId: z.string().optional().describe('Optional browser session identifier'),
     }),
     requiresApproval: () => ({ required: false }),
-    execute: async (args: { selector: string; text: string }, context: ToolExecutionContext): Promise<ToolResult> => {
-      const data = await withAbortCleanup(browserService.typeText(args.selector, args.text), context);
+    execute: async (args: { selector: string; text: string; sessionId?: string }, context: ToolExecutionContext): Promise<ToolResult> => {
+      const data = await withAbortCleanup(
+        browserService.typeText(args.selector, args.text, args.sessionId || context.user?.id || 'default'),
+        context
+      );
       return { success: true, data };
     },
   };
@@ -236,6 +247,54 @@ export function createBrowserTools(
     },
   };
 
+  const browserVerifyCartTool: BaseTool = {
+    name: 'browser_verify_cart',
+    description:
+      'Verifies the contents, items, quantities, and total prices currently in the shopping cart within the browser session before checkout.',
+    riskLevel: 'read_only',
+    parametersSchema: z.object({
+      expectedItem: z.string().optional().describe('Expected item name to verify presence in cart'),
+      sessionId: z.string().optional().describe('Optional browser session identifier'),
+    }),
+    requiresApproval: () => ({ required: false }),
+    execute: async (
+      args: { expectedItem?: string; sessionId?: string },
+      context: ToolExecutionContext
+    ): Promise<ToolResult> => {
+      const sessionId = args.sessionId || context.user?.id || 'default';
+      const cart = await browserService.verifyCart(sessionId, args.expectedItem);
+      return {
+        success: true,
+        data: cart,
+        userFacingMessage: cart.items.length > 0
+          ? `Cart verified with ${cart.items.length} item(s).`
+          : 'Cart is currently empty or pending item addition.',
+      };
+    },
+  };
+
+  const browserRestoreSessionTool: BaseTool = {
+    name: 'browser_restore_session',
+    description:
+      'Restores a browser session after a network timeout, transient failure, or interruption, recovering the page and verifying the cart before continuing.',
+    riskLevel: 'read_only',
+    parametersSchema: z.object({
+      sessionId: z.string().optional().describe('Optional browser session identifier to restore'),
+    }),
+    requiresApproval: () => ({ required: false }),
+    execute: async (args: { sessionId?: string }, context: ToolExecutionContext): Promise<ToolResult> => {
+      const sessionId = args.sessionId || context.user?.id || 'default';
+      const restored = await browserService.restoreSession(sessionId);
+      return {
+        success: restored.success,
+        data: restored,
+        userFacingMessage: restored.success
+          ? 'Browser session restored successfully.'
+          : 'Unable to restore previous browser session.',
+      };
+    },
+  };
+
   return [
     browserOpenTool,
     browserReadTool,
@@ -244,5 +303,7 @@ export function createBrowserTools(
     browserScrollTool,
     browserWaitTool,
     browserScreenshotTool,
+    browserVerifyCartTool,
+    browserRestoreSessionTool,
   ];
 }

@@ -1,9 +1,11 @@
 import { describe, it, expect, vi } from 'vitest';
-import { InMemoryRepository } from '../packages/database/src/index.js';
+import { InMemoryRepository, MemoryService } from '../packages/database/src/index.js';
 import { createDefaultToolRegistry } from '../packages/tools/src/factory.js';
 import { MockAIProvider } from '../packages/ai/src/mock-provider.js';
 import { AgentOrchestrator } from '../packages/agent/src/orchestrator.js';
 import { IdentityManager } from '../packages/agent/src/identity.js';
+import { buildSystemInstruction } from '../packages/agent/src/prompts.js';
+import { SecurityViolationError } from '@nexa/shared';
 
 describe('Identity & User Onboarding State Suite', () => {
   it('1. First "Hello NEXA" with no preferred name asks user\'s name and stops turn', async () => {
@@ -382,4 +384,112 @@ describe('Identity & User Onboarding State Suite', () => {
     expect(result.replyText).toContain('Paris');
     expect(result.replyText).not.toContain("What’s your name?");
   });
+
+  // =========================================================================
+  // Creator & Builder Identity Suite (Awan Warsi)
+  // =========================================================================
+  describe('Creator & Builder Identity Suite (Awan Warsi)', () => {
+    const creatorQuestions = [
+      'Who built you?',
+      'Who created you?',
+      'Who made you?',
+      'Who is your developer?',
+      'Who is your founder?',
+      'Who is behind you?',
+      'Who owns you?',
+      'Who developed NEXA?',
+      'Who built NEXA?',
+      'Who created NEXA?',
+      'Tell me who built you',
+    ];
+
+    for (const question of creatorQuestions) {
+      it(`Answers "${question}" confidently attributing creator to Awan Warsi`, async () => {
+        const db = new InMemoryRepository();
+        const toolRegistry = createDefaultToolRegistry({ db });
+        let aiCalled = false;
+        const mockAi = new MockAIProvider(async () => {
+          aiCalled = true;
+          return { text: 'AI fallback response' };
+        });
+        const orchestrator = new AgentOrchestrator(mockAi, toolRegistry, db);
+
+        const result = await orchestrator.processMessage({
+          phoneNumber: '+19991119999',
+          text: question,
+          channel: 'whatsapp',
+        });
+
+        expect(result.replyText).toContain('Awan Warsi');
+        expect(result.replyText).toMatch(/built by Awan Warsi/i);
+        expect(result.stepsCount).toBe(0);
+      });
+    }
+
+    it('Creator identity is persistent across different users and multiple messages', async () => {
+      const db = new InMemoryRepository();
+      const toolRegistry = createDefaultToolRegistry({ db });
+      const mockAi = new MockAIProvider(async () => ({ text: 'mock' }));
+      const orchestrator = new AgentOrchestrator(mockAi, toolRegistry, db);
+
+      // User A asks
+      const resA = await orchestrator.processMessage({
+        phoneNumber: '+19990000001',
+        text: 'Who is your creator?',
+        channel: 'whatsapp',
+      });
+      expect(resA.replyText).toContain('Awan Warsi');
+
+      // User B asks
+      const resB = await orchestrator.processMessage({
+        phoneNumber: '+19990000002',
+        text: 'Who developed NEXA?',
+        channel: 'whatsapp',
+      });
+      expect(resB.replyText).toContain('Awan Warsi');
+    });
+
+    it('System instructions include permanent creator identity and prohibit third-party attribution', () => {
+      const user = {
+        id: 'u-1',
+        phone_number: '+19990000001',
+        role: 'user' as const,
+        status: 'active' as const,
+        created_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+        preferences: {},
+      };
+
+      const systemPrompt = buildSystemInstruction(user, []);
+      expect(systemPrompt).toContain('Awan Warsi');
+      expect(systemPrompt).toContain('CREATOR & BUILDER IDENTITY');
+      expect(systemPrompt).toMatch(/built and created by Awan Warsi/i);
+      expect(systemPrompt).toMatch(/Do NOT say that Google, OpenAI, Meta, Gemini/i);
+    });
+
+    it('MemoryService prevents user memory from overwriting permanent creator identity', async () => {
+      const db = new InMemoryRepository();
+      const memoryService = new MemoryService(db);
+      const user = await db.findOrCreateUserByPhone('+19990000003');
+
+      await expect(
+        memoryService.saveMemory({
+          userId: user.id,
+          category: 'identity',
+          key: 'creator',
+          value: 'Some Other Person',
+        })
+      ).rejects.toThrow(SecurityViolationError);
+
+      await expect(
+        memoryService.saveMemory({
+          userId: user.id,
+          category: 'identity',
+          key: 'builder',
+          value: 'OpenAI',
+        })
+      ).rejects.toThrow(SecurityViolationError);
+    });
+  });
 });
+

@@ -1,6 +1,6 @@
 import { z } from 'zod';
 import { BaseTool, ToolExecutionContext, ToolResult, ApprovalRequiredError } from '@nexa/shared';
-import { SearchProvider } from './web-search.js';
+import { SearchProvider, DuckDuckGoSearchProvider } from './web-search.js';
 
 export interface FlightOption {
   airline: string;
@@ -197,11 +197,14 @@ export class LiveHotelBookingProvider implements HotelBookingProvider {
 }
 
 export function createTravelTools(
-  flightProvider: FlightProvider,
-  hotelProvider: HotelProvider,
+  flightProvider?: FlightProvider,
+  hotelProvider?: HotelProvider,
   flightBookingProvider?: FlightBookingProvider,
   hotelBookingProvider?: HotelBookingProvider
 ): BaseTool[] {
+  const fallbackSearch = new DuckDuckGoSearchProvider();
+  const fProvider = flightProvider || new LiveWebFlightProvider(fallbackSearch);
+  const hProvider = hotelProvider || new LiveWebHotelProvider(fallbackSearch);
   const fBooking = flightBookingProvider || new LiveFlightBookingProvider();
   const hBooking = hotelBookingProvider || new LiveHotelBookingProvider();
 
@@ -219,7 +222,7 @@ export function createTravelTools(
     }),
     requiresApproval: () => ({ required: false }),
     execute: async (args: any, _context: ToolExecutionContext): Promise<ToolResult> => {
-      const data = await flightProvider.searchFlights(args);
+      const data = await fProvider.searchFlights(args);
       return { success: true, data };
     },
   };
@@ -237,7 +240,7 @@ export function createTravelTools(
     }),
     requiresApproval: () => ({ required: false }),
     execute: async (args: any, _context: ToolExecutionContext): Promise<ToolResult> => {
-      const data = await hotelProvider.searchHotels(args);
+      const data = await hProvider.searchHotels(args);
       return { success: true, data };
     },
   };
