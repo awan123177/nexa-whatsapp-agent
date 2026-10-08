@@ -30,3 +30,18 @@ export interface TaskCheckpoint {
   lastVerifiedState?: Record<string, unknown>;
   updatedAt: number;
 }
+
+export type ShoppingStepState =
+  | 'INITIAL'
+  | 'SEARCHING'
+  | 'PRODUCT_FOUND'
+  | 'PRODUCT_SELECTED'
+  | 'CART_UPDATED'
+  | 'CART_VERIFIED'
+  | 'ADDRESS_SELECTED'
+  | 'CHECKOUT_READY'
+  | 'WAITING_APPROVAL'
+  | 'CHECKOUT_EXECUTED'
+  | 'ORDER_VERIFIED'
+  | 'COMPLETED'
+  | 'FAILED';

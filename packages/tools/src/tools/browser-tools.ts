@@ -295,9 +295,30 @@ export function createBrowserTools(
     },
   };
 
+  const browserObserveTool: BaseTool = {
+    name: 'browser_observe',
+    description:
+      'Inspects and observes interactive elements on the currently active webpage DOM (discovering search inputs, action buttons, visible products, and cart summary) without needing hard-coded selectors.',
+    riskLevel: 'read_only',
+    parametersSchema: z.object({
+      sessionId: z.string().optional().describe('Optional browser session identifier'),
+    }),
+    requiresApproval: () => ({ required: false }),
+    execute: async (args: { sessionId?: string }, context: ToolExecutionContext): Promise<ToolResult> => {
+      const sessionId = args.sessionId || context.user?.id || 'default';
+      const observation = await browserService.observePage(sessionId);
+      return {
+        success: true,
+        data: observation,
+        userFacingMessage: `Observed ${observation.title || observation.url}: found ${observation.searchInputs.length} search input(s), ${observation.actionButtons.length} action button(s), and ${observation.products.length} product(s).`,
+      };
+    },
+  };
+
   return [
     browserOpenTool,
     browserReadTool,
+    browserObserveTool,
     browserClickTool,
     browserTypeTool,
     browserScrollTool,

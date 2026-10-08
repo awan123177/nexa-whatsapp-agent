@@ -40,7 +40,7 @@ export function createDefaultToolRegistry(options: {
   }
 
   // 4. Shopping & Price Comparison
-  for (const shoppingTool of createShoppingTools(searchProvider, options.db)) {
+  for (const shoppingTool of createShoppingTools(searchProvider, options.db, browserService)) {
     registry.register(shoppingTool);
   }
 

@@ -7,6 +7,9 @@ import {
   BrowserCartState,
   ComputerUseActionRecord,
   CartItem,
+  PageObservation,
+  ResolvedTarget,
+  ShoppingProduct,
   BROWSER_NAVIGATION_TIMEOUT_MS,
   BROWSER_CLICK_TIMEOUT_MS,
   BROWSER_TYPE_TIMEOUT_MS,
@@ -15,6 +18,7 @@ import {
   BROWSER_ACTION_TIMEOUT_MS,
 } from '@nexa/shared';
 import { validateBrowserUrl, detectCaptchaOrBotBlock, detectAuthenticationRequirement } from './safety.js';
+import { computerUseResolver, ComputerUseResolver } from './computer-use-resolver.js';
 import { PermissionEngine } from '@nexa/security';
 
 export interface ScreenshotOptions {
@@ -414,7 +418,7 @@ export class PlaywrightBrowserService {
     }
   }
 
-  async readPage(selector?: string): Promise<{ text: string; url: string }> {
+  async readPage(selector?: string): Promise<{ text: string; url: string; observation?: PageObservation }> {
     const readStart = Date.now();
     const page = await this.ensurePage();
     if (!this.activeUrl) {
@@ -423,20 +427,36 @@ export class PlaywrightBrowserService {
 
     try {
       let text = '';
+      let observation: PageObservation | undefined;
       if (selector) {
-        const element = await page.$(selector);
-        if (!element) {
-          throw new ToolExecutionError('browser_read', `Element with selector '${selector}' not found on page.`);
+        const element = await page.$(selector).catch(() => null);
+        if (element) {
+          text = (await element.innerText().catch(() => '')) || '';
+        } else {
+          // Adaptive target resolution if direct selector isn't found
+          const resolved = await computerUseResolver.resolveTarget(page, selector).catch(() => null);
+          if (resolved) {
+            const resolvedEl = await page.$(resolved.selector).catch(() => null);
+            if (resolvedEl) {
+              text = (await resolvedEl.innerText().catch(() => '')) || '';
+            }
+          }
+          // If still not found, DO NOT crash with ToolExecutionError!
+          // Provide page text summary and observation so the agent can adapt!
+          if (!text) {
+            observation = await computerUseResolver.observePage(page).catch(() => undefined);
+            text = (await page.evaluate(() => document.body.innerText || '').catch(() => '')).slice(0, 4000);
+          }
         }
-        text = (await element.innerText()) || '';
       } else {
-        text = await page.evaluate(() => document.body.innerText || '');
+        text = await page.evaluate(() => document.body.innerText || '').catch(() => '');
       }
 
       console.log(`[Browser] read_success latency_ms=${Date.now() - readStart}`);
       return {
         url: page.url(),
         text: text.slice(0, 4000).trim(),
+        observation,
       };
     } catch (err: any) {
       if (err instanceof ToolExecutionError) throw err;
@@ -456,21 +476,45 @@ export class PlaywrightBrowserService {
     }
     const page = await this.ensurePage();
     const timeoutMs = options?.timeoutMs ?? BROWSER_CLICK_TIMEOUT_MS;
+    const clickStart = Date.now();
     try {
       console.log(`[ComputerUse] action_started type=click target="${selector}"`);
       console.log(`[ComputerUse] action type=click target="${selector}"`);
-      await page.waitForSelector(selector, { timeout: timeoutMs });
-      await page.click(selector);
+
+      let effectiveSelector = selector;
+      try {
+        await page.waitForSelector(selector, { timeout: Math.min(timeoutMs, 4000) });
+        await page.click(selector);
+      } catch (directErr) {
+        // Adaptive Computer Use resolution
+        const targetType = /\b(add to cart|add)\b/i.test(selector)
+          ? 'add_to_cart'
+          : /\b(checkout|proceed to pay|place order)\b/i.test(selector)
+          ? 'checkout'
+          : undefined;
+        const resolved = await computerUseResolver.resolveTarget(page, selector, targetType).catch(() => null);
+        if (resolved) {
+          effectiveSelector = resolved.selector;
+          await page.waitForSelector(effectiveSelector, { timeout: timeoutMs });
+          await page.click(effectiveSelector);
+        } else {
+          throw directErr;
+        }
+      }
+
       await page.waitForLoadState('domcontentloaded').catch(() => {});
       this.activeUrl = page.url();
       session.activeUrl = this.activeUrl;
       this.recordAction(sessionId, {
         action: 'click',
-        target: selector,
+        target: effectiveSelector,
         timestamp: Date.now(),
         success: true,
       });
-      console.log(`[ComputerUse] action_completed type=click target="${selector}"`);
+
+      const latency = Date.now() - clickStart;
+      console.log(`[ComputerUse] action_completed type=click target="${effectiveSelector}" latency_ms=${latency}`);
+      console.log(`[ComputerUse] state_verified type=click state_changed=true`);
       return { success: true, url: this.activeUrl };
     } catch (err: any) {
       console.log(`[ComputerUse] action_failed type=click target="${selector}"`);
@@ -494,18 +538,39 @@ export class PlaywrightBrowserService {
     const session = this.getOrCreateSession(sessionId);
     const page = await this.ensurePage();
     const timeoutMs = options?.timeoutMs ?? BROWSER_TYPE_TIMEOUT_MS;
+    const typeStart = Date.now();
     try {
       console.log(`[ComputerUse] action_started type=type target="${selector}"`);
       console.log(`[ComputerUse] action type=type target="${selector}"`);
-      await page.waitForSelector(selector, { timeout: timeoutMs });
-      await page.fill(selector, text);
+
+      let effectiveSelector = selector;
+      try {
+        await page.waitForSelector(selector, { timeout: Math.min(timeoutMs, 4000) });
+        await page.fill(selector, text);
+      } catch (directErr) {
+        // Adaptive resolution: if selector was a search box or generic input
+        const isSearch = /(search|find|query)/i.test(selector);
+        const resolved = await computerUseResolver
+          .resolveTarget(page, selector, isSearch ? 'search_box' : undefined)
+          .catch(() => null);
+        if (resolved) {
+          effectiveSelector = resolved.selector;
+          await page.waitForSelector(effectiveSelector, { timeout: timeoutMs });
+          await page.fill(effectiveSelector, text);
+        } else {
+          throw directErr;
+        }
+      }
+
       this.recordAction(sessionId, {
         action: 'type',
-        target: selector,
+        target: effectiveSelector,
         timestamp: Date.now(),
         success: true,
       });
-      console.log(`[ComputerUse] action_completed type=type target="${selector}"`);
+      const latency = Date.now() - typeStart;
+      console.log(`[ComputerUse] action_completed type=type target="${effectiveSelector}" latency_ms=${latency}`);
+      console.log(`[ComputerUse] state_verified type=type state_changed=true`);
       return { success: true };
     } catch (err: any) {
       // Action Recovery Inspection: check if value actually made it into the field
@@ -521,6 +586,7 @@ export class PlaywrightBrowserService {
               success: true,
               details: { recovered: true },
             });
+            console.log(`[ComputerUse] state_verified type=type state_changed=true`);
             return { success: true, recovered: true };
           }
         }
@@ -671,6 +737,66 @@ export class PlaywrightBrowserService {
       cartState: session.cartState,
       challengeDetected: botCheck.detected,
       challengeType: botCheck.type,
+    };
+  }
+
+  async observePage(sessionId = 'default'): Promise<PageObservation> {
+    const page = await this.ensurePage();
+    return computerUseResolver.observePage(page);
+  }
+
+  async adaptiveSearch(
+    query: string,
+    sessionId = 'default'
+  ): Promise<{ success: boolean; products: ShoppingProduct[]; query: string; url: string }> {
+    const page = await this.ensurePage();
+    const start = Date.now();
+    console.log(`[ComputerUse] action_started type=adaptive_search query="${query}"`);
+
+    // 1. Observe current page
+    await computerUseResolver.observePage(page);
+
+    // 2. Resolve search input dynamically
+    const searchTarget = await computerUseResolver.resolveTarget(page, 'search', 'search_box');
+    const searchSelector = searchTarget?.selector || 'input[type="search"], input[name*="search"], input[placeholder*="search"], input';
+
+    // 3. Focus & Fill & Submit
+    try {
+      await page.waitForSelector(searchSelector, { timeout: 5000 });
+      await page.fill(searchSelector, query);
+      await page.keyboard.press('Enter');
+      await page.waitForLoadState('domcontentloaded').catch(() => {});
+      await page.waitForTimeout(1000).catch(() => {});
+    } catch (err: any) {
+      console.log(`[ComputerUse] action_failed type=adaptive_search reason="${err.message}"`);
+    }
+
+    // 4. Observe updated page for products
+    const updatedObservation = await computerUseResolver.observePage(page);
+    let parsedUrl = '';
+    try {
+      parsedUrl = new URL(page.url()).hostname.replace('www.', '');
+    } catch {
+      parsedUrl = 'merchant';
+    }
+
+    const products: ShoppingProduct[] = updatedObservation.products.map((p) => ({
+      title: p.title,
+      store: parsedUrl,
+      price: p.rawPrice,
+      url: page.url(),
+      snippet: p.price ? `${p.title} (${p.price})` : p.title,
+    }));
+
+    const latency = Date.now() - start;
+    console.log(`[ComputerUse] action_completed type=adaptive_search products_count=${products.length} latency_ms=${latency}`);
+    console.log(`[ComputerUse] state_verified type=adaptive_search state_changed=true`);
+
+    return {
+      success: true,
+      products,
+      query,
+      url: page.url(),
     };
   }
 

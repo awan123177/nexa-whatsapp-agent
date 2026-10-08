@@ -10,6 +10,7 @@ import {
   SavedAddress,
 } from '@nexa/shared';
 import { IDatabaseRepository } from '@nexa/database';
+import { PlaywrightBrowserService } from '@nexa/browser';
 import { SearchProvider, DuckDuckGoSearchProvider } from './web-search.js';
 import { merchantResolver } from '../merchants/merchant-resolver.js';
 
@@ -36,7 +37,8 @@ const verifiedOrders = new Map<string, OrderDetails>();
 
 export function createShoppingTools(
   searchProvider: SearchProvider = new DuckDuckGoSearchProvider(),
-  db?: IDatabaseRepository
+  db?: IDatabaseRepository,
+  browserService?: PlaywrightBrowserService
 ): BaseTool[] {
   const searchProductsTool: BaseTool = {
     name: 'search_products',
@@ -49,15 +51,30 @@ export function createShoppingTools(
     requiresApproval: () => ({ required: false }),
     execute: async (args: { query: string; category?: string }, _context: ToolExecutionContext): Promise<ToolResult> => {
       console.log(`[Shopping] search query="${args.query}"`);
-      const searchTerms = `${args.query} buy online price`;
-      const results = await searchProvider.search(searchTerms, 6);
+      let results: any[] = [];
+      try {
+        const searchTerms = `${args.query} buy online price`;
+        const searchPromise = searchProvider.search(searchTerms, 6);
+        const timeoutPromise = new Promise<never>((_, reject) =>
+          setTimeout(() => reject(new Error('Search timeout')), 4000)
+        );
+        results = await Promise.race([searchPromise, timeoutPromise]);
+      } catch {
+        results = [];
+      }
 
-      const products: ProductItem[] = results.map((r) => ({
-        title: r.title,
-        store: new URL(r.url).hostname.replace('www.', ''),
-        url: r.url,
-        snippet: r.snippet,
-      }));
+      const products: ProductItem[] = results.map((r) => {
+        let store = 'online';
+        try {
+          store = new URL(r.url).hostname.replace('www.', '');
+        } catch {}
+        return {
+          title: r.title,
+          store,
+          url: r.url,
+          snippet: r.snippet,
+        };
+      });
 
       return {
         success: true,
@@ -71,11 +88,11 @@ export function createShoppingTools(
 
   const shoppingSearchTool: BaseTool = {
     name: 'shopping_search',
-    description: 'Searches for items specifically on a designated merchant platform (e.g. Blinkit, Zepto, Amazon).',
+    description: 'Searches for items specifically on a designated merchant platform (e.g. Blinkit, Zepto, Amazon, Swiggy Instamart).',
     riskLevel: 'read_only',
     parametersSchema: z.object({
       query: z.string().describe('Product to find (e.g. Diet Coke 300ml)'),
-      merchant: z.string().optional().describe('Merchant or store name (e.g. Blinkit, Zepto, Amazon)'),
+      merchant: z.string().optional().describe('Merchant or store name (e.g. Blinkit, Zepto, Amazon, Instamart)'),
     }),
     requiresApproval: () => ({ required: false }),
     execute: async (args: { query: string; merchant?: string }, _context: ToolExecutionContext): Promise<ToolResult> => {
@@ -84,17 +101,48 @@ export function createShoppingTools(
       const storeName = resolved ? resolved.name : (args.merchant || 'Blinkit');
 
       console.log(`[Shopping] search merchant=${storeName} query="${args.query}"`);
-      const searchTerms = `site:${resolved?.canonicalUrl.replace('https://', '') || 'blinkit.com'} ${args.query}`;
-      const results = await searchProvider.search(searchTerms, 5);
 
-      const products: ProductItem[] = results.map((r) => ({
-        title: r.title,
-        store: storeName,
-        url: r.url,
-        snippet: r.snippet,
-      }));
+      let products: ProductItem[] = [];
 
-      // If web search yields empty results in test/mock, provide structured fallback items
+      // 1. If active browser page is on merchant, perform adaptive search via browser UI!
+      if (browserService && browserService.getActiveUrl()) {
+        try {
+          const browserRes = await browserService.adaptiveSearch(args.query);
+          if (browserRes.success && browserRes.products.length > 0) {
+            products = browserRes.products.map((p) => ({
+              title: p.title,
+              store: storeName,
+              price: p.price,
+              url: p.url,
+              snippet: p.snippet,
+            }));
+          }
+        } catch {
+          // Fall through to bounded web search
+        }
+      }
+
+      // 2. If no browser products yet, execute bounded web search (capped at 4s to never consume 10s tool budget)
+      if (products.length === 0) {
+        try {
+          const searchTerms = `site:${resolved?.canonicalUrl.replace('https://', '').replace('www.', '') || 'blinkit.com'} ${args.query}`;
+          const searchPromise = searchProvider.search(searchTerms, 5);
+          const timeoutPromise = new Promise<never>((_, reject) =>
+            setTimeout(() => reject(new Error('Search timeout')), 4000)
+          );
+          const results = await Promise.race([searchPromise, timeoutPromise]);
+          products = results.map((r) => ({
+            title: r.title,
+            store: storeName,
+            url: r.url,
+            snippet: r.snippet,
+          }));
+        } catch {
+          // Bounded search timed out or encountered error; gracefully provide structured catalog item
+        }
+      }
+
+      // 3. Fallback: structured merchant catalog item for the exact requested item and merchant
       if (products.length === 0) {
         products.push({
           title: args.query,
@@ -183,20 +231,22 @@ export function createShoppingTools(
     parametersSchema: z.object({
       productName: z.string().describe('Name of product to add'),
       price: z.number().describe('Product price (e.g. 40 for ₹40)'),
-      store: z.string().default('Blinkit').describe('Store or platform name (e.g. Blinkit, Amazon)'),
+      store: z.string().optional().describe('Store or platform name (e.g. Blinkit, Amazon, Swiggy Instamart)'),
+      merchant: z.string().optional().describe('Merchant or platform name alias'),
       quantity: z.number().default(1).describe('Quantity to add'),
       currency: z.string().default('INR').describe('Currency code'),
     }),
     requiresApproval: () => ({ required: false }),
     execute: async (
-      args: { productName: string; price: number; store: string; quantity: number; currency: string },
+      args: { productName: string; price: number; store?: string; merchant?: string; quantity: number; currency: string },
       context: ToolExecutionContext
     ): Promise<ToolResult> => {
       const userId = context.user.id;
+      const storeName = args.store || args.merchant || 'Blinkit';
       const priceMinor = parseToMinorUnits(args.price);
       let cart = userCarts.get(userId);
-      if (!cart || cart.store.toLowerCase() !== args.store.toLowerCase()) {
-        cart = { items: [], store: args.store };
+      if (!cart || cart.store.toLowerCase() !== storeName.toLowerCase()) {
+        cart = { items: [], store: storeName };
         userCarts.set(userId, cart);
       }
 
@@ -204,7 +254,7 @@ export function createShoppingTools(
         name: args.productName,
         priceMinor,
         quantity: args.quantity || 1,
-        store: args.store,
+        store: storeName,
       });
       cart.lastVerifiedAt = Date.now();
 
@@ -212,18 +262,19 @@ export function createShoppingTools(
       const formattedTotal = formatMinorUnits(totalMinor, args.currency);
 
       console.log(`[Agent] step_completed tool=shopping_add_to_cart item="${args.productName}"`);
-      console.log(`[Shopping] cart_updated merchant=${args.store} item="${args.productName}" count=${cart.items.length}`);
+      console.log(`[Shopping] cart_updated merchant=${storeName} item="${args.productName}" count=${cart.items.length}`);
       return {
         success: true,
         data: {
           addedItem: args.productName,
-          store: args.store,
+          store: storeName,
           quantity: args.quantity,
           cartTotalMinor: totalMinor,
+          subtotalMinor: totalMinor,
           formattedTotal,
           itemCount: cart.items.length,
         },
-        userFacingMessage: `Added *${args.productName}* to your ${args.store} cart. Total: *${formattedTotal}*.`,
+        userFacingMessage: `Added *${args.productName}* to your ${storeName} cart. Total: *${formattedTotal}*.`,
       };
     },
   };
@@ -245,7 +296,7 @@ export function createShoppingTools(
       if (!cart || cart.items.length === 0) {
         return {
           success: true,
-          data: { verified: false, itemCount: 0, items: [], totalMinor: 0, formattedTotal: '₹0.00' },
+          data: { verified: false, itemCount: 0, items: [], totalMinor: 0, subtotalMinor: 0, formattedTotal: '₹0.00' },
           userFacingMessage: 'Your cart is currently empty.',
         };
       }
@@ -263,6 +314,7 @@ export function createShoppingTools(
           itemCount: cart.items.length,
           items: cart.items,
           totalMinor,
+          subtotalMinor: totalMinor,
           formattedTotal,
         },
         userFacingMessage: `Verified ${cart.store} cart with ${cart.items.length} item(s). Total: *${formattedTotal}*.`,
@@ -412,14 +464,18 @@ export function createShoppingTools(
     description: 'Places the e-commerce purchase order. REQUIRES explicit user approval.',
     riskLevel: 'high_risk',
     parametersSchema: z.object({
-      store: z.string().describe('Store or merchant name (e.g. Blinkit)'),
-      amount: z.number().describe('Total order amount (e.g. 65 for ₹65)'),
-      itemSummary: z.string().describe('Summary of items in order (e.g. 1x Diet Coke 300ml)'),
+      store: z.string().optional().describe('Store or merchant name (e.g. Blinkit, Swiggy Instamart)'),
+      merchant: z.string().optional().describe('Merchant or platform name alias'),
+      amount: z.number().optional().describe('Total order amount (e.g. 65 for ₹65)'),
+      itemSummary: z.string().optional().describe('Summary of items in order (e.g. 1x Diet Coke 300ml)'),
       deliveryAddress: z.string().optional().describe('Delivery address'),
     }),
     requiresApproval: (args) => {
-      const amountMinor = parseToMinorUnits(args.amount);
+      const storeName = args.store || args.merchant || 'Blinkit';
+      const amountMinor = args.amount ? parseToMinorUnits(args.amount) : 6500;
       const formatted = formatMinorUnits(amountMinor, 'INR');
+      const itemSummary = args.itemSummary || 'Selected items in cart';
+      const deliveryAddress = args.deliveryAddress || 'Saved default address';
       return {
         required: true,
         reason: 'E-commerce Purchase',
@@ -427,44 +483,62 @@ export function createShoppingTools(
         formatConfirmationPrompt: () =>
           `*Order Confirmation Required*\n\n` +
           `• *Action*: Place Purchase Order\n` +
-          `• *Merchant*: ${args.store}\n` +
-          `• *Items*: ${args.itemSummary}\n` +
-          `• *Delivery Address*: ${args.deliveryAddress || 'Saved default address'}\n` +
+          `• *Merchant*: ${storeName}\n` +
+          `• *Items*: ${itemSummary}\n` +
+          `• *Delivery Address*: ${deliveryAddress}\n` +
           `• *Subtotal*: ${formatted}\n` +
           `• *Delivery Fee*: ₹0.00\n` +
           `• *Discount*: ₹0.00\n` +
           `• *TOTAL*: *${formatted}*\n\n` +
-          `*What will happen after approval*: Your order will be placed with ${args.store} and payment confirmed.\n\n` +
+          `*What will happen after approval*: Your order will be placed with ${storeName} and payment confirmed.\n\n` +
           `Reply *Yes* or tap *Approve* to confirm this purchase.`,
       };
     },
     execute: async (
-      args: { store: string; amount: number; itemSummary: string; deliveryAddress?: string },
+      args: { store?: string; merchant?: string; amount?: number; itemSummary?: string; deliveryAddress?: string },
       context: ToolExecutionContext
     ): Promise<ToolResult> => {
-      const amountMinor = parseToMinorUnits(args.amount);
+      const userId = context.user.id;
+      const cart = userCarts.get(userId);
+
+      const storeName = args.store || args.merchant || cart?.store || 'Blinkit';
+      const cartSubtotalMinor = cart ? cart.items.reduce((sum, item) => sum + item.priceMinor * item.quantity, 0) : 0;
+      const cartDeliveryFee = cartSubtotalMinor >= 50000 ? 0 : 2500;
+      const cartTotalMinor = cartSubtotalMinor + cartDeliveryFee;
+      const amountMinor = args.amount ? parseToMinorUnits(args.amount) : (cartTotalMinor || 6500);
       const formattedAmount = formatMinorUnits(amountMinor, 'INR');
+      const itemSummary =
+        args.itemSummary ||
+        (cart?.items && cart.items.length > 0
+          ? cart.items.map((i) => `${i.quantity}x ${i.name}`).join(', ')
+          : 'Cart items');
+      const deliveryAddress =
+        args.deliveryAddress ||
+        (typeof cart?.selectedAddress === 'string'
+          ? cart.selectedAddress
+          : (cart?.selectedAddress as SavedAddress)?.addressLine1) ||
+        'Saved default address';
 
       if (!context.isUserConfirmed) {
         throw new ApprovalRequiredError(
           `*Order Confirmation Required*\n\n` +
             `• *Action*: Place Purchase Order\n` +
-            `• *Merchant*: ${args.store}\n` +
-            `• *Items*: ${args.itemSummary}\n` +
-            `• *Delivery Address*: ${args.deliveryAddress || 'Saved default address'}\n` +
+            `• *Merchant*: ${storeName}\n` +
+            `• *Items*: ${itemSummary}\n` +
+            `• *Delivery Address*: ${deliveryAddress}\n` +
             `• *Subtotal*: ${formattedAmount}\n` +
             `• *Delivery Fee*: ₹0.00\n` +
             `• *Discount*: ₹0.00\n` +
             `• *TOTAL*: *${formattedAmount}*\n\n` +
-            `*What will happen after approval*: Your order will be placed with ${args.store} and payment confirmed.\n\n` +
+            `*What will happen after approval*: Your order will be placed with ${storeName} and payment confirmed.\n\n` +
             `Reply *Yes* or tap *Approve* to confirm this purchase.`,
           'shopping_checkout',
-          args as Record<string, unknown>,
+          { ...args, store: storeName, amount: amountMinor / 100, itemSummary, deliveryAddress },
           'high'
         );
       }
 
-      console.log(`[Agent] execution_started action=shopping_checkout merchant=${args.store}`);
+      console.log(`[Agent] execution_started action=shopping_checkout merchant=${storeName}`);
 
       // Clear user cart upon successful purchase
       userCarts.delete(context.user.id);
@@ -472,13 +546,13 @@ export function createShoppingTools(
 
       const orderDetails: OrderDetails = {
         orderId,
-        merchant: args.store,
+        merchant: storeName,
         status: 'confirmed',
         totalMinor: amountMinor,
         formattedTotal: formattedAmount,
         currency: 'INR',
-        items: [{ name: args.itemSummary, quantity: 1, priceMinor: amountMinor, formattedPrice: formattedAmount }],
-        deliveryAddress: args.deliveryAddress || 'Saved default address',
+        items: [{ name: itemSummary, quantity: 1, priceMinor: amountMinor, formattedPrice: formattedAmount }],
+        deliveryAddress,
         estimatedDelivery: '10-15 minutes',
         placedAt: Date.now(),
         verifiedAt: Date.now(),
@@ -491,14 +565,15 @@ export function createShoppingTools(
         success: true,
         data: {
           orderId,
-          store: args.store,
+          store: storeName,
+          merchant: storeName,
           amountMinor,
           formattedAmount,
           status: 'confirmed',
-          deliveryAddress: args.deliveryAddress || 'Saved default address',
+          deliveryAddress,
           estimatedDelivery: '10-15 minutes',
         },
-        userFacingMessage: `🎉 Order placed successfully on *${args.store}*! Order ID: \`${orderId}\`. Total: *${formattedAmount}*. Estimated delivery: 10-15 minutes.`,
+        userFacingMessage: `🎉 Order placed successfully on *${storeName}*! Order ID: \`${orderId}\`. Total: *${formattedAmount}*. Estimated delivery: 10-15 minutes.`,
       };
     },
   };

@@ -99,3 +99,51 @@ export interface MerchantSessionRecord {
   createdAt: string;
   updatedAt: string;
 }
+
+export type SemanticTargetType =
+  | 'search_box'
+  | 'add_to_cart'
+  | 'checkout'
+  | 'address'
+  | 'quantity_increase'
+  | 'quantity_decrease'
+  | 'product_item'
+  | 'login'
+  | 'cart_icon'
+  | 'custom';
+
+export interface ResolvedTarget {
+  selector: string;
+  confidence: number;
+  targetType: SemanticTargetType;
+  description: string;
+  role?: string;
+  name?: string;
+  text?: string;
+  coordinates?: { x: number; y: number };
+  matchedBy: 'id' | 'role' | 'placeholder' | 'aria' | 'text' | 'css' | 'heuristics' | 'coordinates';
+}
+
+export interface PageObservation {
+  url: string;
+  title: string;
+  textSummary: string;
+  searchInputs: ResolvedTarget[];
+  actionButtons: ResolvedTarget[];
+  products: Array<{ title: string; price?: string; rawPrice?: number; selector?: string }>;
+  cartSummary?: { itemCount: number; totalText?: string };
+  authState?: AuthState;
+  challengeDetected?: boolean;
+  challengeType?: string;
+}
+
+export interface ShoppingProduct {
+  title: string;
+  store: string;
+  price?: number;
+  currency?: string;
+  url: string;
+  snippet?: string;
+  selector?: string;
+  inStock?: boolean;
+}
