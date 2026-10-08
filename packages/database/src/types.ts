@@ -16,6 +16,8 @@ import {
   WalletLimit,
   WalletProviderEvent,
   TopupStatus,
+  MerchantSessionRecord,
+  SavedAddress,
 } from '@nexa/shared';
 
 export interface IDatabaseRepository {
@@ -73,4 +75,11 @@ export interface IDatabaseRepository {
   saveWalletLimits(data: WalletLimit): Promise<WalletLimit>;
   saveWalletProviderEvent(data: Omit<WalletProviderEvent, 'id' | 'processed_at'>): Promise<void>;
   getWalletProviderEvent(idempotencyKey: string): Promise<WalletProviderEvent | null>;
+
+  // Merchant Sessions & Saved Addresses
+  getMerchantSession(userId: string, merchant: string): Promise<MerchantSessionRecord | null>;
+  saveMerchantSession(data: Omit<MerchantSessionRecord, 'id' | 'createdAt' | 'updatedAt'>): Promise<MerchantSessionRecord>;
+  getUserAddresses(userId: string, merchant?: string): Promise<SavedAddress[]>;
+  saveUserAddress(data: Omit<SavedAddress, 'id'>): Promise<SavedAddress>;
+  getDefaultUserAddress(userId: string, merchant?: string): Promise<SavedAddress | null>;
 }

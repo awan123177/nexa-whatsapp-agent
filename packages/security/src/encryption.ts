@@ -5,6 +5,13 @@ const SENSITIVE_TOKEN_KEYS = new Set([
   'refresh_token',
   'id_token',
   'token',
+  'sessionToken',
+  'session_token',
+  'password',
+  'apiKey',
+  'api_key',
+  'secret',
+  'client_secret',
 ]);
 
 const DEFAULT_DEV_KEY = 'nexa-default-dev-encryption-key-for-local-development!';

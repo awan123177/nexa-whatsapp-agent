@@ -11,4 +11,6 @@ export * from './tools/google-oauth.js';
 export * from './tools/gmail-provider.js';
 export * from './wallet/wallet-service.js';
 export * from './tools/wallet-tools.js';
+export * from './merchants/merchant-resolver.js';
+export * from './accounts/connected-account-manager.js';
 export * from './factory.js';

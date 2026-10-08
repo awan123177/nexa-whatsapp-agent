@@ -1,11 +1,14 @@
 export type AuthState =
   | 'AUTH_NOT_REQUIRED'
   | 'AUTH_REQUIRED'
+  | 'AUTHENTICATING'
   | 'WAITING_FOR_USER_AUTH'
   | 'AUTHENTICATED'
+  | 'AUTH_EXPIRED'
   | 'AUTH_FAILED'
   | 'CAPTCHA_REQUIRED'
-  | 'BLOCKED';
+  | 'BLOCKED'
+  | 'ERROR';
 
 export type BrowserOpenSuccess = {
   success: true;
@@ -43,7 +46,20 @@ export interface BrowserCartState {
 }
 
 export interface ComputerUseActionRecord {
-  action: 'navigate' | 'click' | 'type' | 'scroll' | 'wait' | 'screenshot' | 'verify_cart' | 'restore';
+  action:
+    | 'navigate'
+    | 'click'
+    | 'type'
+    | 'fill'
+    | 'press'
+    | 'select'
+    | 'scroll'
+    | 'hover'
+    | 'wait'
+    | 'inspect'
+    | 'screenshot'
+    | 'verify_cart'
+    | 'restore';
   target?: string;
   timestamp: number;
   success: boolean;
@@ -55,12 +71,15 @@ export interface BrowserSessionMetadata {
   id: string;
   sessionId?: string;
   userId?: string;
+  merchant?: string;
   activeUrl?: string;
   title?: string;
   lastAction?: string;
   lastActionTimestamp?: number;
   cartState?: BrowserCartState;
   pageState?: 'idle' | 'navigating' | 'authenticating' | 'challenged' | 'error';
+  authState?: AuthState;
+  browserProfileReference?: string;
   challengeDetected?: boolean;
   challengeType?: string;
   createdAt: number;
@@ -68,4 +87,15 @@ export interface BrowserSessionMetadata {
   actionHistory: ComputerUseActionRecord[];
 }
 
-
+export interface MerchantSessionRecord {
+  id: string;
+  userId: string;
+  merchant: string;
+  authState: AuthState;
+  sessionState: Record<string, unknown>;
+  browserProfileReference?: string;
+  lastVerifiedAt: string;
+  lastUsedAt: string;
+  createdAt: string;
+  updatedAt: string;
+}

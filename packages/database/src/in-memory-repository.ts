@@ -17,6 +17,8 @@ import {
   WalletLimit,
   WalletProviderEvent,
   TopupStatus,
+  MerchantSessionRecord,
+  SavedAddress,
 } from '@nexa/shared';
 import { IDatabaseRepository } from './types.js';
 
@@ -35,6 +37,8 @@ export class InMemoryRepository implements IDatabaseRepository {
   public walletTopups = new Map<string, WalletTopup>();
   public walletLimits = new Map<string, WalletLimit>();
   public walletProviderEvents = new Map<string, WalletProviderEvent>();
+  public merchantSessions = new Map<string, MerchantSessionRecord>();
+  public userAddresses = new Map<string, SavedAddress>();
 
   async findOrCreateUserByPhone(phoneNumber: string, name?: string): Promise<User> {
     const existing = Array.from(this.users.values()).find(
@@ -520,4 +524,64 @@ export class InMemoryRepository implements IDatabaseRepository {
   async getWalletProviderEvent(idempotencyKey: string): Promise<WalletProviderEvent | null> {
     return this.walletProviderEvents.get(idempotencyKey) || null;
   }
+
+  // Merchant Sessions
+  async getMerchantSession(userId: string, merchant: string): Promise<MerchantSessionRecord | null> {
+    const key = `${userId}:${merchant.toLowerCase()}`;
+    return this.merchantSessions.get(key) || null;
+  }
+
+  async saveMerchantSession(
+    data: Omit<MerchantSessionRecord, 'id' | 'createdAt' | 'updatedAt'>
+  ): Promise<MerchantSessionRecord> {
+    const key = `${data.userId}:${data.merchant.toLowerCase()}`;
+    const existing = this.merchantSessions.get(key);
+    const now = new Date().toISOString();
+    if (existing) {
+      existing.authState = data.authState;
+      existing.sessionState = data.sessionState;
+      if (data.browserProfileReference) existing.browserProfileReference = data.browserProfileReference;
+      existing.lastVerifiedAt = data.lastVerifiedAt;
+      existing.lastUsedAt = data.lastUsedAt;
+      existing.updatedAt = now;
+      return existing;
+    }
+
+    const session: MerchantSessionRecord = {
+      ...data,
+      id: crypto.randomUUID(),
+      createdAt: now,
+      updatedAt: now,
+    };
+    this.merchantSessions.set(key, session);
+    return session;
+  }
+
+  // User Addresses
+  async getUserAddresses(userId: string, merchant?: string): Promise<SavedAddress[]> {
+    return Array.from(this.userAddresses.values()).filter((addr) => {
+      if (addr.userId !== userId) return false;
+      if (merchant && addr.merchant && addr.merchant.toLowerCase() !== merchant.toLowerCase()) {
+        return false;
+      }
+      return true;
+    });
+  }
+
+  async saveUserAddress(data: Omit<SavedAddress, 'id'>): Promise<SavedAddress> {
+    const id = crypto.randomUUID();
+    const address: SavedAddress = {
+      ...data,
+      id,
+    };
+    this.userAddresses.set(id, address);
+    return address;
+  }
+
+  async getDefaultUserAddress(userId: string, merchant?: string): Promise<SavedAddress | null> {
+    const addresses = await this.getUserAddresses(userId, merchant);
+    const def = addresses.find((a) => a.isDefault);
+    return def || addresses[0] || null;
+  }
 }
+

@@ -438,4 +438,56 @@ ALTER TABLE tasks ADD COLUMN IF NOT EXISTS verification_state JSONB DEFAULT '{"v
 
 CREATE INDEX IF NOT EXISTS idx_tasks_current_step ON tasks(current_step);
 
+-- ====================================================================
+-- 15. CONNECTED ACCOUNTS & MERCHANT SESSIONS V2
+-- ====================================================================
+CREATE TABLE IF NOT EXISTS merchant_sessions (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    merchant VARCHAR(100) NOT NULL,
+    auth_state VARCHAR(50) DEFAULT 'IDLE' NOT NULL,
+    session_state JSONB DEFAULT '{}'::jsonb NOT NULL,
+    browser_profile_reference TEXT,
+    last_verified_at TIMESTAMPTZ DEFAULT NOW() NOT NULL,
+    last_used_at TIMESTAMPTZ DEFAULT NOW() NOT NULL,
+    created_at TIMESTAMPTZ DEFAULT NOW() NOT NULL,
+    updated_at TIMESTAMPTZ DEFAULT NOW() NOT NULL,
+    CONSTRAINT uq_merchant_sessions_user_merchant UNIQUE (user_id, merchant)
+);
+
+CREATE INDEX IF NOT EXISTS idx_merchant_sessions_user_id ON merchant_sessions(user_id);
+CREATE INDEX IF NOT EXISTS idx_merchant_sessions_merchant ON merchant_sessions(merchant);
+CREATE INDEX IF NOT EXISTS idx_merchant_sessions_auth_state ON merchant_sessions(auth_state);
+
+DROP TRIGGER IF EXISTS update_merchant_sessions_updated_at ON merchant_sessions;
+CREATE TRIGGER update_merchant_sessions_updated_at
+    BEFORE UPDATE ON merchant_sessions
+    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+CREATE TABLE IF NOT EXISTS user_addresses (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    merchant VARCHAR(100),
+    label VARCHAR(100) DEFAULT 'Home' NOT NULL,
+    recipient_name VARCHAR(255),
+    phone VARCHAR(50),
+    address_line1 TEXT NOT NULL,
+    address_line2 TEXT,
+    city VARCHAR(100) NOT NULL,
+    pincode VARCHAR(20) NOT NULL,
+    state VARCHAR(100),
+    is_default BOOLEAN DEFAULT FALSE NOT NULL,
+    metadata JSONB DEFAULT '{}'::jsonb NOT NULL,
+    created_at TIMESTAMPTZ DEFAULT NOW() NOT NULL,
+    updated_at TIMESTAMPTZ DEFAULT NOW() NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_user_addresses_user_id ON user_addresses(user_id);
+CREATE INDEX IF NOT EXISTS idx_user_addresses_merchant ON user_addresses(merchant);
+
+DROP TRIGGER IF EXISTS update_user_addresses_updated_at ON user_addresses;
+CREATE TRIGGER update_user_addresses_updated_at
+    BEFORE UPDATE ON user_addresses
+    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
 

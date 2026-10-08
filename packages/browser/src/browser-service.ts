@@ -7,6 +7,12 @@ import {
   BrowserCartState,
   ComputerUseActionRecord,
   CartItem,
+  BROWSER_NAVIGATION_TIMEOUT_MS,
+  BROWSER_CLICK_TIMEOUT_MS,
+  BROWSER_TYPE_TIMEOUT_MS,
+  BROWSER_READ_TIMEOUT_MS,
+  BROWSER_SCREENSHOT_TIMEOUT_MS,
+  BROWSER_ACTION_TIMEOUT_MS,
 } from '@nexa/shared';
 import { validateBrowserUrl, detectCaptchaOrBotBlock, detectAuthenticationRequirement } from './safety.js';
 import { PermissionEngine } from '@nexa/security';
@@ -256,7 +262,7 @@ export class PlaywrightBrowserService {
 
   async openPage(targetUrl: string, options?: BrowserOpenOptions): Promise<BrowserOpenResult> {
     const startNav = Date.now();
-    const timeoutMs = options?.timeoutMs ?? 15_000;
+    const timeoutMs = options?.timeoutMs ?? BROWSER_NAVIGATION_TIMEOUT_MS;
     const sanitizedLogUrl = sanitizeUrlForLogs(targetUrl);
     const sessionId = options?.sessionId || this.activeSessionId || 'default';
     const session = this.getOrCreateSession(sessionId, options?.userId);
@@ -438,16 +444,22 @@ export class PlaywrightBrowserService {
     }
   }
 
-  async clickElement(selector: string, sessionId = 'default'): Promise<{ success: boolean; url: string; preventedDuplicate?: boolean }> {
+  async clickElement(
+    selector: string,
+    sessionId = 'default',
+    options?: { timeoutMs?: number }
+  ): Promise<{ success: boolean; url: string; preventedDuplicate?: boolean }> {
     const session = this.getOrCreateSession(sessionId);
     const check = this.canExecuteAction(sessionId, 'click', selector);
     if (!check.allowed) {
       return { success: true, url: this.activeUrl || '', preventedDuplicate: true };
     }
     const page = await this.ensurePage();
+    const timeoutMs = options?.timeoutMs ?? BROWSER_CLICK_TIMEOUT_MS;
     try {
+      console.log(`[ComputerUse] action_started type=click target="${selector}"`);
       console.log(`[ComputerUse] action type=click target="${selector}"`);
-      await page.waitForSelector(selector, { timeout: 10_000 });
+      await page.waitForSelector(selector, { timeout: timeoutMs });
       await page.click(selector);
       await page.waitForLoadState('domcontentloaded').catch(() => {});
       this.activeUrl = page.url();
@@ -458,8 +470,10 @@ export class PlaywrightBrowserService {
         timestamp: Date.now(),
         success: true,
       });
+      console.log(`[ComputerUse] action_completed type=click target="${selector}"`);
       return { success: true, url: this.activeUrl };
     } catch (err: any) {
+      console.log(`[ComputerUse] action_failed type=click target="${selector}"`);
       this.recordAction(sessionId, {
         action: 'click',
         target: selector,
@@ -471,12 +485,19 @@ export class PlaywrightBrowserService {
     }
   }
 
-  async typeText(selector: string, text: string, sessionId = 'default'): Promise<{ success: boolean }> {
+  async typeText(
+    selector: string,
+    text: string,
+    sessionId = 'default',
+    options?: { timeoutMs?: number }
+  ): Promise<{ success: boolean; recovered?: boolean }> {
     const session = this.getOrCreateSession(sessionId);
     const page = await this.ensurePage();
+    const timeoutMs = options?.timeoutMs ?? BROWSER_TYPE_TIMEOUT_MS;
     try {
+      console.log(`[ComputerUse] action_started type=type target="${selector}"`);
       console.log(`[ComputerUse] action type=type target="${selector}"`);
-      await page.waitForSelector(selector, { timeout: 10_000 });
+      await page.waitForSelector(selector, { timeout: timeoutMs });
       await page.fill(selector, text);
       this.recordAction(sessionId, {
         action: 'type',
@@ -484,8 +505,28 @@ export class PlaywrightBrowserService {
         timestamp: Date.now(),
         success: true,
       });
+      console.log(`[ComputerUse] action_completed type=type target="${selector}"`);
       return { success: true };
     } catch (err: any) {
+      // Action Recovery Inspection: check if value actually made it into the field
+      try {
+        if (!page.isClosed()) {
+          const actualValue = await page.$eval(selector, (el: any) => el.value || el.innerText || '');
+          if (typeof actualValue === 'string' && actualValue.includes(text)) {
+            console.log(`[ComputerUse] action_recovered type target="${selector}" value_matched=true`);
+            this.recordAction(sessionId, {
+              action: 'type',
+              target: selector,
+              timestamp: Date.now(),
+              success: true,
+              details: { recovered: true },
+            });
+            return { success: true, recovered: true };
+          }
+        }
+      } catch {}
+
+      console.log(`[ComputerUse] action_failed type=type target="${selector}"`);
       this.recordAction(sessionId, {
         action: 'type',
         target: selector,
@@ -495,6 +536,142 @@ export class PlaywrightBrowserService {
       });
       throw new ToolExecutionError('browser_type', `Failed to type in '${selector}': ${err.message}`);
     }
+  }
+
+  async fillInput(
+    selector: string,
+    text: string,
+    sessionId = 'default',
+    options?: { timeoutMs?: number }
+  ): Promise<{ success: boolean; recovered?: boolean }> {
+    return this.typeText(selector, text, sessionId, options);
+  }
+
+  async pressKey(
+    key: string,
+    sessionId = 'default',
+    options?: { timeoutMs?: number }
+  ): Promise<{ success: boolean }> {
+    const page = await this.ensurePage();
+    const timeoutMs = options?.timeoutMs ?? BROWSER_ACTION_TIMEOUT_MS;
+    try {
+      console.log(`[ComputerUse] action_started type=press target="${key}"`);
+      await page.keyboard.press(key);
+      this.recordAction(sessionId, {
+        action: 'press',
+        target: key,
+        timestamp: Date.now(),
+        success: true,
+      });
+      console.log(`[ComputerUse] action_completed type=press target="${key}"`);
+      return { success: true };
+    } catch (err: any) {
+      console.log(`[ComputerUse] action_failed type=press target="${key}"`);
+      this.recordAction(sessionId, {
+        action: 'press',
+        target: key,
+        timestamp: Date.now(),
+        success: false,
+        error: err.message,
+      });
+      throw new ToolExecutionError('browser_press', `Failed to press key '${key}': ${err.message}`);
+    }
+  }
+
+  async selectOption(
+    selector: string,
+    value: string,
+    sessionId = 'default',
+    options?: { timeoutMs?: number }
+  ): Promise<{ success: boolean }> {
+    const page = await this.ensurePage();
+    const timeoutMs = options?.timeoutMs ?? BROWSER_ACTION_TIMEOUT_MS;
+    try {
+      console.log(`[ComputerUse] action_started type=select target="${selector}" value="${value}"`);
+      await page.waitForSelector(selector, { timeout: timeoutMs });
+      await page.selectOption(selector, value);
+      this.recordAction(sessionId, {
+        action: 'select',
+        target: selector,
+        timestamp: Date.now(),
+        success: true,
+        details: { value },
+      });
+      console.log(`[ComputerUse] action_completed type=select target="${selector}"`);
+      return { success: true };
+    } catch (err: any) {
+      console.log(`[ComputerUse] action_failed type=select target="${selector}"`);
+      this.recordAction(sessionId, {
+        action: 'select',
+        target: selector,
+        timestamp: Date.now(),
+        success: false,
+        error: err.message,
+      });
+      throw new ToolExecutionError('browser_select', `Failed to select option '${value}' in '${selector}': ${err.message}`);
+    }
+  }
+
+  async hoverElement(
+    selector: string,
+    sessionId = 'default',
+    options?: { timeoutMs?: number }
+  ): Promise<{ success: boolean }> {
+    const page = await this.ensurePage();
+    const timeoutMs = options?.timeoutMs ?? BROWSER_ACTION_TIMEOUT_MS;
+    try {
+      console.log(`[ComputerUse] action_started type=hover target="${selector}"`);
+      await page.waitForSelector(selector, { timeout: timeoutMs });
+      await page.hover(selector);
+      this.recordAction(sessionId, {
+        action: 'hover',
+        target: selector,
+        timestamp: Date.now(),
+        success: true,
+      });
+      console.log(`[ComputerUse] action_completed type=hover target="${selector}"`);
+      return { success: true };
+    } catch (err: any) {
+      console.log(`[ComputerUse] action_failed type=hover target="${selector}"`);
+      this.recordAction(sessionId, {
+        action: 'hover',
+        target: selector,
+        timestamp: Date.now(),
+        success: false,
+        error: err.message,
+      });
+      throw new ToolExecutionError('browser_hover', `Failed to hover over '${selector}': ${err.message}`);
+    }
+  }
+
+  async inspectPageState(sessionId = 'default'): Promise<{
+    url: string;
+    title: string;
+    text: string;
+    authState?: string;
+    cartState?: BrowserCartState;
+    challengeDetected?: boolean;
+    challengeType?: string;
+  }> {
+    const session = this.getOrCreateSession(sessionId);
+    const page = await this.ensurePage();
+    const url = page.url();
+    const title = await page.title().catch(() => '');
+    const bodyHtml = await page.content().catch(() => '');
+    const text = (await page.evaluate(() => document.body.innerText || '').catch(() => '')).slice(0, 3000);
+
+    const botCheck = detectCaptchaOrBotBlock(bodyHtml);
+    const authCheck = detectAuthenticationRequirement(bodyHtml, url);
+
+    return {
+      url,
+      title,
+      text,
+      authState: authCheck.state,
+      cartState: session.cartState,
+      challengeDetected: botCheck.detected,
+      challengeType: botCheck.type,
+    };
   }
 
   async scrollPage(direction: 'up' | 'down', amount = 500): Promise<{ scrolled: boolean }> {

@@ -11,16 +11,22 @@ import {
   TitleSource,
   BROWSER_NAVIGATION_TIMEOUT_MS,
   BROWSER_SCREENSHOT_TIMEOUT_MS,
+  BROWSER_CLICK_TIMEOUT_MS,
+  BROWSER_TYPE_TIMEOUT_MS,
+  BROWSER_READ_TIMEOUT_MS,
   BROWSER_ACTION_TIMEOUT_MS,
   WEB_SEARCH_TIMEOUT_MS,
   DEFAULT_TOOL_TIMEOUT_MS,
   TOTAL_AGENT_DEADLINE_MS,
   MAX_AGENT_STEPS,
+  COMMERCE_TASK_MAX_STEPS,
+  COMMERCE_TASK_DEADLINE_MS,
 } from '@nexa/shared';
 import { IDatabaseRepository, MemoryService } from '@nexa/database';
-import { ToolRegistry } from '@nexa/tools';
+import { ToolRegistry, merchantResolver } from '@nexa/tools';
 import { buildSystemInstruction } from './prompts.js';
 import { IdentityManager } from './identity.js';
+import { TaskStateMachine } from './task-state-machine.js';
 
 export interface AgentProcessInput {
   phoneNumber: string;
@@ -66,18 +72,31 @@ export interface AgentProcessOutput {
 export function resolveToolTimeout(toolName: string, defaultTimeout = DEFAULT_TOOL_TIMEOUT_MS): number {
   switch (toolName) {
     case 'browser_open':
-      return BROWSER_NAVIGATION_TIMEOUT_MS; // 15000
+    case 'browser_navigate':
+      return BROWSER_NAVIGATION_TIMEOUT_MS; // 25000
     case 'browser_screenshot':
-      return BROWSER_SCREENSHOT_TIMEOUT_MS; // 10000
-    case 'browser_read':
+      return BROWSER_SCREENSHOT_TIMEOUT_MS; // 12000
     case 'browser_click':
+      return BROWSER_CLICK_TIMEOUT_MS; // 12000
     case 'browser_type':
+    case 'browser_fill':
+      return BROWSER_TYPE_TIMEOUT_MS; // 12000
+    case 'browser_read':
+      return BROWSER_READ_TIMEOUT_MS; // 12000
     case 'browser_scroll':
     case 'browser_wait':
+    case 'browser_press':
+    case 'browser_select':
+    case 'browser_hover':
     case 'browser_verify_cart':
     case 'browser_restore_session':
-      return BROWSER_ACTION_TIMEOUT_MS; // 10000
+    case 'shopping_verify_cart':
+    case 'shopping_verify_order':
+    case 'shopping_get_checkout':
+    case 'shopping_checkout':
+      return BROWSER_ACTION_TIMEOUT_MS; // 12000
     case 'web_search':
+    case 'shopping_search':
       return WEB_SEARCH_TIMEOUT_MS; // 10000
     default:
       return defaultTimeout;
@@ -143,7 +162,9 @@ export class AgentOrchestrator {
     private maxSteps = MAX_AGENT_STEPS,
     private whatsappClient?: any,
     private toolTimeoutMs = DEFAULT_TOOL_TIMEOUT_MS,
-    private totalDeadlineMs = TOTAL_AGENT_DEADLINE_MS
+    private totalDeadlineMs = TOTAL_AGENT_DEADLINE_MS,
+    private commerceMaxSteps = COMMERCE_TASK_MAX_STEPS,
+    private commerceDeadlineMs = COMMERCE_TASK_DEADLINE_MS
   ) {}
 
   /**
@@ -343,20 +364,48 @@ export class AgentOrchestrator {
 
     const toolDeclarations = this.toolRegistry.getDeclarations();
 
+    // Exact Merchant Resolution & Commerce Task Routing
+    const resolvedMerchant = merchantResolver.resolve(input.text || '');
+    if (resolvedMerchant) {
+      console.log(`[Agent] merchant_resolved merchant=${resolvedMerchant.name} canonical_url=${resolvedMerchant.canonicalUrl}`);
+    }
+
+    const isCommerceTask =
+      Boolean(resolvedMerchant) ||
+      /\b(order|buy|cart|checkout|book|booking|purchase)\b/i.test(input.text || '');
+
+    const effectiveMaxSteps = isCommerceTask
+      ? Math.max(this.maxSteps, this.commerceMaxSteps)
+      : this.maxSteps;
+    const effectiveDeadlineMs = isCommerceTask
+      ? Math.max(this.totalDeadlineMs, this.commerceDeadlineMs)
+      : this.totalDeadlineMs;
+    const planName = isCommerceTask
+      ? (resolvedMerchant ? `commerce_order_${resolvedMerchant.merchantId}` : 'commerce_order_execution')
+      : 'understand_and_execute';
+
+    const stateMachine = new TaskStateMachine('CREATED');
+    if (stateMachine.canTransitionTo('PLANNING')) {
+      stateMachine.transitionTo('PLANNING');
+    }
+
     // 8. Multi-Step Agent Execution Loop
     let currentStep = 0;
     let finalReply = '';
+    let latestExecutionToolFailed = false;
+    let verifiedSuccess = false;
+    let executionToolCalled = false;
 
     console.log(`[Agent] task_created taskId=${conversation.id}_${Date.now()} user=${user.id}`);
-    console.log(`[Agent] plan_created plan="understand_and_execute" maxSteps=${this.maxSteps}`);
+    console.log(`[Agent] plan_created plan="${planName}" maxSteps=${effectiveMaxSteps}`);
 
     // Active in-memory raw Gemini Content[] history for intermediate tool turns
     let activeRawHistory: any[] | undefined = undefined;
 
-    while (currentStep < this.maxSteps) {
+    while (currentStep < effectiveMaxSteps) {
       // Overall request deadline check
       const elapsedMs = Date.now() - requestStartTime;
-      const remainingMs = this.totalDeadlineMs - elapsedMs;
+      const remainingMs = effectiveDeadlineMs - elapsedMs;
       if (remainingMs <= 3000) {
         console.log(`[Agent] deadline_approaching remaining_ms=${remainingMs}`);
         break;
@@ -436,10 +485,28 @@ export class AgentOrchestrator {
 
       for (const tc of aiResponse.toolCalls) {
         const tcName = tc.name;
+        executionToolCalled = true;
+        if (stateMachine.canTransitionTo('EXECUTING')) {
+          stateMachine.transitionTo('EXECUTING');
+        }
         const signature = normalizeToolSignature(tcName, tc.arguments as Record<string, unknown>);
         console.log(`[Agent] step=${currentStep} tool=${tcName}`);
         if (tcName.includes('verify')) {
+          if (stateMachine.canTransitionTo('VERIFYING')) {
+            stateMachine.transitionTo('VERIFYING');
+          }
           console.log(`[Agent] verification_started tool=${tcName}`);
+        }
+        if (
+          tcName === 'shopping_checkout' ||
+          tcName === 'wallet_pay' ||
+          tcName === 'book_flight' ||
+          tcName === 'book_hotel'
+        ) {
+          if (stateMachine.canTransitionTo('EXECUTING_PAYMENT')) {
+            stateMachine.transitionTo('EXECUTING_PAYMENT');
+          }
+          console.log(`[Agent] execution_started action=${tcName}`);
         }
 
         // Check 1: Tool disabled for this session due to repeated failures (2 or more)
@@ -485,7 +552,7 @@ export class AgentOrchestrator {
         // Check 3: Calculate tool-specific bounded timeout respecting total request deadline
         const configuredToolTimeout = resolveToolTimeout(tcName, this.toolTimeoutMs);
         const elapsedSinceStart = Date.now() - requestStartTime;
-        const remainingUntilDeadline = this.totalDeadlineMs - elapsedSinceStart;
+        const remainingUntilDeadline = effectiveDeadlineMs - elapsedSinceStart;
         // Keep 1500ms safety buffer for response serialization / network return
         const maxAvailableForTool = Math.max(1000, remainingUntilDeadline - 1500);
         const effectiveTimeoutMs = Math.min(configuredToolTimeout, maxAvailableForTool);
@@ -515,8 +582,10 @@ export class AgentOrchestrator {
           if (timeoutTimer) clearTimeout(timeoutTimer);
 
           if (result.success) {
+            latestExecutionToolFailed = false;
             console.log(`[Agent] tool_success name=${tcName}`);
             if (tcName.includes('verify')) {
+              verifiedSuccess = true;
               console.log(`[Agent] verification_passed tool=${tcName}`);
             }
             if (tcName.includes('restore')) {
@@ -541,16 +610,23 @@ export class AgentOrchestrator {
             });
           } else {
             // Tool returned structured failure
+            latestExecutionToolFailed = true;
             const errMsg = result.error || 'Tool execution returned failure';
             const attempts = (toolFailures.get(tcName) || 0) + 1;
             toolFailures.set(tcName, attempts);
             failedSignatures.add(signature);
+            console.log(`[Agent] step_failed step=${currentStep} tool=${tcName} error="${errMsg}"`);
             console.log(`[Agent] tool_error name=${tcName} error="${errMsg}" attempts=${attempts}`);
 
             if (attempts >= 2) {
               disabledTools.add(tcName);
               console.log(`[Agent] tool_disabled name=${tcName} reason="max retries exceeded"`);
             }
+
+            if (stateMachine.canTransitionTo('RECOVERING')) {
+              stateMachine.transitionTo('RECOVERING');
+            }
+            console.log(`[Agent] recovery_started tool=${tcName} reason="${errMsg}"`);
 
             toolResultsForNextTurn.push({
               toolCallId: tc.id,
@@ -575,6 +651,10 @@ export class AgentOrchestrator {
 
           // Check if this was an intentional pause for user confirmation!
           if (err instanceof ApprovalRequiredError || err?.name === 'ApprovalRequiredError') {
+            if (stateMachine.canTransitionTo('WAITING_APPROVAL')) {
+              stateMachine.transitionTo('WAITING_APPROVAL');
+            }
+            console.log(`[Agent] waiting_approval tool=${tcName}`);
             console.log(`[Agent] step_completed step=${currentStep} status="awaiting_approval"`);
             await this.db.saveMessage({
               conversation_id: conversation.id,
@@ -593,10 +673,12 @@ export class AgentOrchestrator {
           }
 
           // Tool execution error / timeout
+          latestExecutionToolFailed = true;
           const errMsg = err.message || 'Tool execution failed';
           const attempts = (toolFailures.get(tcName) || 0) + 1;
           toolFailures.set(tcName, attempts);
           failedSignatures.add(signature);
+          console.log(`[Agent] step_failed step=${currentStep} tool=${tcName} error="${errMsg}"`);
           console.log(`[Agent] tool_error name=${tcName} error="${errMsg}" attempts=${attempts}`);
 
           if (attempts >= 2) {
@@ -609,9 +691,10 @@ export class AgentOrchestrator {
             (err.message && err.message.toLowerCase().includes('timed out')) ||
             abortController.signal.aborted;
 
-          if (isTimeout || tcName.startsWith('browser_')) {
-            console.log(`[Agent] recovery_started tool=${tcName} reason="${errMsg}"`);
+          if (stateMachine.canTransitionTo('RECOVERING')) {
+            stateMachine.transitionTo('RECOVERING');
           }
+          console.log(`[Agent] recovery_started tool=${tcName} reason="${errMsg}"`);
 
           const errorPayload: Record<string, unknown> = isTimeout
             ? { success: false, errorType: 'TIMEOUT', error: errMsg, message: errMsg }
@@ -652,8 +735,11 @@ export class AgentOrchestrator {
       console.log(`[Agent] step_completed step=${currentStep}`);
     }
 
-    if (currentStep >= this.maxSteps && !finalReply) {
-      console.log(`[Agent] max_steps_reached limit=${this.maxSteps}`);
+    if (currentStep >= effectiveMaxSteps && !finalReply) {
+      console.log(`[Agent] max_steps_reached limit=${effectiveMaxSteps}`);
+      if (stateMachine.canTransitionTo('FAILED')) {
+        stateMachine.transitionTo('FAILED');
+      }
       console.log(`[Agent] task_failed reason="max_steps_reached" steps=${currentStep}`);
     }
 
@@ -678,16 +764,35 @@ export class AgentOrchestrator {
       if (hadNetworkToolFailures) {
         finalReply =
           "I'm currently unable to access the web or online services due to a temporary network issue. Please try again in a moment or let me know if there's anything else I can assist with.";
-      } else if (currentStep >= this.maxSteps) {
+      } else if (latestExecutionToolFailed) {
+        finalReply =
+          "I encountered an issue executing the requested action. The action could not be completed safely. Please try again or let me know how you would like to proceed.";
+      } else if (currentStep >= effectiveMaxSteps) {
         finalReply =
           "I have reached the maximum processing steps for this request. Please let me know how you'd like to proceed, or try rephrasing your request.";
+      } else if (isCommerceTask) {
+        finalReply =
+          `I am ready to proceed with your order on ${resolvedMerchant?.name || 'the merchant'}. Please let me know if you would like me to continue.`;
       } else {
         finalReply =
           "I have gathered the information for your request. Let me know if you would like me to take any further action!";
       }
     }
 
-    if (finalReply) {
+    if (latestExecutionToolFailed) {
+      if (stateMachine.canTransitionTo('FAILED')) {
+        stateMachine.transitionTo('FAILED');
+      }
+      console.log(`[Agent] task_failed reason="action_execution_failed" steps=${currentStep}`);
+    } else if (currentStep >= effectiveMaxSteps && !finalReply) {
+      if (stateMachine.canTransitionTo('FAILED')) {
+        stateMachine.transitionTo('FAILED');
+      }
+      console.log(`[Agent] task_failed reason="max_steps_reached" steps=${currentStep}`);
+    } else if (finalReply) {
+      if (stateMachine.canTransitionTo('COMPLETED')) {
+        stateMachine.transitionTo('COMPLETED');
+      }
       console.log(`[Agent] task_completed steps=${currentStep}`);
     }
 

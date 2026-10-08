@@ -17,6 +17,8 @@ import {
   WalletLimit,
   WalletProviderEvent,
   TopupStatus,
+  MerchantSessionRecord,
+  SavedAddress,
 } from '@nexa/shared';
 import { IDatabaseRepository } from './types.js';
 
@@ -699,5 +701,152 @@ export class SupabaseRepository implements IDatabaseRepository {
     }
 
     return (data as WalletProviderEvent) || null;
+  }
+
+  // Merchant Sessions
+  async getMerchantSession(userId: string, merchant: string): Promise<MerchantSessionRecord | null> {
+    const { data, error } = await this.client
+      .from('merchant_sessions')
+      .select('*')
+      .eq('user_id', userId)
+      .ilike('merchant', merchant)
+      .maybeSingle();
+
+    if (error) {
+      throw new Error(`Failed to get merchant session: ${error.message}`);
+    }
+
+    if (!data) return null;
+    return {
+      id: data.id,
+      userId: data.user_id,
+      merchant: data.merchant,
+      authState: data.auth_state,
+      sessionState: data.session_state || {},
+      browserProfileReference: data.browser_profile_reference,
+      lastVerifiedAt: data.last_verified_at,
+      lastUsedAt: data.last_used_at,
+      createdAt: data.created_at,
+      updatedAt: data.updated_at,
+    };
+  }
+
+  async saveMerchantSession(
+    data: Omit<MerchantSessionRecord, 'id' | 'createdAt' | 'updatedAt'>
+  ): Promise<MerchantSessionRecord> {
+    const { data: saved, error } = await this.client
+      .from('merchant_sessions')
+      .upsert(
+        {
+          user_id: data.userId,
+          merchant: data.merchant,
+          auth_state: data.authState,
+          session_state: data.sessionState,
+          browser_profile_reference: data.browserProfileReference,
+          last_verified_at: data.lastVerifiedAt,
+          last_used_at: data.lastUsedAt,
+          updated_at: new Date().toISOString(),
+        },
+        { onConflict: 'user_id,merchant' }
+      )
+      .select()
+      .single();
+
+    if (error || !saved) {
+      throw new Error(`Failed to save merchant session: ${error?.message}`);
+    }
+
+    return {
+      id: saved.id,
+      userId: saved.user_id,
+      merchant: saved.merchant,
+      authState: saved.auth_state,
+      sessionState: saved.session_state || {},
+      browserProfileReference: saved.browser_profile_reference,
+      lastVerifiedAt: saved.last_verified_at,
+      lastUsedAt: saved.last_used_at,
+      createdAt: saved.created_at,
+      updatedAt: saved.updated_at,
+    };
+  }
+
+  // User Addresses
+  async getUserAddresses(userId: string, merchant?: string): Promise<SavedAddress[]> {
+    let query = this.client
+      .from('user_addresses')
+      .select('*')
+      .eq('user_id', userId);
+
+    if (merchant) {
+      query = query.or(`merchant.is.null,merchant.ilike.${merchant}`);
+    }
+
+    const { data, error } = await query.order('created_at', { ascending: false });
+    if (error) {
+      throw new Error(`Failed to get user addresses: ${error.message}`);
+    }
+
+    return (data || []).map((row: any) => ({
+      id: row.id,
+      userId: row.user_id,
+      merchant: row.merchant,
+      label: row.label,
+      recipientName: row.recipient_name,
+      phone: row.phone,
+      addressLine1: row.address_line1,
+      addressLine2: row.address_line2,
+      city: row.city,
+      pincode: row.pincode,
+      state: row.state,
+      isDefault: Boolean(row.is_default),
+      metadata: row.metadata || {},
+    }));
+  }
+
+  async saveUserAddress(data: Omit<SavedAddress, 'id'>): Promise<SavedAddress> {
+    const { data: saved, error } = await this.client
+      .from('user_addresses')
+      .insert({
+        user_id: data.userId,
+        merchant: data.merchant || null,
+        label: data.label,
+        recipient_name: data.recipientName || null,
+        phone: data.phone || null,
+        address_line1: data.addressLine1,
+        address_line2: data.addressLine2 || null,
+        city: data.city,
+        pincode: data.pincode,
+        state: data.state || null,
+        is_default: Boolean(data.isDefault),
+        metadata: data.metadata || {},
+      })
+      .select()
+      .single();
+
+    if (error || !saved) {
+      throw new Error(`Failed to save user address: ${error?.message}`);
+    }
+
+    return {
+      id: saved.id,
+      userId: saved.user_id,
+      merchant: saved.merchant,
+      label: saved.label,
+      recipientName: saved.recipient_name,
+      phone: saved.phone,
+      addressLine1: saved.address_line1,
+      addressLine2: saved.address_line2,
+      city: saved.city,
+      pincode: saved.pincode,
+      state: saved.state,
+      isDefault: Boolean(saved.is_default),
+      metadata: saved.metadata || {},
+    };
+  }
+
+  async getDefaultUserAddress(userId: string, merchant?: string): Promise<SavedAddress | null> {
+    const addresses = await this.getUserAddresses(userId, merchant);
+    const def = addresses.find((a) => a.isDefault);
+    return def || addresses[0] || null;
   }
 }
