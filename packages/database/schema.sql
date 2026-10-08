@@ -217,3 +217,184 @@ CREATE TRIGGER update_tasks_updated_at BEFORE UPDATE ON tasks FOR EACH ROW EXECU
 
 DROP TRIGGER IF EXISTS update_connected_accounts_updated_at ON connected_accounts;
 CREATE TRIGGER update_connected_accounts_updated_at BEFORE UPDATE ON connected_accounts FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+-- ====================================================================
+-- 12. IDENTITY & MEMORY V2 (Additive, Non-destructive)
+-- ====================================================================
+ALTER TABLE users ADD COLUMN IF NOT EXISTS preferred_name VARCHAR(255);
+ALTER TABLE users ADD COLUMN IF NOT EXISTS name_confirmed BOOLEAN DEFAULT FALSE;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS name_source VARCHAR(50);
+ALTER TABLE users ADD COLUMN IF NOT EXISTS preferred_title VARCHAR(100);
+ALTER TABLE users ADD COLUMN IF NOT EXISTS title_confirmed BOOLEAN DEFAULT FALSE;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS title_source VARCHAR(50);
+ALTER TABLE users ADD COLUMN IF NOT EXISTS memory_version INTEGER DEFAULT 1;
+
+ALTER TABLE memories ADD COLUMN IF NOT EXISTS source VARCHAR(50) DEFAULT 'USER_PROVIDED';
+ALTER TABLE memories ADD COLUMN IF NOT EXISTS confirmed BOOLEAN DEFAULT TRUE;
+ALTER TABLE memories ADD COLUMN IF NOT EXISTS version INTEGER DEFAULT 1;
+
+CREATE INDEX IF NOT EXISTS idx_memories_user_category ON memories(user_id, category);
+CREATE INDEX IF NOT EXISTS idx_users_preferred_title ON users(preferred_title);
+
+-- ====================================================================
+-- 13. WALLET ARCHITECTURE (Ledger, Transactions, Top-ups & Limits)
+-- ====================================================================
+
+-- 13.1 WALLETS
+CREATE TABLE IF NOT EXISTS wallets (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    currency VARCHAR(10) DEFAULT 'INR' NOT NULL,
+    balance_minor INTEGER DEFAULT 0 NOT NULL CHECK (balance_minor >= 0),
+    status VARCHAR(50) DEFAULT 'active' NOT NULL CHECK (status IN ('active', 'frozen', 'closed')),
+    created_at TIMESTAMPTZ DEFAULT NOW() NOT NULL,
+    updated_at TIMESTAMPTZ DEFAULT NOW() NOT NULL,
+    CONSTRAINT uq_wallets_user_id UNIQUE (user_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_wallets_user_id ON wallets(user_id);
+CREATE INDEX IF NOT EXISTS idx_wallets_status ON wallets(status);
+
+DROP TRIGGER IF EXISTS update_wallets_updated_at ON wallets;
+CREATE TRIGGER update_wallets_updated_at
+    BEFORE UPDATE ON wallets
+    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+-- 13.2 WALLET TRANSACTIONS
+CREATE TABLE IF NOT EXISTS wallet_transactions (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    wallet_id UUID NOT NULL REFERENCES wallets(id) ON DELETE CASCADE,
+    idempotency_key VARCHAR(255) NOT NULL,
+    type VARCHAR(50) NOT NULL CHECK (type IN ('topup', 'payment', 'transfer', 'refund', 'adjustment')),
+    amount_minor INTEGER NOT NULL,
+    currency VARCHAR(10) DEFAULT 'INR' NOT NULL,
+    balance_after_minor INTEGER NOT NULL CHECK (balance_after_minor >= 0),
+    status VARCHAR(50) DEFAULT 'PENDING' NOT NULL CHECK (status IN (
+        'PENDING',
+        'AUTHORIZED',
+        'PROCESSING',
+        'SUCCEEDED',
+        'FAILED',
+        'CANCELLED',
+        'REFUNDED'
+    )),
+    recipient VARCHAR(255),
+    description TEXT NOT NULL,
+    reference_id VARCHAR(255),
+    metadata JSONB DEFAULT '{}'::jsonb NOT NULL,
+    created_at TIMESTAMPTZ DEFAULT NOW() NOT NULL,
+    updated_at TIMESTAMPTZ DEFAULT NOW() NOT NULL,
+    CONSTRAINT uq_wallet_transactions_idempotency_key UNIQUE (idempotency_key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_wallet_transactions_wallet_id ON wallet_transactions(wallet_id);
+CREATE INDEX IF NOT EXISTS idx_wallet_transactions_idempotency_key ON wallet_transactions(idempotency_key);
+CREATE INDEX IF NOT EXISTS idx_wallet_transactions_status ON wallet_transactions(status);
+CREATE INDEX IF NOT EXISTS idx_wallet_transactions_type ON wallet_transactions(type);
+CREATE INDEX IF NOT EXISTS idx_wallet_transactions_created_at ON wallet_transactions(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_wallet_transactions_reference_id ON wallet_transactions(reference_id);
+
+DROP TRIGGER IF EXISTS update_wallet_transactions_updated_at ON wallet_transactions;
+CREATE TRIGGER update_wallet_transactions_updated_at
+    BEFORE UPDATE ON wallet_transactions
+    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+-- 13.3 WALLET TOPUPS
+CREATE TABLE IF NOT EXISTS wallet_topups (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    wallet_id UUID NOT NULL REFERENCES wallets(id) ON DELETE CASCADE,
+    idempotency_key VARCHAR(255) NOT NULL,
+    amount_minor INTEGER NOT NULL CHECK (amount_minor > 0),
+    currency VARCHAR(10) DEFAULT 'INR' NOT NULL,
+    provider VARCHAR(50) NOT NULL CHECK (provider IN ('upi_qr', 'razorpay', 'stripe', 'mock')),
+    provider_intent_id VARCHAR(255),
+    qr_code_data TEXT,
+    payment_url TEXT,
+    status VARCHAR(50) DEFAULT 'PENDING' NOT NULL CHECK (status IN ('PENDING', 'SUCCEEDED', 'FAILED', 'EXPIRED')),
+    created_at TIMESTAMPTZ DEFAULT NOW() NOT NULL,
+    completed_at TIMESTAMPTZ,
+    CONSTRAINT uq_wallet_topups_idempotency_key UNIQUE (idempotency_key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_wallet_topups_wallet_id ON wallet_topups(wallet_id);
+CREATE INDEX IF NOT EXISTS idx_wallet_topups_idempotency_key ON wallet_topups(idempotency_key);
+CREATE INDEX IF NOT EXISTS idx_wallet_topups_status ON wallet_topups(status);
+CREATE INDEX IF NOT EXISTS idx_wallet_topups_provider_intent_id ON wallet_topups(provider_intent_id);
+CREATE INDEX IF NOT EXISTS idx_wallet_topups_created_at ON wallet_topups(created_at DESC);
+
+-- 13.4 WALLET PAYMENT REQUESTS
+CREATE TABLE IF NOT EXISTS wallet_payment_requests (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    wallet_id UUID NOT NULL REFERENCES wallets(id) ON DELETE CASCADE,
+    idempotency_key VARCHAR(255) NOT NULL,
+    recipient VARCHAR(255) NOT NULL,
+    amount_minor INTEGER NOT NULL CHECK (amount_minor > 0),
+    currency VARCHAR(10) DEFAULT 'INR' NOT NULL,
+    reason TEXT NOT NULL,
+    status VARCHAR(50) DEFAULT 'pending_approval' NOT NULL CHECK (status IN (
+        'pending_approval',
+        'approved',
+        'rejected',
+        'executed',
+        'failed'
+    )),
+    approval_id UUID REFERENCES approvals(id) ON DELETE SET NULL,
+    created_at TIMESTAMPTZ DEFAULT NOW() NOT NULL,
+    expires_at TIMESTAMPTZ NOT NULL,
+    CONSTRAINT uq_wallet_payment_requests_idempotency_key UNIQUE (idempotency_key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_wallet_payment_requests_wallet_id ON wallet_payment_requests(wallet_id);
+CREATE INDEX IF NOT EXISTS idx_wallet_payment_requests_idempotency_key ON wallet_payment_requests(idempotency_key);
+CREATE INDEX IF NOT EXISTS idx_wallet_payment_requests_status ON wallet_payment_requests(status);
+CREATE INDEX IF NOT EXISTS idx_wallet_payment_requests_approval_id ON wallet_payment_requests(approval_id);
+CREATE INDEX IF NOT EXISTS idx_wallet_payment_requests_created_at ON wallet_payment_requests(created_at DESC);
+
+-- 13.5 WALLET LIMITS
+CREATE TABLE IF NOT EXISTS wallet_limits (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    wallet_id UUID NOT NULL REFERENCES wallets(id) ON DELETE CASCADE,
+    daily_limit_minor INTEGER DEFAULT 0 NOT NULL CHECK (daily_limit_minor >= 0),
+    monthly_limit_minor INTEGER DEFAULT 0 NOT NULL CHECK (monthly_limit_minor >= 0),
+    single_tx_limit_minor INTEGER DEFAULT 0 NOT NULL CHECK (single_tx_limit_minor >= 0),
+    updated_at TIMESTAMPTZ DEFAULT NOW() NOT NULL,
+    CONSTRAINT uq_wallet_limits_wallet_id UNIQUE (wallet_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_wallet_limits_wallet_id ON wallet_limits(wallet_id);
+
+DROP TRIGGER IF EXISTS update_wallet_limits_updated_at ON wallet_limits;
+CREATE TRIGGER update_wallet_limits_updated_at
+    BEFORE UPDATE ON wallet_limits
+    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+-- 13.6 WALLET PROVIDER EVENTS
+CREATE TABLE IF NOT EXISTS wallet_provider_events (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    provider VARCHAR(100) NOT NULL,
+    event_type VARCHAR(100) NOT NULL,
+    idempotency_key VARCHAR(255) NOT NULL,
+    payload JSONB DEFAULT '{}'::jsonb NOT NULL,
+    processed_at TIMESTAMPTZ DEFAULT NOW() NOT NULL,
+    CONSTRAINT uq_wallet_provider_events_idempotency_key UNIQUE (idempotency_key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_wallet_provider_events_idempotency_key ON wallet_provider_events(idempotency_key);
+CREATE INDEX IF NOT EXISTS idx_wallet_provider_events_provider ON wallet_provider_events(provider);
+CREATE INDEX IF NOT EXISTS idx_wallet_provider_events_processed_at ON wallet_provider_events(processed_at DESC);
+
+-- 13.7 WALLET AUDIT LOGS
+CREATE TABLE IF NOT EXISTS wallet_audit_logs (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    wallet_id UUID NOT NULL REFERENCES wallets(id) ON DELETE CASCADE,
+    action VARCHAR(100) NOT NULL,
+    actor VARCHAR(100) NOT NULL,
+    details JSONB DEFAULT '{}'::jsonb NOT NULL,
+    created_at TIMESTAMPTZ DEFAULT NOW() NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_wallet_audit_logs_wallet_id ON wallet_audit_logs(wallet_id);
+CREATE INDEX IF NOT EXISTS idx_wallet_audit_logs_action ON wallet_audit_logs(action);
+CREATE INDEX IF NOT EXISTS idx_wallet_audit_logs_created_at ON wallet_audit_logs(created_at DESC);
+
+
