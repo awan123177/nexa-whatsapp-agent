@@ -16,6 +16,8 @@ export interface ToolExecutionContext {
   isUserConfirmed?: boolean;
   whatsappClient?: WhatsAppMediaSender;
   recipientPhone?: string;
+  abortSignal?: AbortSignal;
+  timeoutMs?: number;
 }
 
 export interface ToolResult<T = unknown> {

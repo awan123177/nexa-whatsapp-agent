@@ -86,7 +86,47 @@ export class SupabaseRepository implements IDatabaseRepository {
       throw new Error(`Failed to get user: ${error.message}`);
     }
 
-    return (data as User) || null;
+    if (!data) return null;
+    const user = data as User;
+    if (user.preferences) {
+      user.preferred_name = user.preferences.preferred_name as string;
+      user.name_confirmed = Boolean(user.preferences.name_confirmed);
+      user.name_source = user.preferences.name_source as any;
+    }
+    return user;
+  }
+
+  async updateUser(userId: string, updates: Partial<User>): Promise<User> {
+    const existing = await this.getUserById(userId);
+    const updatedPreferences = {
+      ...(existing?.preferences || {}),
+      ...(updates.preferences || {}),
+    };
+    const dbPayload: any = {
+      ...updates,
+      preferences: updatedPreferences,
+      updated_at: new Date().toISOString(),
+    };
+    delete dbPayload.preferred_name;
+    delete dbPayload.name_confirmed;
+    delete dbPayload.name_source;
+
+    const { data, error } = await this.client
+      .from('users')
+      .update(dbPayload)
+      .eq('id', userId)
+      .select()
+      .single();
+
+    if (error || !data) {
+      throw new Error(`Failed to update user: ${error?.message}`);
+    }
+
+    const res = data as User;
+    res.preferred_name = (updatedPreferences.preferred_name as string) || null;
+    res.name_confirmed = Boolean(updatedPreferences.name_confirmed);
+    res.name_source = (updatedPreferences.name_source as any) || null;
+    return res;
   }
 
   async getOrCreateActiveConversation(userId: string, channel: ChannelType = 'whatsapp'): Promise<Conversation> {

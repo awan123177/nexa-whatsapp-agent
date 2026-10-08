@@ -1,5 +1,5 @@
 import { chromium, Browser, BrowserContext, Page } from 'playwright';
-import { NexaError, ToolExecutionError } from '@nexa/shared';
+import { NexaError, ToolExecutionError, BrowserOpenResult } from '@nexa/shared';
 import { validateBrowserUrl, detectCaptchaOrBotBlock } from './safety.js';
 import { PermissionEngine } from '@nexa/security';
 
@@ -8,12 +8,28 @@ export interface ScreenshotOptions {
   selector?: string;
   type?: 'png' | 'jpeg';
   quality?: number;
+  timeoutMs?: number;
+  signal?: AbortSignal;
 }
 
 export interface ScreenshotResult {
   buffer: Buffer;
   mimeType: string;
   base64: string;
+}
+
+export interface BrowserOpenOptions {
+  timeoutMs?: number;
+  signal?: AbortSignal;
+}
+
+function sanitizeUrlForLogs(targetUrl: string): string {
+  try {
+    const parsed = new URL(targetUrl);
+    return `${parsed.protocol}//${parsed.host}${parsed.pathname}`;
+  } catch {
+    return targetUrl.split('?')[0];
+  }
 }
 
 export class PlaywrightBrowserService {
@@ -24,9 +40,11 @@ export class PlaywrightBrowserService {
 
   async ensurePage(): Promise<Page> {
     if (!this.browser) {
+      console.log('[Browser] launch_start');
       try {
         this.browser = await chromium.launch({
           headless: true,
+          executablePath: process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH || undefined,
           args: [
             '--no-sandbox',
             '--disable-setuid-sandbox',
@@ -35,8 +53,11 @@ export class PlaywrightBrowserService {
             '--disable-accelerated-2d-canvas',
             '--no-first-run',
             '--no-zygote',
+            '--disable-software-rasterizer',
+            '--disable-extensions',
           ],
         });
+        console.log('[Browser] launch_success');
       } catch (err: any) {
         throw new NexaError(`Playwright browser initialization failed: ${err.message}`, {
           code: 'BROWSER_INIT_FAILED',
@@ -56,51 +77,146 @@ export class PlaywrightBrowserService {
 
     if (!this.page || this.page.isClosed()) {
       this.page = await this.context.newPage();
-      this.page.setDefaultTimeout(20_000);
+      this.page.setDefaultTimeout(15_000);
     }
 
     return this.page;
   }
 
-  async openPage(targetUrl: string): Promise<{ url: string; title: string; contentSnippet: string }> {
+  async cleanupPage(): Promise<void> {
+    if (this.page) {
+      const pageToClose = this.page;
+      this.page = null;
+      this.activeUrl = null;
+      if (!pageToClose.isClosed()) {
+        await pageToClose.close().catch(() => {});
+      }
+    }
+  }
+
+  async openPage(targetUrl: string, options?: BrowserOpenOptions): Promise<BrowserOpenResult> {
+    const startNav = Date.now();
+    const timeoutMs = options?.timeoutMs ?? 15_000;
+    const sanitizedLogUrl = sanitizeUrlForLogs(targetUrl);
+    console.log(`[Browser] open_start url="${sanitizedLogUrl}" timeout_ms=${timeoutMs}`);
+
+    // Security & SSRF pre-validation
     validateBrowserUrl(targetUrl);
-    const page = await this.ensurePage();
+    PermissionEngine.validateResourceAccess(targetUrl);
+
+    let page: Page;
+    try {
+      page = await this.ensurePage();
+    } catch (err: any) {
+      const latency = Date.now() - startNav;
+      console.log(`[Browser] open_failed latency_ms=${latency} error_type=NAVIGATION_FAILED`);
+      return {
+        success: false,
+        errorType: 'NAVIGATION_FAILED',
+        message: `Failed to initialize browser page: ${err.message}`,
+      };
+    }
+
+    // Handle early cancellation if signal already aborted
+    if (options?.signal?.aborted) {
+      const latency = Date.now() - startNav;
+      console.log(`[Browser] open_timeout timeout_ms=${timeoutMs}`);
+      console.log(`[Browser] open_failed latency_ms=${latency} error_type=TIMEOUT`);
+      await this.cleanupPage();
+      return {
+        success: false,
+        errorType: 'TIMEOUT',
+        message: `Browser navigation to ${sanitizedLogUrl} was cancelled before execution.`,
+      };
+    }
+
+    // Set up cancellation listener
+    let abortListener: (() => void) | null = null;
+    let aborted = false;
+
+    if (options?.signal) {
+      abortListener = () => {
+        aborted = true;
+        this.cleanupPage().catch(() => {});
+      };
+      options.signal.addEventListener('abort', abortListener, { once: true });
+    }
 
     try {
       const response = await page.goto(targetUrl, {
         waitUntil: 'domcontentloaded',
-        timeout: 25_000,
+        timeout: timeoutMs,
       });
 
+      if (abortListener && options?.signal) {
+        options.signal.removeEventListener('abort', abortListener);
+      }
+
       this.activeUrl = page.url();
-      const title = await page.title();
-      const bodyHtml = await page.content();
+      const title = await page.title().catch(() => '');
+      const bodyHtml = await page.content().catch(() => '');
 
       // Check CAPTCHA / bot block
       const botCheck = detectCaptchaOrBotBlock(bodyHtml);
       if (botCheck.detected) {
-        throw new ToolExecutionError(
-          'browser_open',
-          `Automated browsing blocked by ${botCheck.type}: ${botCheck.message}`,
-          `The website at ${targetUrl} requires human verification (${botCheck.type}). Automated access is restricted. Please complete this step directly.`
-        );
+        const latency = Date.now() - startNav;
+        console.log(`[Browser] open_failed latency_ms=${latency} error_type=BOT_BLOCKED`);
+        return {
+          success: false,
+          errorType: 'BOT_BLOCKED',
+          message: `Automated access restricted by ${botCheck.type}: ${botCheck.message}`,
+        };
       }
 
-      const text = await page.evaluate(() => document.body.innerText || '');
-      const contentSnippet = text.slice(0, 1500).replace(/\s+/g, ' ').trim();
+      const text = await page.evaluate(() => document.body.innerText || '').catch(() => '');
+      const contentSnippet = text.slice(0, 2500).replace(/\s+/g, ' ').trim();
+      const latency = Date.now() - startNav;
+      const status = response?.status() || 200;
+      console.log(`[Browser] open_success latency_ms=${latency} status=${status}`);
 
       return {
-        url: this.activeUrl,
+        success: true,
+        finalUrl: this.activeUrl,
+        status,
         title,
-        contentSnippet,
+        text: contentSnippet,
       };
     } catch (err: any) {
-      if (err instanceof ToolExecutionError) throw err;
-      throw new ToolExecutionError('browser_open', err.message);
+      if (abortListener && options?.signal) {
+        options.signal.removeEventListener('abort', abortListener);
+      }
+
+      const latency = Date.now() - startNav;
+      const isTimeout =
+        aborted ||
+        options?.signal?.aborted ||
+        err.name === 'TimeoutError' ||
+        (err.message && err.message.toLowerCase().includes('timeout'));
+
+      // Cancel and cleanup page immediately upon failure or timeout
+      await this.cleanupPage().catch(() => {});
+
+      if (isTimeout) {
+        console.log(`[Browser] open_timeout timeout_ms=${timeoutMs}`);
+        console.log(`[Browser] open_failed latency_ms=${latency} error_type=TIMEOUT`);
+        return {
+          success: false,
+          errorType: 'TIMEOUT',
+          message: `Browser navigation to ${sanitizedLogUrl} timed out after ${timeoutMs}ms.`,
+        };
+      }
+
+      console.log(`[Browser] open_failed latency_ms=${latency} error_type=NAVIGATION_FAILED`);
+      return {
+        success: false,
+        errorType: 'NAVIGATION_FAILED',
+        message: `Browser navigation failed: ${err.message}`,
+      };
     }
   }
 
   async readPage(selector?: string): Promise<{ text: string; url: string }> {
+    const readStart = Date.now();
     const page = await this.ensurePage();
     if (!this.activeUrl) {
       throw new ToolExecutionError('browser_read', 'No page currently open. Use browser_open first.');
@@ -118,6 +234,7 @@ export class PlaywrightBrowserService {
         text = await page.evaluate(() => document.body.innerText || '');
       }
 
+      console.log(`[Browser] read_success latency_ms=${Date.now() - readStart}`);
       return {
         url: page.url(),
         text: text.slice(0, 4000).trim(),
@@ -187,6 +304,7 @@ export class PlaywrightBrowserService {
   }
 
   async takeScreenshot(options?: ScreenshotOptions): Promise<ScreenshotResult> {
+    console.log('[Browser] screenshot_start');
     if (!this.activeUrl) {
       throw new ToolExecutionError('browser_screenshot', 'No page currently open. Use browser_open first.');
     }
@@ -220,9 +338,25 @@ export class PlaywrightBrowserService {
       // Continue if content reading encountered minor error
     }
 
+    if (options?.signal?.aborted) {
+      await this.cleanupPage().catch(() => {});
+      throw new ToolExecutionError('browser_screenshot', 'Screenshot capture cancelled before execution.');
+    }
+
+    let abortListener: (() => void) | null = null;
+    if (options?.signal) {
+      abortListener = () => {
+        this.cleanupPage().catch(() => {});
+      };
+      options.signal.addEventListener('abort', abortListener, { once: true });
+    }
+
     try {
       const imgType = options?.type || 'png';
-      const screenshotOpts: any = { type: imgType };
+      const screenshotOpts: any = {
+        type: imgType,
+        timeout: options?.timeoutMs ?? 10_000,
+      };
       if (imgType === 'jpeg' && options?.quality) {
         screenshotOpts.quality = options.quality;
       }
@@ -245,8 +379,13 @@ export class PlaywrightBrowserService {
         rawBuffer = await this.page.screenshot(screenshotOpts);
       }
 
+      if (abortListener && options?.signal) {
+        options.signal.removeEventListener('abort', abortListener);
+      }
+
       const buffer = Buffer.from(rawBuffer);
       const mimeType = imgType === 'jpeg' ? 'image/jpeg' : 'image/png';
+      console.log(`[Browser] screenshot_success size_bytes=${buffer.length}`);
 
       return {
         buffer,
@@ -254,6 +393,9 @@ export class PlaywrightBrowserService {
         base64: buffer.toString('base64'),
       };
     } catch (err: any) {
+      if (abortListener && options?.signal) {
+        options.signal.removeEventListener('abort', abortListener);
+      }
       if (err instanceof ToolExecutionError) throw err;
       throw new ToolExecutionError('browser_screenshot', `Failed to take screenshot: ${err.message}`);
     }

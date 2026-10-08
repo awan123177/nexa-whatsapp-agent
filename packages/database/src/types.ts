@@ -22,6 +22,7 @@ export interface IDatabaseRepository {
   // Users & Connections
   findOrCreateUserByPhone(phoneNumber: string, name?: string): Promise<User>;
   getUserById(id: string): Promise<User | null>;
+  updateUser(userId: string, updates: Partial<User>): Promise<User>;
   
   // Conversations & Messages
   getOrCreateActiveConversation(userId: string, channel?: ChannelType): Promise<Conversation>;

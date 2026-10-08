@@ -7,14 +7,27 @@ import {
   ApprovalRequiredError,
   ToolResult,
   ThinkingLevel,
+  NameSource,
+  BROWSER_NAVIGATION_TIMEOUT_MS,
+  BROWSER_SCREENSHOT_TIMEOUT_MS,
+  BROWSER_ACTION_TIMEOUT_MS,
+  WEB_SEARCH_TIMEOUT_MS,
+  DEFAULT_TOOL_TIMEOUT_MS,
+  TOTAL_AGENT_DEADLINE_MS,
+  MAX_AGENT_STEPS,
 } from '@nexa/shared';
 import { IDatabaseRepository } from '@nexa/database';
 import { ToolRegistry } from '@nexa/tools';
 import { buildSystemInstruction } from './prompts.js';
+import { IdentityManager } from './identity.js';
 
 export interface AgentProcessInput {
   phoneNumber: string;
   name?: string;
+  whatsappProfileName?: string;
+  preferredName?: string;
+  nameConfirmed?: boolean;
+  nameSource?: NameSource;
   text: string;
   channel?: ChannelType;
   mediaUrl?: string;
@@ -36,6 +49,33 @@ export interface AgentProcessOutput {
   approvalPrompt?: string;
   approvalId?: string;
   stepsCount: number;
+}
+
+/**
+ * Resolves tool-specific timeout in milliseconds.
+ * browser_open: 15s (15000ms)
+ * browser_screenshot: 10s (10000ms)
+ * browser interaction/read: 10s (10000ms)
+ * web_search: 10s (10000ms)
+ * default: 7s (7000ms)
+ */
+export function resolveToolTimeout(toolName: string, defaultTimeout = DEFAULT_TOOL_TIMEOUT_MS): number {
+  switch (toolName) {
+    case 'browser_open':
+      return BROWSER_NAVIGATION_TIMEOUT_MS; // 15000
+    case 'browser_screenshot':
+      return BROWSER_SCREENSHOT_TIMEOUT_MS; // 10000
+    case 'browser_read':
+    case 'browser_click':
+    case 'browser_type':
+    case 'browser_scroll':
+    case 'browser_wait':
+      return BROWSER_ACTION_TIMEOUT_MS; // 10000
+    case 'web_search':
+      return WEB_SEARCH_TIMEOUT_MS; // 10000
+    default:
+      return defaultTimeout;
+  }
 }
 
 /**
@@ -94,10 +134,10 @@ export class AgentOrchestrator {
     private aiProvider: AIProvider,
     private toolRegistry: ToolRegistry,
     private db: IDatabaseRepository,
-    private maxSteps = 5,
+    private maxSteps = MAX_AGENT_STEPS,
     private whatsappClient?: any,
-    private toolTimeoutMs = 7000,
-    private totalDeadlineMs = 22000
+    private toolTimeoutMs = DEFAULT_TOOL_TIMEOUT_MS,
+    private totalDeadlineMs = TOTAL_AGENT_DEADLINE_MS
   ) {}
 
   /**
@@ -132,7 +172,7 @@ export class AgentOrchestrator {
     }
 
     // 2. Identify or create User and Active Conversation
-    const user = await this.db.findOrCreateUserByPhone(input.phoneNumber, input.name);
+    let user = await this.db.findOrCreateUserByPhone(input.phoneNumber, input.name);
     const conversation = await this.db.getOrCreateActiveConversation(user.id, channel);
 
     // 3. Persist incoming user message
@@ -147,7 +187,7 @@ export class AgentOrchestrator {
       raw_payload: input.interactiveButtonId ? { buttonId: input.interactiveButtonId } : null,
     });
 
-    const context: ToolExecutionContext = {
+    let context: ToolExecutionContext = {
       user,
       conversation,
       messageId: userMessage.id,
@@ -157,14 +197,42 @@ export class AgentOrchestrator {
     };
 
     // 4. Concurrently fetch pending approvals, user memories, and conversation history
-    // Avoid redundant sequential database roundtrips to minimize time-to-first-token
     const [pendingApproval, memories, rawHistory] = await Promise.all([
       this.db.getPendingApproval(conversation.id),
       this.db.getUserMemories(user.id),
       this.db.getConversationMessages(conversation.id, 10),
     ]);
 
-    // 5. Check for Pending Approvals
+    // 5. Identity & Preferred Name Onboarding Flow
+    const identityResult = await IdentityManager.handleInboundMessage({
+      user,
+      text: input.text || '',
+      conversationHistory: rawHistory,
+      db: this.db,
+      whatsappProfileName: input.whatsappProfileName,
+      explicitName: input.name,
+      explicitConfirmed: input.nameConfirmed,
+      explicitSource: input.nameSource,
+    });
+
+    user = identityResult.user;
+    context.user = user;
+
+    if (identityResult.handled && identityResult.replyText) {
+      await this.db.saveMessage({
+        conversation_id: conversation.id,
+        sender_type: 'assistant',
+        content: identityResult.replyText,
+      });
+
+      return {
+        replyText: identityResult.replyText,
+        conversationId: conversation.id,
+        stepsCount: 0,
+      };
+    }
+
+    // 6. Check for Pending Approvals
     if (pendingApproval) {
       const lowerText = input.text.trim().toLowerCase();
       const words = lowerText.split(/[\s,;.!?]+/).filter(Boolean);
@@ -229,7 +297,7 @@ export class AgentOrchestrator {
       // If user said something unrelated, keep approval pending and fall through to normal agent loop
     }
 
-    // 6. Build Context for Agent Reasoning Loop
+    // 7. Build Context for Agent Reasoning Loop
     const systemInstruction = buildSystemInstruction(user, memories);
     const messages: AIMessage[] = rawHistory.map((m) => ({
       role: m.sender_type === 'user' ? 'user' : 'assistant',
@@ -237,8 +305,6 @@ export class AgentOrchestrator {
     }));
 
     // Ensure the final content/turn sent to Gemini is ALWAYS a USER turn.
-    // If history ended with an assistant/model turn, or the current inbound message
-    // is not already at the end of the history array, append the current user message.
     const lastHistoryMsg = messages[messages.length - 1];
     const userMediaPart = input.audioBuffer
       ? {
@@ -267,7 +333,7 @@ export class AgentOrchestrator {
 
     const toolDeclarations = this.toolRegistry.getDeclarations();
 
-    // 7. Multi-Step Agent Execution Loop
+    // 8. Multi-Step Agent Execution Loop
     let currentStep = 0;
     let finalReply = '';
 
@@ -317,7 +383,6 @@ export class AgentOrchestrator {
       });
 
       // Maintain activeRawHistory for multi-step tool execution
-      // Initialize with preceding conversation history up to current user turn
       if (!activeRawHistory) {
         activeRawHistory = messages.slice(0, -1).map((m) => {
           if (m.role === 'user') {
@@ -399,18 +464,35 @@ export class AgentOrchestrator {
           continue;
         }
 
-        // Check 3: Execute tool with per-tool timeout
+        // Check 3: Calculate tool-specific bounded timeout respecting total request deadline
+        const configuredToolTimeout = resolveToolTimeout(tcName, this.toolTimeoutMs);
+        const elapsedSinceStart = Date.now() - requestStartTime;
+        const remainingUntilDeadline = this.totalDeadlineMs - elapsedSinceStart;
+        // Keep 1500ms safety buffer for response serialization / network return
+        const maxAvailableForTool = Math.max(1000, remainingUntilDeadline - 1500);
+        const effectiveTimeoutMs = Math.min(configuredToolTimeout, maxAvailableForTool);
+
+        // Check 4: Execute tool with cancellation AbortController
+        const abortController = new AbortController();
         let timeoutTimer: NodeJS.Timeout | null = null;
         const timeoutPromise = new Promise<never>((_, reject) => {
           timeoutTimer = setTimeout(() => {
-            const timeoutErr = new Error(`Tool ${tcName} timed out after ${this.toolTimeoutMs}ms`);
+            // ACTUALLY abort underlying operation (Playwright page close / fetch abort)
+            abortController.abort(new Error(`Tool ${tcName} timed out after ${effectiveTimeoutMs}ms`));
+            const timeoutErr = new Error(`Tool ${tcName} timed out after ${effectiveTimeoutMs}ms`);
             timeoutErr.name = 'ToolTimeoutError';
             reject(timeoutErr);
-          }, this.toolTimeoutMs);
+          }, effectiveTimeoutMs);
         });
 
+        const toolExecutionContext: ToolExecutionContext = {
+          ...context,
+          abortSignal: abortController.signal,
+          timeoutMs: effectiveTimeoutMs,
+        };
+
         try {
-          const execPromise = this.toolRegistry.executeTool(tcName, tc.arguments, context);
+          const execPromise = this.toolRegistry.executeTool(tcName, tc.arguments, toolExecutionContext);
           const result = await Promise.race([execPromise, timeoutPromise]);
           if (timeoutTimer) clearTimeout(timeoutTimer);
 
@@ -463,6 +545,9 @@ export class AgentOrchestrator {
           }
         } catch (err: any) {
           if (timeoutTimer) clearTimeout(timeoutTimer);
+          if (!abortController.signal.aborted) {
+            abortController.abort(err);
+          }
 
           // Check if this was an intentional pause for user confirmation!
           if (err instanceof ApprovalRequiredError) {
@@ -494,17 +579,26 @@ export class AgentOrchestrator {
             console.log(`[Agent] tool_disabled name=${tcName} reason="max retries exceeded"`);
           }
 
+          const isTimeout =
+            err.name === 'ToolTimeoutError' ||
+            (err.message && err.message.toLowerCase().includes('timed out')) ||
+            abortController.signal.aborted;
+
+          const errorPayload: Record<string, unknown> = isTimeout
+            ? { success: false, errorType: 'TIMEOUT', error: errMsg, message: errMsg }
+            : { success: false, error: errMsg };
+
           toolResultsForNextTurn.push({
             toolCallId: tc.id,
             name: tcName,
-            result: { error: errMsg },
+            result: errorPayload,
             isError: true,
           });
 
           functionResponseParts.push({
             functionResponse: {
               name: tcName,
-              response: { error: errMsg },
+              response: errorPayload,
               id: tc.id,
             },
           });
@@ -518,11 +612,13 @@ export class AgentOrchestrator {
         toolResults: toolResultsForNextTurn,
       });
 
-      // Append function response turn to activeRawHistory
-      activeRawHistory.push({
-        role: 'user',
-        parts: functionResponseParts,
-      });
+      // Append function responses to activeRawHistory
+      if (activeRawHistory) {
+        activeRawHistory.push({
+          role: 'user',
+          parts: functionResponseParts,
+        });
+      }
     }
 
     if (currentStep >= this.maxSteps && !finalReply) {
@@ -559,7 +655,7 @@ export class AgentOrchestrator {
       }
     }
 
-    // 8. Persist final assistant reply
+    // 9. Persist final assistant reply
     await this.db.saveMessage({
       conversation_id: conversation.id,
       sender_type: 'assistant',

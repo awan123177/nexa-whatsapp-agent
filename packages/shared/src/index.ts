@@ -3,5 +3,7 @@ export * from './types/tools.js';
 export * from './types/ai.js';
 export * from './types/whatsapp.js';
 export * from './types/wallet.js';
+export * from './types/browser.js';
 export * from './errors/index.js';
 export * from './config/index.js';
+

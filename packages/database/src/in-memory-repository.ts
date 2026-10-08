@@ -66,6 +66,22 @@ export class InMemoryRepository implements IDatabaseRepository {
     return this.users.get(id) || null;
   }
 
+  async updateUser(userId: string, updates: Partial<User>): Promise<User> {
+    const user = this.users.get(userId);
+    if (!user) {
+      throw new Error(`User not found: ${userId}`);
+    }
+    const updatedPreferences = {
+      ...user.preferences,
+      ...(updates.preferences || {}),
+    };
+    Object.assign(user, updates, {
+      preferences: updatedPreferences,
+      updated_at: new Date().toISOString(),
+    });
+    return user;
+  }
+
   async getOrCreateActiveConversation(userId: string, channel: ChannelType = 'whatsapp'): Promise<Conversation> {
     const existing = Array.from(this.conversations.values()).find(
       (c) => c.user_id === userId && c.channel === channel && c.status === 'active'

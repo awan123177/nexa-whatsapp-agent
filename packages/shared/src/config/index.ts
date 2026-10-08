@@ -40,9 +40,21 @@ export const ConfigSchema = z.object({
   MAX_AGENT_STEPS: z.coerce.number().default(5),
   TOOL_TIMEOUT_MS: z.coerce.number().default(7000),
   TOTAL_AGENT_DEADLINE_MS: z.coerce.number().default(22000),
+  BROWSER_NAVIGATION_TIMEOUT_MS: z.coerce.number().default(15000),
+  BROWSER_SCREENSHOT_TIMEOUT_MS: z.coerce.number().default(10000),
+  BROWSER_ACTION_TIMEOUT_MS: z.coerce.number().default(10000),
+  WEB_SEARCH_TIMEOUT_MS: z.coerce.number().default(10000),
   RATE_LIMIT_MAX_REQUESTS_PER_MINUTE: z.coerce.number().default(30),
   APPROVAL_TIMEOUT_MINUTES: z.coerce.number().default(60),
 });
+
+export const BROWSER_NAVIGATION_TIMEOUT_MS = 15000;
+export const BROWSER_SCREENSHOT_TIMEOUT_MS = 10000;
+export const BROWSER_ACTION_TIMEOUT_MS = 10000;
+export const WEB_SEARCH_TIMEOUT_MS = 10000;
+export const DEFAULT_TOOL_TIMEOUT_MS = 7000;
+export const TOTAL_AGENT_DEADLINE_MS = 22000;
+export const MAX_AGENT_STEPS = 5;
 
 export type NexaConfig = z.infer<typeof ConfigSchema>;
 

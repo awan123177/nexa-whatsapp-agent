@@ -166,7 +166,7 @@ export function registerWhatsAppRoutes(
           // Run through NEXA Agent Orchestrator
           const result = await orchestrator.processMessage({
             phoneNumber: msg.senderPhoneNumber,
-            name: msg.senderName,
+            whatsappProfileName: msg.senderName,
             text: msg.text || '',
             audioBuffer,
             audioMimeType,

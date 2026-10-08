@@ -1,5 +1,6 @@
 export type UserRole = 'user' | 'admin' | 'tester';
 export type UserStatus = 'active' | 'suspended' | 'pending';
+export type NameSource = 'USER_PROVIDED' | 'USER_CONFIRMED' | 'WHATSAPP_PROFILE_UNCONFIRMED';
 
 export interface User {
   id: string;
@@ -8,6 +9,9 @@ export interface User {
   role: UserRole;
   status: UserStatus;
   preferences: Record<string, unknown>;
+  preferred_name?: string | null;
+  name_confirmed?: boolean;
+  name_source?: NameSource | null;
   created_at: string;
   updated_at: string;
 }

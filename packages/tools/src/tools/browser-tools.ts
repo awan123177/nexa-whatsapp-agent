@@ -18,11 +18,40 @@ export function createBrowserTools(
       url: z.string().url().describe('The destination URL (must start with http:// or https://)'),
     }),
     requiresApproval: () => ({ required: false }),
-    execute: async (args: { url: string }, _context: ToolExecutionContext): Promise<ToolResult> => {
-      const data = await browserService.openPage(args.url);
-      return { success: true, data };
+    execute: async (args: { url: string }, context: ToolExecutionContext): Promise<ToolResult> => {
+      const result = await browserService.openPage(args.url, {
+        timeoutMs: context.timeoutMs ?? 15_000,
+        signal: context.abortSignal,
+      });
+      if (!result.success) {
+        return {
+          success: false,
+          error: result.message,
+          data: result,
+          userFacingMessage: `Unable to open page: ${result.message}`,
+        };
+      }
+      return {
+        success: true,
+        data: result,
+      };
     },
   };
+
+  function withAbortCleanup<T>(promise: Promise<T>, context: ToolExecutionContext): Promise<T> {
+    if (!context.abortSignal) return promise;
+    if (context.abortSignal.aborted) {
+      browserService.cleanupPage().catch(() => {});
+      return Promise.reject(new Error('Browser action cancelled by abort signal.'));
+    }
+    const listener = () => {
+      browserService.cleanupPage().catch(() => {});
+    };
+    context.abortSignal.addEventListener('abort', listener, { once: true });
+    return promise.finally(() => {
+      context.abortSignal?.removeEventListener('abort', listener);
+    });
+  }
 
   const browserReadTool: BaseTool = {
     name: 'browser_read',
@@ -32,8 +61,8 @@ export function createBrowserTools(
       selector: z.string().optional().describe('Optional CSS selector to read specific element content'),
     }),
     requiresApproval: () => ({ required: false }),
-    execute: async (args: { selector?: string }, _context: ToolExecutionContext): Promise<ToolResult> => {
-      const data = await browserService.readPage(args.selector);
+    execute: async (args: { selector?: string }, context: ToolExecutionContext): Promise<ToolResult> => {
+      const data = await withAbortCleanup(browserService.readPage(args.selector), context);
       return { success: true, data };
     },
   };
@@ -46,8 +75,8 @@ export function createBrowserTools(
       selector: z.string().describe('CSS selector of the element to click (e.g. button#submit, a.nav-link)'),
     }),
     requiresApproval: () => ({ required: false }),
-    execute: async (args: { selector: string }, _context: ToolExecutionContext): Promise<ToolResult> => {
-      const data = await browserService.clickElement(args.selector);
+    execute: async (args: { selector: string }, context: ToolExecutionContext): Promise<ToolResult> => {
+      const data = await withAbortCleanup(browserService.clickElement(args.selector), context);
       return { success: true, data };
     },
   };
@@ -61,8 +90,8 @@ export function createBrowserTools(
       text: z.string().describe('The text to enter'),
     }),
     requiresApproval: () => ({ required: false }),
-    execute: async (args: { selector: string; text: string }, _context: ToolExecutionContext): Promise<ToolResult> => {
-      const data = await browserService.typeText(args.selector, args.text);
+    execute: async (args: { selector: string; text: string }, context: ToolExecutionContext): Promise<ToolResult> => {
+      const data = await withAbortCleanup(browserService.typeText(args.selector, args.text), context);
       return { success: true, data };
     },
   };
@@ -76,8 +105,8 @@ export function createBrowserTools(
       amount: z.number().min(100).max(2000).optional().describe('Pixels to scroll (default 500)'),
     }),
     requiresApproval: () => ({ required: false }),
-    execute: async (args: { direction: 'up' | 'down'; amount?: number }, _context: ToolExecutionContext): Promise<ToolResult> => {
-      const data = await browserService.scrollPage(args.direction, args.amount);
+    execute: async (args: { direction: 'up' | 'down'; amount?: number }, context: ToolExecutionContext): Promise<ToolResult> => {
+      const data = await withAbortCleanup(browserService.scrollPage(args.direction, args.amount), context);
       return { success: true, data };
     },
   };
@@ -91,9 +120,9 @@ export function createBrowserTools(
       selector: z.string().optional().describe('CSS selector to wait for'),
     }),
     requiresApproval: () => ({ required: false }),
-    execute: async (args: { milliseconds?: number; selector?: string }, _context: ToolExecutionContext): Promise<ToolResult> => {
+    execute: async (args: { milliseconds?: number; selector?: string }, context: ToolExecutionContext): Promise<ToolResult> => {
       const waitTarget = args.selector || args.milliseconds || 1000;
-      const data = await browserService.waitFor(waitTarget);
+      const data = await withAbortCleanup(browserService.waitFor(waitTarget), context);
       return { success: true, data };
     },
   };
@@ -127,13 +156,12 @@ export function createBrowserTools(
       context: ToolExecutionContext
     ): Promise<ToolResult> => {
       // 1. Capture screenshot via PlaywrightBrowserService
-      console.log('[Browser] screenshot_start');
       const screenshot = await browserService.takeScreenshot({
         fullPage: args.fullPage,
         selector: args.selector,
+        timeoutMs: context.timeoutMs ?? 10_000,
+        signal: context.abortSignal,
       });
-
-      console.log(`[Browser] screenshot_success size_bytes=${screenshot.buffer.length}`);
 
       // 2. Generate secure temporary file path in os.tmpdir() with cryptographically random name
       const randomId = crypto.randomBytes(16).toString('hex');
