@@ -56,7 +56,12 @@ export function registerWhatsAppRoutes(
    */
   app.post('/webhook/whatsapp', async (req, reply) => {
     const signature = req.headers['x-hub-signature-256'] as string | undefined;
-    const rawBody = (req as any).rawBody || JSON.stringify(req.body);
+    const rawBody = (req as any).rawBody;
+
+    if (rawBody === undefined || rawBody === null) {
+      console.error('[WhatsApp Webhook] Missing raw request body for HMAC verification');
+      return reply.status(400).send({ error: 'Missing raw request body' });
+    }
 
     // 1. Verify Webhook Signature
     const isSignatureValid = whatsapp.verifyRequestSignature(rawBody, signature);
@@ -118,10 +123,42 @@ export function registerWhatsAppRoutes(
           // Acknowledge receipt by marking as read
           await whatsapp.markRead(msg.whatsappMessageId);
 
-          if (!msg.text) {
+          let audioBuffer: Buffer | undefined;
+          let audioMimeType: string | undefined;
+
+          if (msg.type === 'audio' && msg.media?.id) {
+            console.log(`[Voice] audio_received message_id=${msg.whatsappMessageId} mime_type=${msg.media.mimeType}`);
+            console.log(`[Voice] download_start media_id=${msg.media.id}`);
+            try {
+              const downloaded = await whatsapp.mediaService.downloadMedia(msg.media.id);
+              console.log(`[Voice] download_success media_id=${msg.media.id} size_bytes=${downloaded.fileSizeBytes}`);
+
+              // Validate maximum size (16MB limit for Meta WhatsApp voice)
+              const MAX_AUDIO_BYTES = 16 * 1024 * 1024;
+              if (downloaded.fileSizeBytes > MAX_AUDIO_BYTES) {
+                console.warn(`[Voice] audio_size_exceeded size_bytes=${downloaded.fileSizeBytes}`);
+                await whatsapp.sendText(
+                  msg.senderPhoneNumber,
+                  'That voice note is a bit too large for me to process. Please send a shorter voice note (under 16MB) or send text.'
+                );
+                return;
+              }
+
+              audioBuffer = downloaded.buffer;
+              audioMimeType = downloaded.mimeType;
+              console.log(`[Voice] processing_multimodal mime_type=${audioMimeType}`);
+            } catch (err: any) {
+              console.error(`[Voice] download_failed: ${err.message}`);
+              await whatsapp.sendText(
+                msg.senderPhoneNumber,
+                "I couldn't download your voice note right now. Could you please send your request as text or try again?"
+              );
+              return;
+            }
+          } else if (!msg.text) {
             await whatsapp.sendText(
               msg.senderPhoneNumber,
-              "I received your attachment! Document, audio, and media processing will be fully connected in the next update. For now, please feel free to send text requests."
+              'I received your attachment! Please feel free to send text requests or voice notes.'
             );
             return;
           }
@@ -130,7 +167,9 @@ export function registerWhatsAppRoutes(
           const result = await orchestrator.processMessage({
             phoneNumber: msg.senderPhoneNumber,
             name: msg.senderName,
-            text: msg.text,
+            text: msg.text || '',
+            audioBuffer,
+            audioMimeType,
             channel: 'whatsapp',
             whatsappMessageId: msg.whatsappMessageId,
             interactiveButtonId: msg.interactiveSelection?.id,

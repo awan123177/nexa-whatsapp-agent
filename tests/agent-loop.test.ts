@@ -1,4 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
+import { z } from 'zod';
 import { InMemoryRepository } from '../packages/database/src/index.js';
 import { createDefaultToolRegistry } from '../packages/tools/src/factory.js';
 import { MockAIProvider } from '../packages/ai/src/mock-provider.js';
@@ -880,6 +881,361 @@ describe('Agent Orchestrator & Loop Suite', () => {
       expect(capturedPart.functionCall.name).toBe('web_search');
       expect(capturedPart.thoughtSignature).toBe('func_sig_inner');
       expect(capturedPart.customMetadata).toEqual({ origin: 'gemini-3' });
+    });
+  });
+
+  describe('Production Tool-Loop Safety & Reliability Suite', () => {
+    it('Test A: max steps termination (hard stops at 5 steps by default)', async () => {
+      const db = new InMemoryRepository();
+      const toolRegistry = createDefaultToolRegistry({ db });
+      let aiCallCount = 0;
+      const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+
+      const mockAi = new MockAIProvider(async () => {
+        aiCallCount++;
+        // Keep returning tool calls endlessly
+        return {
+          text: '',
+          toolCalls: [
+            {
+              id: `call_${aiCallCount}`,
+              name: 'save_memory',
+              arguments: {
+                category: 'test',
+                key: `step_${aiCallCount}`,
+                value: `val_${aiCallCount}`,
+                confidence: 1.0,
+              },
+            },
+          ],
+        };
+      });
+
+      const orchestrator = new AgentOrchestrator(mockAi, toolRegistry, db); // default maxSteps = 5
+      const result = await orchestrator.processMessage({
+        phoneNumber: '+15551110001',
+        name: 'MaxStepsUser',
+        text: 'Loop forever please',
+        channel: 'whatsapp',
+      });
+
+      expect(result.stepsCount).toBe(5);
+      expect(aiCallCount).toBe(5);
+      expect(result.replyText).toBeDefined();
+
+      const logs = logSpy.mock.calls.map((c) => c[0]);
+      expect(logs.some((l) => typeof l === 'string' && l.includes('[Agent] max_steps_reached limit=5'))).toBe(true);
+
+      logSpy.mockRestore();
+    });
+
+    it('Test B: per-tool timeout aborts slow tools after timeout threshold', async () => {
+      const db = new InMemoryRepository();
+      const toolRegistry = createDefaultToolRegistry({ db });
+
+      // Register a slow tool that takes 150ms
+      toolRegistry.register({
+        name: 'slow_tool',
+        description: 'A tool that takes too long',
+        riskLevel: 'read_only',
+        parametersSchema: z.object({}),
+        requiresApproval: () => ({ required: false }),
+        execute: async () => {
+          await new Promise((resolve) => setTimeout(resolve, 150));
+          return { success: true, data: { status: 'done' } };
+        },
+      });
+
+      let turn = 0;
+      let toolErrorReceived: any = null;
+      const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+
+      const mockAi = new MockAIProvider(async (messages) => {
+        turn++;
+        if (turn === 1) {
+          return {
+            text: '',
+            toolCalls: [
+              {
+                id: 'call_slow',
+                name: 'slow_tool',
+                arguments: {},
+              },
+            ],
+          };
+        }
+        // Step 2: examine messages to verify tool error was fed back
+        const lastMsg = messages[messages.length - 1];
+        toolErrorReceived = (lastMsg.toolResults?.[0]?.result as any)?.error;
+        return { text: 'Handled timeout gracefully' };
+      });
+
+      // Initialize orchestrator with a 50ms toolTimeout
+      const orchestrator = new AgentOrchestrator(mockAi, toolRegistry, db, 5, undefined, 50);
+
+      const result = await orchestrator.processMessage({
+        phoneNumber: '+15551110002',
+        name: 'TimeoutUser',
+        text: 'Run the slow tool',
+        channel: 'whatsapp',
+      });
+
+      expect(result.replyText).toBe('Handled timeout gracefully');
+      expect(toolErrorReceived).toContain('timed out after 50ms');
+
+      const logs = logSpy.mock.calls.map((c) => c[0]);
+      expect(logs.some((l) => typeof l === 'string' && l.includes('[Agent] tool_error name=slow_tool error="Tool slow_tool timed out after 50ms" attempts=1'))).toBe(true);
+
+      logSpy.mockRestore();
+    });
+
+    it('Test C: tool failure limit disables tool after 2 failures and prevents 3rd execution', async () => {
+      const db = new InMemoryRepository();
+      const toolRegistry = createDefaultToolRegistry({ db });
+
+      let toolExecCount = 0;
+      toolRegistry.register({
+        name: 'failing_api',
+        description: 'An API tool that keeps failing',
+        riskLevel: 'read_only',
+        parametersSchema: z.object({ q: z.string().optional() }),
+        requiresApproval: () => ({ required: false }),
+        execute: async () => {
+          toolExecCount++;
+          return { success: false, error: 'Remote server error 500' };
+        },
+      });
+
+      let turn = 0;
+      let thirdTurnToolError: any = null;
+      const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+
+      const mockAi = new MockAIProvider(async (messages) => {
+        turn++;
+        if (turn === 1) {
+          // Attempt 1 with query A
+          return {
+            text: '',
+            toolCalls: [{ id: 'call_1', name: 'failing_api', arguments: { q: 'attempt_1' } }],
+          };
+        }
+        if (turn === 2) {
+          // Attempt 2 with query B
+          return {
+            text: '',
+            toolCalls: [{ id: 'call_2', name: 'failing_api', arguments: { q: 'attempt_2' } }],
+          };
+        }
+        if (turn === 3) {
+          // Attempt 3 with query C -> tool should now be DISABLED!
+          return {
+            text: '',
+            toolCalls: [{ id: 'call_3', name: 'failing_api', arguments: { q: 'attempt_3' } }],
+          };
+        }
+        const lastMsg = messages[messages.length - 1];
+        thirdTurnToolError = (lastMsg.toolResults?.[0]?.result as any)?.error;
+        return { text: 'Stopped using disabled tool' };
+      });
+
+      const orchestrator = new AgentOrchestrator(mockAi, toolRegistry, db);
+
+      const result = await orchestrator.processMessage({
+        phoneNumber: '+15551110003',
+        name: 'RetryUser',
+        text: 'Try failing api',
+        channel: 'whatsapp',
+      });
+
+      expect(result.replyText).toBe('Stopped using disabled tool');
+      // The tool registry was executed only 2 times, NOT 3 times!
+      expect(toolExecCount).toBe(2);
+      expect(thirdTurnToolError).toContain('unavailable for this request due to repeated failures');
+
+      const logs = logSpy.mock.calls.map((c) => c[0]);
+      expect(logs.some((l) => typeof l === 'string' && l.includes('[Agent] tool_disabled name=failing_api reason="max retries exceeded"'))).toBe(true);
+
+      logSpy.mockRestore();
+    });
+
+    it('Test D: duplicate identical tool call blocked after initial failure', async () => {
+      const db = new InMemoryRepository();
+      const toolRegistry = createDefaultToolRegistry({ db });
+
+      let execCount = 0;
+      toolRegistry.register({
+        name: 'flakey_service',
+        description: 'Flakey test service',
+        riskLevel: 'read_only',
+        parametersSchema: z.object({ item: z.string().optional() }),
+        requiresApproval: () => ({ required: false }),
+        execute: async () => {
+          execCount++;
+          return { success: false, error: 'Connection refused' };
+        },
+      });
+
+      let turn = 0;
+      let duplicateBlockedMsg: any = null;
+      const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+
+      const mockAi = new MockAIProvider(async (messages) => {
+        turn++;
+        if (turn === 1) {
+          // Call with item: "widget"
+          return {
+            text: '',
+            toolCalls: [{ id: 'call_1', name: 'flakey_service', arguments: { item: 'widget' } }],
+          };
+        }
+        if (turn === 2) {
+          // Model stubbornly retries the exact same tool and arguments
+          return {
+            text: '',
+            toolCalls: [{ id: 'call_2', name: 'flakey_service', arguments: { item: 'widget' } }],
+          };
+        }
+        const lastMsg = messages[messages.length - 1];
+        duplicateBlockedMsg = (lastMsg.toolResults?.[0]?.result as any)?.error;
+        return { text: 'Handled duplicate rejection' };
+      });
+
+      const orchestrator = new AgentOrchestrator(mockAi, toolRegistry, db);
+
+      const result = await orchestrator.processMessage({
+        phoneNumber: '+15551110004',
+        name: 'DupUser',
+        text: 'Fetch widget',
+        channel: 'whatsapp',
+      });
+
+      expect(result.replyText).toBe('Handled duplicate rejection');
+      // Tool was only executed once!
+      expect(execCount).toBe(1);
+      expect(duplicateBlockedMsg).toContain('Duplicate tool call to flakey_service with identical arguments blocked');
+
+      const logs = logSpy.mock.calls.map((c) => c[0]);
+      expect(logs.some((l) => typeof l === 'string' && l.includes('[Agent] duplicate_tool_blocked name=flakey_service'))).toBe(true);
+
+      logSpy.mockRestore();
+    });
+
+    it('Test E: overall request deadline enforcement terminates before timeout', async () => {
+      const db = new InMemoryRepository();
+      const toolRegistry = createDefaultToolRegistry({ db });
+
+      // Orchestrator with totalDeadlineMs = 50ms
+      // ReceivedAt was 100ms ago, so remainingMs is <= 3000ms immediately
+      const mockAi = new MockAIProvider(async () => {
+        return {
+          text: '',
+          toolCalls: [{ id: 'c1', name: 'save_memory', arguments: { category: 't', key: 'k', value: 'v', confidence: 1 } }],
+        };
+      });
+
+      const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+
+      const orchestrator = new AgentOrchestrator(mockAi, toolRegistry, db, 5, undefined, 7000, 50);
+
+      const result = await orchestrator.processMessage({
+        phoneNumber: '+15551110005',
+        name: 'DeadlineUser',
+        text: 'Do slow operation',
+        channel: 'whatsapp',
+        receivedAt: Date.now() - 100, // already past deadline
+      });
+
+      expect(result.replyText).toBeDefined();
+      const logs = logSpy.mock.calls.map((c) => c[0]);
+      expect(logs.some((l) => typeof l === 'string' && l.includes('[Agent] deadline_approaching'))).toBe(true);
+
+      logSpy.mockRestore();
+    });
+
+    it('Test F: clean fallback response when external network tools fail repeatedly without fabricating data', async () => {
+      const db = new InMemoryRepository();
+      const toolRegistry = createDefaultToolRegistry({ db });
+
+      toolRegistry.register({
+        name: 'web_search',
+        description: 'Web search',
+        riskLevel: 'read_only',
+        parametersSchema: z.object({ query: z.string().optional() }),
+        requiresApproval: () => ({ required: false }),
+        execute: async () => {
+          throw new Error('fetch failed: getaddrinfo ENOTFOUND');
+        },
+      });
+
+      let turn = 0;
+      const mockAi = new MockAIProvider(async () => {
+        turn++;
+        // Step 1: web_search fails
+        // Step 2: web_search fails again -> marked disabled
+        // Model doesn't return text in step 2 (keeps returning tool call)
+        return {
+          text: '',
+          toolCalls: [{ id: `call_${turn}`, name: 'web_search', arguments: { query: `query_${turn}` } }],
+        };
+      });
+
+      const orchestrator = new AgentOrchestrator(mockAi, toolRegistry, db, 2);
+
+      const result = await orchestrator.processMessage({
+        phoneNumber: '+15551110006',
+        name: 'OfflineUser',
+        text: 'Find today weather online',
+        channel: 'whatsapp',
+      });
+
+      expect(result.replyText).toContain('unable to access the web or online services due to a temporary network issue');
+      // No hallucinated weather data!
+      expect(result.replyText).not.toContain('sunny');
+    });
+
+    it('Test G: no SDK warning emitted when model response contains function calls', async () => {
+      let accessedResponseText = false;
+      const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+      const fakeResponse = {
+        candidates: [
+          {
+            content: {
+              role: 'model',
+              parts: [
+                {
+                  functionCall: { name: 'web_search', args: { query: 'test query' } },
+                  thoughtSignature: 'sig_no_warn',
+                },
+              ],
+            },
+          },
+        ],
+        functionCalls: [{ name: 'web_search', args: { query: 'test query' } }],
+        get text() {
+          accessedResponseText = true;
+          console.warn('there are non-text parts functionCall in the response, returning concatenation of all text parts.');
+          return '';
+        },
+      };
+
+      const geminiProvider = new GeminiProvider({
+        apiKey: 'test-key',
+        generateContentFn: async () => fakeResponse as any,
+      });
+
+      const res = await geminiProvider.generateResponse([
+        { role: 'user', content: 'Search something' },
+      ]);
+
+      expect(res.toolCalls).toHaveLength(1);
+      expect(res.toolCalls![0].name).toBe('web_search');
+      expect(accessedResponseText).toBe(false);
+
+      const warnings = warnSpy.mock.calls.map((c) => c[0]);
+      expect(warnings.some((w) => typeof w === 'string' && w.includes('there are non-text parts functionCall'))).toBe(false);
+
+      warnSpy.mockRestore();
     });
   });
 });

@@ -20,6 +20,8 @@ export interface AppDependencies {
   oauthService?: GoogleOAuthService;
   rateLimiter?: InMemoryRateLimiter;
   maxAgentSteps?: number;
+  toolTimeoutMs?: number;
+  totalAgentDeadlineMs?: number;
 }
 
 export function buildApp(deps: AppDependencies): FastifyInstance {
@@ -37,10 +39,9 @@ export function buildApp(deps: AppDependencies): FastifyInstance {
   // Enable rawBody support (needed for Meta HMAC-SHA256 signature verification)
   app.register(rawBody, {
     field: 'rawBody',
-    global: false,
+    global: true,
     encoding: 'utf8',
     runFirst: true,
-    routes: ['/webhook/whatsapp'],
   });
 
   const rateLimiter = deps.rateLimiter || new InMemoryRateLimiter();
@@ -48,8 +49,10 @@ export function buildApp(deps: AppDependencies): FastifyInstance {
     deps.aiProvider,
     deps.toolRegistry,
     deps.db,
-    deps.maxAgentSteps || 10,
-    deps.whatsapp
+    deps.maxAgentSteps || 5,
+    deps.whatsapp,
+    deps.toolTimeoutMs || 7000,
+    deps.totalAgentDeadlineMs || 22000
   );
 
   // Global Error Handler
@@ -71,29 +74,31 @@ export function buildApp(deps: AppDependencies): FastifyInstance {
 
   const oauthService = deps.oauthService || new GoogleOAuthService({ db: deps.db });
 
-  // Register route handlers
-  registerHealthRoutes(app, {
-    db: deps.db,
-    aiProvider: deps.aiProvider,
-    whatsapp: deps.whatsapp,
-    oauthService,
-  });
+  // Register route handlers after plugins have initialized so rawBody hooks attach to all routes
+  app.after(() => {
+    registerHealthRoutes(app, {
+      db: deps.db,
+      aiProvider: deps.aiProvider,
+      whatsapp: deps.whatsapp,
+      oauthService,
+    });
 
-  registerWhatsAppRoutes(app, {
-    orchestrator,
-    whatsapp: deps.whatsapp,
-    rateLimiter,
-  });
+    registerWhatsAppRoutes(app, {
+      orchestrator,
+      whatsapp: deps.whatsapp,
+      rateLimiter,
+    });
 
-  registerChatRoutes(app, {
-    orchestrator,
-    db: deps.db,
-    rateLimiter,
-  });
+    registerChatRoutes(app, {
+      orchestrator,
+      db: deps.db,
+      rateLimiter,
+    });
 
-  registerAuthRoutes(app, {
-    db: deps.db,
-    oauthService,
+    registerAuthRoutes(app, {
+      db: deps.db,
+      oauthService,
+    });
   });
 
   return app;

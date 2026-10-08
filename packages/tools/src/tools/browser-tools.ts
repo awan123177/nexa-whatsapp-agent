@@ -127,10 +127,13 @@ export function createBrowserTools(
       context: ToolExecutionContext
     ): Promise<ToolResult> => {
       // 1. Capture screenshot via PlaywrightBrowserService
+      console.log('[Browser] screenshot_start');
       const screenshot = await browserService.takeScreenshot({
         fullPage: args.fullPage,
         selector: args.selector,
       });
+
+      console.log(`[Browser] screenshot_success size_bytes=${screenshot.buffer.length}`);
 
       // 2. Generate secure temporary file path in os.tmpdir() with cryptographically random name
       const randomId = crypto.randomBytes(16).toString('hex');
@@ -155,11 +158,14 @@ export function createBrowserTools(
           const uploadFilename = `screenshot-${Date.now()}.${ext}`;
 
           // Upload media via Meta WhatsApp Cloud API
+          console.log('[WhatsApp Media] image_upload_start');
           const uploadRes = await whatsappClient.uploadMedia(fileData, screenshot.mimeType, uploadFilename);
           mediaId = uploadRes.mediaId;
+          console.log('[WhatsApp Media] image_upload_success');
 
           // Send image message with caption
           await whatsappClient.sendImageMessage(recipient, mediaId, caption);
+          console.log('[WhatsApp Media] image_send_success');
           deliveredToWhatsApp = true;
         }
 
@@ -172,6 +178,7 @@ export function createBrowserTools(
             mediaId,
             deliveredToWhatsApp,
             caption,
+            imageBuffer: screenshot.buffer,
             preview: `data:${screenshot.mimeType};base64,${screenshot.base64.slice(0, 100)}...`,
           },
           userFacingMessage: caption,

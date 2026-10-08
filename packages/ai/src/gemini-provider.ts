@@ -5,6 +5,7 @@ import {
   AICompletionOptions,
   AIResponse,
   AIToolCall,
+  AIMediaPart,
   NexaError,
   ThinkingLevel,
 } from '@nexa/shared';
@@ -276,11 +277,24 @@ export function mapToGenAIThinkingLevel(level?: ThinkingLevel): GenAIThinkingLev
  */
 export function validateGeminiConversation(
   contents: any[],
-  fallbackUserText?: string
+  fallbackUserText?: string,
+  fallbackUserMedia?: AIMediaPart
 ): any[] {
   if (!contents || contents.length === 0) {
+    const parts: any[] = [];
+    if (fallbackUserMedia) {
+      parts.push({
+        inlineData: {
+          mimeType: fallbackUserMedia.mimeType,
+          data: fallbackUserMedia.data,
+        },
+      });
+    }
     if (fallbackUserText && fallbackUserText.trim().length > 0) {
-      return [{ role: 'user', parts: [{ text: fallbackUserText.trim() }] }];
+      parts.push({ text: fallbackUserText.trim() });
+    }
+    if (parts.length > 0) {
+      return [{ role: 'user', parts }];
     }
     throw new NexaError('Gemini conversation validation failed: contents cannot be empty.', {
       code: 'INVALID_CONVERSATION',
@@ -337,10 +351,22 @@ export function validateGeminiConversation(
   const finalTurn = contents[contents.length - 1];
   if (finalTurn.role !== 'user') {
     // If final turn is 'model' unexpectedly, repair it only when safe
+    const repairParts: any[] = [];
+    if (fallbackUserMedia) {
+      repairParts.push({
+        inlineData: {
+          mimeType: fallbackUserMedia.mimeType,
+          data: fallbackUserMedia.data,
+        },
+      });
+    }
     if (fallbackUserText && fallbackUserText.trim().length > 0) {
+      repairParts.push({ text: fallbackUserText.trim() });
+    }
+    if (repairParts.length > 0) {
       contents.push({
         role: 'user',
-        parts: [{ text: fallbackUserText.trim() }],
+        parts: repairParts,
       });
     } else {
       throw new NexaError(
@@ -448,9 +474,10 @@ export class GeminiProvider implements AIProvider {
     // Extract fallback user text from messages or options for safe conversation repair
     const lastUserMsg = [...messages].reverse().find((m) => m.role === 'user');
     const currentUserText = options.currentUserText || lastUserMsg?.content || '';
+    const currentUserMedia = options.currentUserMedia || lastUserMsg?.media;
 
     // Validate and guarantee valid Gemini conversation structure (ends in user turn)
-    const contents = validateGeminiConversation(rawContents, currentUserText);
+    const contents = validateGeminiConversation(rawContents, currentUserText, currentUserMedia);
 
     // Sanitized conversation structure logging (never logs message text or credentials)
     const conversationRoles = contents.map((c: any) => c.role).join(',');
@@ -569,7 +596,13 @@ export class GeminiProvider implements AIProvider {
           const candidateContent = candidate?.content;
           const candidateParts: any[] = candidateContent?.parts || [];
 
-          // Extract text safely without calling response.text if non-text functionCall parts exist
+          // Check if function calls are present anywhere in response or candidate parts
+          const hasFunctionCalls =
+            Boolean(response.functionCalls && response.functionCalls.length > 0) ||
+            candidateParts.some((p: any) => Boolean(p.functionCall));
+
+          // Extract text safely from candidate text parts without calling response.text
+          // when function calls exist, eliminating the Google GenAI SDK warning.
           let extractedText = '';
           if (candidateParts.length > 0) {
             const textSegments = candidateParts
@@ -579,7 +612,7 @@ export class GeminiProvider implements AIProvider {
               extractedText = textSegments.join('');
             }
           }
-          if (!extractedText) {
+          if (!extractedText && !hasFunctionCalls) {
             try {
               extractedText = response.text || '';
             } catch {
@@ -800,9 +833,23 @@ export class GeminiProvider implements AIProvider {
       }
 
       if (msg.role === 'user') {
+        const parts: any[] = [];
+        if (msg.media) {
+          parts.push({
+            inlineData: {
+              mimeType: msg.media.mimeType,
+              data: msg.media.data,
+            },
+          });
+        }
+        if (msg.content) {
+          parts.push({ text: msg.content });
+        } else if (parts.length === 0) {
+          parts.push({ text: '' });
+        }
         formatted.push({
           role: 'user',
-          parts: [{ text: msg.content }],
+          parts,
         });
       } else if (msg.role === 'assistant') {
         // Priority 1: Preserve original raw model content object from SDK

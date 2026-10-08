@@ -9,4 +9,6 @@ export * from './tools/memory-tools.js';
 export * from './tools/approval-tool.js';
 export * from './tools/google-oauth.js';
 export * from './tools/gmail-provider.js';
+export * from './wallet/wallet-service.js';
+export * from './tools/wallet-tools.js';
 export * from './factory.js';

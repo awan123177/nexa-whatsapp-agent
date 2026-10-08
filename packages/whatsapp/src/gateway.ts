@@ -56,17 +56,29 @@ export class WhatsAppGateway {
     rawBody: string | Buffer,
     signatureHeader: string | undefined
   ): boolean {
+    const rawBodyLength = Buffer.isBuffer(rawBody)
+      ? rawBody.length
+      : Buffer.byteLength(rawBody || '', 'utf-8');
+    const signaturePresent = Boolean(signatureHeader);
+    console.log(
+      `[WhatsApp Security] signature_present=${signaturePresent} raw_body_length=${rawBodyLength}`
+    );
+
     if (!this.appSecret) {
       console.warn(
         '[WhatsAppGateway] WHATSAPP_APP_SECRET is not configured. Skipping HMAC signature check.'
       );
+      console.log(`[WhatsApp Security] signature_valid=true`);
       return true;
     }
 
     try {
-      return verifyMetaSignature(rawBody, signatureHeader, this.appSecret);
+      const isValid = verifyMetaSignature(rawBody, signatureHeader, this.appSecret);
+      console.log(`[WhatsApp Security] signature_valid=${isValid}`);
+      return isValid;
     } catch (err: any) {
       console.error(`[WhatsAppGateway] Signature verification failed: ${err.message}`);
+      console.log(`[WhatsApp Security] signature_valid=false`);
       return false;
     }
   }

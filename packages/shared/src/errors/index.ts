@@ -31,21 +31,47 @@ export class ApprovalRequiredError extends NexaError {
   public readonly toolArguments: Record<string, unknown>;
   public readonly prompt: string;
 
-  constructor(params: {
-    approvalId: string;
-    toolName: string;
-    toolArguments: Record<string, unknown>;
-    prompt: string;
-  }) {
-    super(`Action requires user approval: ${params.toolName}`, {
-      code: 'APPROVAL_REQUIRED',
-      statusCode: 200, // Not an HTTP failure, but an intentional workflow state
-      userFacingMessage: params.prompt,
-    });
-    this.approvalId = params.approvalId;
-    this.toolName = params.toolName;
-    this.toolArguments = params.toolArguments;
-    this.prompt = params.prompt;
+  get confirmationPrompt(): string {
+    return this.prompt;
+  }
+
+  constructor(
+    params:
+      | {
+          approvalId?: string;
+          toolName: string;
+          toolArguments: Record<string, unknown>;
+          prompt: string;
+        }
+      | string,
+    toolName?: string,
+    toolArguments?: Record<string, unknown>,
+    _impactLevel?: string
+  ) {
+    if (typeof params === 'string') {
+      const promptStr = params;
+      const tName = toolName || 'unknown_tool';
+      const tArgs = toolArguments || {};
+      super(`Action requires user approval: ${tName}`, {
+        code: 'APPROVAL_REQUIRED',
+        statusCode: 200, // Not an HTTP failure, but an intentional workflow state
+        userFacingMessage: promptStr,
+      });
+      this.approvalId = '';
+      this.toolName = tName;
+      this.toolArguments = tArgs;
+      this.prompt = promptStr;
+    } else {
+      super(`Action requires user approval: ${params.toolName}`, {
+        code: 'APPROVAL_REQUIRED',
+        statusCode: 200, // Not an HTTP failure, but an intentional workflow state
+        userFacingMessage: params.prompt,
+      });
+      this.approvalId = params.approvalId || '';
+      this.toolName = params.toolName;
+      this.toolArguments = params.toolArguments;
+      this.prompt = params.prompt;
+    }
   }
 }
 

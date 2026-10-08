@@ -19,6 +19,8 @@ export interface AgentProcessInput {
   channel?: ChannelType;
   mediaUrl?: string;
   mediaType?: MediaType;
+  audioBuffer?: Buffer;
+  audioMimeType?: string;
   whatsappMessageId?: string;
   wamid?: string;
   interactiveButtonId?: string;
@@ -68,13 +70,34 @@ export function resolveThinkingLevel(
   return 'low';
 }
 
+/**
+ * Normalizes tool arguments to create a stable signature for duplicate detection.
+ */
+export function normalizeToolSignature(name: string, args?: Record<string, unknown> | null): string {
+  if (!args || typeof args !== 'object') {
+    return `${name}:{}`;
+  }
+  try {
+    const sortedKeys = Object.keys(args).sort();
+    const sortedObj: Record<string, unknown> = {};
+    for (const k of sortedKeys) {
+      sortedObj[k] = (args as any)[k];
+    }
+    return `${name}:${JSON.stringify(sortedObj)}`;
+  } catch {
+    return `${name}:${String(args)}`;
+  }
+}
+
 export class AgentOrchestrator {
   constructor(
     private aiProvider: AIProvider,
     private toolRegistry: ToolRegistry,
     private db: IDatabaseRepository,
-    private maxSteps = 10,
-    private whatsappClient?: any
+    private maxSteps = 5,
+    private whatsappClient?: any,
+    private toolTimeoutMs = 7000,
+    private totalDeadlineMs = 22000
   ) {}
 
   /**
@@ -83,6 +106,12 @@ export class AgentOrchestrator {
   async processMessage(input: AgentProcessInput): Promise<AgentProcessOutput> {
     const channel = input.channel || 'whatsapp';
     const messageId = input.whatsappMessageId || input.wamid;
+    const requestStartTime = input.receivedAt || Date.now();
+
+    // Per-request tracking for loop prevention, deduplication, and failure policies
+    const toolFailures = new Map<string, number>();
+    const disabledTools = new Set<string>();
+    const failedSignatures = new Set<string>();
 
     // 1. Message Deduplication check (crucial for WhatsApp Cloud API retries)
     // Check wamid FIRST to avoid unnecessary DB user/conversation queries on duplicates
@@ -107,12 +136,13 @@ export class AgentOrchestrator {
     const conversation = await this.db.getOrCreateActiveConversation(user.id, channel);
 
     // 3. Persist incoming user message
+    const effectiveText = input.text || (input.audioBuffer ? '[Voice Note]' : '');
     const userMessage = await this.db.saveMessage({
       conversation_id: conversation.id,
       sender_type: 'user',
-      content: input.text,
+      content: effectiveText,
       media_url: input.mediaUrl || null,
-      media_type: input.mediaType || null,
+      media_type: input.mediaType || (input.audioBuffer ? 'audio' : null),
       whatsapp_message_id: messageId || null,
       raw_payload: input.interactiveButtonId ? { buttonId: input.interactiveButtonId } : null,
     });
@@ -210,16 +240,29 @@ export class AgentOrchestrator {
     // If history ended with an assistant/model turn, or the current inbound message
     // is not already at the end of the history array, append the current user message.
     const lastHistoryMsg = messages[messages.length - 1];
+    const userMediaPart = input.audioBuffer
+      ? {
+          mimeType: input.audioMimeType || 'audio/ogg; codecs=opus',
+          data: input.audioBuffer.toString('base64'),
+        }
+      : undefined;
+
+    const currentTurnContent =
+      input.text || (input.audioBuffer ? '[Voice Note]' : '');
+
     const isCurrentUserAlreadyLast =
       lastHistoryMsg &&
       lastHistoryMsg.role === 'user' &&
-      lastHistoryMsg.content === input.text;
+      lastHistoryMsg.content === currentTurnContent;
 
     if (!isCurrentUserAlreadyLast) {
       messages.push({
         role: 'user',
-        content: input.text,
+        content: currentTurnContent,
+        media: userMediaPart,
       });
+    } else if (userMediaPart && lastHistoryMsg) {
+      lastHistoryMsg.media = userMediaPart;
     }
 
     const toolDeclarations = this.toolRegistry.getDeclarations();
@@ -232,9 +275,17 @@ export class AgentOrchestrator {
     let activeRawHistory: any[] | undefined = undefined;
 
     while (currentStep < this.maxSteps) {
+      // Overall request deadline check
+      const elapsedMs = Date.now() - requestStartTime;
+      const remainingMs = this.totalDeadlineMs - elapsedMs;
+      if (remainingMs <= 3000) {
+        console.log(`[Agent] deadline_approaching remaining_ms=${remainingMs}`);
+        break;
+      }
+
       currentStep++;
 
-      const thinkingLevel = resolveThinkingLevel(input.text, currentStep, input.thinkingLevel);
+      const thinkingLevel = resolveThinkingLevel(currentTurnContent, currentStep, input.thinkingLevel);
       console.log(`[WhatsApp Path] gemini_request_start step=${currentStep} thinking_level=${thinkingLevel}`);
       const stepStartTime = Date.now();
 
@@ -242,7 +293,8 @@ export class AgentOrchestrator {
         systemInstruction,
         tools: toolDeclarations,
         thinkingLevel,
-        currentUserText: input.text,
+        currentUserText: currentTurnContent,
+        currentUserMedia: userMediaPart,
         rawHistory: activeRawHistory,
       });
 
@@ -303,27 +355,115 @@ export class AgentOrchestrator {
       const functionResponseParts: any[] = [];
 
       for (const tc of aiResponse.toolCalls) {
-        try {
-          const result = await this.toolRegistry.executeTool(tc.name, tc.arguments, context);
+        const tcName = tc.name;
+        const signature = normalizeToolSignature(tcName, tc.arguments as Record<string, unknown>);
+        console.log(`[Agent] step=${currentStep} tool=${tcName}`);
 
+        // Check 1: Tool disabled for this session due to repeated failures (2 or more)
+        if (disabledTools.has(tcName)) {
+          console.log(`[Agent] tool_disabled name=${tcName} reason="max retries exceeded"`);
+          const disabledMsg = `Tool ${tcName} is unavailable for this request due to repeated failures. Please continue without it using available knowledge or explain the situation to the user.`;
           toolResultsForNextTurn.push({
             toolCallId: tc.id,
-            name: tc.name,
-            result: result.data || { success: result.success },
-            isError: !result.success,
+            name: tcName,
+            result: { error: disabledMsg },
+            isError: true,
           });
-
           functionResponseParts.push({
             functionResponse: {
-              name: tc.name,
-              response: {
-                result: result.data || { success: result.success },
-                isError: !result.success,
-              },
+              name: tcName,
+              response: { error: disabledMsg },
               id: tc.id,
             },
           });
+          continue;
+        }
+
+        // Check 2: Duplicate tool call with identical arguments that already failed
+        if (failedSignatures.has(signature)) {
+          console.log(`[Agent] duplicate_tool_blocked name=${tcName}`);
+          const duplicateMsg = `Duplicate tool call to ${tcName} with identical arguments blocked because it already failed.`;
+          toolResultsForNextTurn.push({
+            toolCallId: tc.id,
+            name: tcName,
+            result: { error: duplicateMsg },
+            isError: true,
+          });
+          functionResponseParts.push({
+            functionResponse: {
+              name: tcName,
+              response: { error: duplicateMsg },
+              id: tc.id,
+            },
+          });
+          continue;
+        }
+
+        // Check 3: Execute tool with per-tool timeout
+        let timeoutTimer: NodeJS.Timeout | null = null;
+        const timeoutPromise = new Promise<never>((_, reject) => {
+          timeoutTimer = setTimeout(() => {
+            const timeoutErr = new Error(`Tool ${tcName} timed out after ${this.toolTimeoutMs}ms`);
+            timeoutErr.name = 'ToolTimeoutError';
+            reject(timeoutErr);
+          }, this.toolTimeoutMs);
+        });
+
+        try {
+          const execPromise = this.toolRegistry.executeTool(tcName, tc.arguments, context);
+          const result = await Promise.race([execPromise, timeoutPromise]);
+          if (timeoutTimer) clearTimeout(timeoutTimer);
+
+          if (result.success) {
+            console.log(`[Agent] tool_success name=${tcName}`);
+            toolResultsForNextTurn.push({
+              toolCallId: tc.id,
+              name: tcName,
+              result: result.data || { success: true },
+              isError: false,
+            });
+
+            functionResponseParts.push({
+              functionResponse: {
+                name: tcName,
+                response: {
+                  result: result.data || { success: true },
+                  isError: false,
+                },
+                id: tc.id,
+              },
+            });
+          } else {
+            // Tool returned structured failure
+            const errMsg = result.error || 'Tool execution returned failure';
+            const attempts = (toolFailures.get(tcName) || 0) + 1;
+            toolFailures.set(tcName, attempts);
+            failedSignatures.add(signature);
+            console.log(`[Agent] tool_error name=${tcName} error="${errMsg}" attempts=${attempts}`);
+
+            if (attempts >= 2) {
+              disabledTools.add(tcName);
+              console.log(`[Agent] tool_disabled name=${tcName} reason="max retries exceeded"`);
+            }
+
+            toolResultsForNextTurn.push({
+              toolCallId: tc.id,
+              name: tcName,
+              result: { error: errMsg, details: result.data },
+              isError: true,
+            });
+
+            functionResponseParts.push({
+              functionResponse: {
+                name: tcName,
+                response: { error: errMsg, details: result.data },
+                id: tc.id,
+              },
+            });
+          }
         } catch (err: any) {
+          if (timeoutTimer) clearTimeout(timeoutTimer);
+
           // Check if this was an intentional pause for user confirmation!
           if (err instanceof ApprovalRequiredError) {
             await this.db.saveMessage({
@@ -342,18 +482,29 @@ export class AgentOrchestrator {
             };
           }
 
-          // Regular tool execution error: Feed error back to model
+          // Tool execution error / timeout
+          const errMsg = err.message || 'Tool execution failed';
+          const attempts = (toolFailures.get(tcName) || 0) + 1;
+          toolFailures.set(tcName, attempts);
+          failedSignatures.add(signature);
+          console.log(`[Agent] tool_error name=${tcName} error="${errMsg}" attempts=${attempts}`);
+
+          if (attempts >= 2) {
+            disabledTools.add(tcName);
+            console.log(`[Agent] tool_disabled name=${tcName} reason="max retries exceeded"`);
+          }
+
           toolResultsForNextTurn.push({
             toolCallId: tc.id,
-            name: tc.name,
-            result: { error: err.message },
+            name: tcName,
+            result: { error: errMsg },
             isError: true,
           });
 
           functionResponseParts.push({
             functionResponse: {
-              name: tc.name,
-              response: { error: err.message },
+              name: tcName,
+              response: { error: errMsg },
               id: tc.id,
             },
           });
@@ -374,11 +525,41 @@ export class AgentOrchestrator {
       });
     }
 
-    if (!finalReply) {
-      finalReply = "I have gathered the information for your request. Let me know if you would like me to take any further action!";
+    if (currentStep >= this.maxSteps && !finalReply) {
+      console.log(`[Agent] max_steps_reached limit=${this.maxSteps}`);
     }
 
-    // 7. Persist final assistant reply
+    if (!finalReply) {
+      const networkToolNames = [
+        'web_search',
+        'browser_open',
+        'browser_navigate',
+        'search_products',
+        'search_flights',
+        'search_hotels',
+        'browse_web_page',
+        'take_screenshot',
+      ];
+
+      const hadNetworkToolFailures =
+        Array.from(disabledTools).some((name) => networkToolNames.includes(name)) ||
+        Array.from(toolFailures.entries()).some(
+          ([name, count]) => count > 0 && networkToolNames.includes(name)
+        );
+
+      if (hadNetworkToolFailures) {
+        finalReply =
+          "I'm currently unable to access the web or online services due to a temporary network issue. Please try again in a moment or let me know if there's anything else I can assist with.";
+      } else if (currentStep >= this.maxSteps) {
+        finalReply =
+          "I have reached the maximum processing steps for this request. Please let me know how you'd like to proceed, or try rephrasing your request.";
+      } else {
+        finalReply =
+          "I have gathered the information for your request. Let me know if you would like me to take any further action!";
+      }
+    }
+
+    // 8. Persist final assistant reply
     await this.db.saveMessage({
       conversation_id: conversation.id,
       sender_type: 'assistant',

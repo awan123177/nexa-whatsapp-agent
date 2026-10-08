@@ -10,6 +10,12 @@ import {
   AuditLog,
   ChannelType,
   ConnectedAccount,
+  Wallet,
+  WalletTransaction,
+  WalletTopup,
+  WalletLimit,
+  WalletProviderEvent,
+  TopupStatus,
 } from '@nexa/shared';
 
 export interface IDatabaseRepository {
@@ -50,4 +56,20 @@ export interface IDatabaseRepository {
 
   // Audit Logs
   saveAuditLog(data: Omit<AuditLog, 'id' | 'created_at'>): Promise<void>;
+
+  // NEXA Wallet Operations
+  getOrCreateWallet(userId: string, currency?: string): Promise<Wallet>;
+  getWalletByUserId(userId: string): Promise<Wallet | null>;
+  getWalletById(walletId: string): Promise<Wallet | null>;
+  createWalletTransaction(data: Omit<WalletTransaction, 'id' | 'created_at' | 'updated_at'>): Promise<WalletTransaction>;
+  getWalletTransactions(walletId: string, limit?: number): Promise<WalletTransaction[]>;
+  getTransactionByIdempotencyKey(key: string): Promise<WalletTransaction | null>;
+  updateWalletBalance(walletId: string, newBalanceMinor: number): Promise<Wallet>;
+  createWalletTopup(data: Omit<WalletTopup, 'id' | 'created_at'>): Promise<WalletTopup>;
+  getWalletTopupByIdempotencyKey(key: string): Promise<WalletTopup | null>;
+  updateWalletTopupStatus(id: string, status: TopupStatus, completedAt?: string): Promise<WalletTopup>;
+  getWalletLimits(walletId: string): Promise<WalletLimit | null>;
+  saveWalletLimits(data: WalletLimit): Promise<WalletLimit>;
+  saveWalletProviderEvent(data: Omit<WalletProviderEvent, 'id' | 'processed_at'>): Promise<void>;
+  getWalletProviderEvent(idempotencyKey: string): Promise<WalletProviderEvent | null>;
 }

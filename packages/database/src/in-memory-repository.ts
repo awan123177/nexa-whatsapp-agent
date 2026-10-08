@@ -11,6 +11,12 @@ import {
   AuditLog,
   ChannelType,
   ConnectedAccount,
+  Wallet,
+  WalletTransaction,
+  WalletTopup,
+  WalletLimit,
+  WalletProviderEvent,
+  TopupStatus,
 } from '@nexa/shared';
 import { IDatabaseRepository } from './types.js';
 
@@ -24,6 +30,11 @@ export class InMemoryRepository implements IDatabaseRepository {
   public tasks = new Map<string, Task>();
   public connectedAccounts = new Map<string, ConnectedAccount>();
   public auditLogs: AuditLog[] = [];
+  public wallets = new Map<string, Wallet>();
+  public walletTransactions = new Map<string, WalletTransaction>();
+  public walletTopups = new Map<string, WalletTopup>();
+  public walletLimits = new Map<string, WalletLimit>();
+  public walletProviderEvents = new Map<string, WalletProviderEvent>();
 
   async findOrCreateUserByPhone(phoneNumber: string, name?: string): Promise<User> {
     const existing = Array.from(this.users.values()).find(
@@ -287,5 +298,121 @@ export class InMemoryRepository implements IDatabaseRepository {
       return this.connectedAccounts.delete(account.id);
     }
     return false;
+  }
+
+  // NEXA Wallet Operations
+  async getOrCreateWallet(userId: string, currency = 'INR'): Promise<Wallet> {
+    const existing = Array.from(this.wallets.values()).find((w) => w.user_id === userId);
+    if (existing) return existing;
+
+    const now = new Date().toISOString();
+    const wallet: Wallet = {
+      id: crypto.randomUUID(),
+      user_id: userId,
+      currency,
+      balance_minor: 0,
+      status: 'active',
+      created_at: now,
+      updated_at: now,
+    };
+    this.wallets.set(wallet.id, wallet);
+    return wallet;
+  }
+
+  async getWalletByUserId(userId: string): Promise<Wallet | null> {
+    return Array.from(this.wallets.values()).find((w) => w.user_id === userId) || null;
+  }
+
+  async getWalletById(walletId: string): Promise<Wallet | null> {
+    return this.wallets.get(walletId) || null;
+  }
+
+  async createWalletTransaction(
+    data: Omit<WalletTransaction, 'id' | 'created_at' | 'updated_at'>
+  ): Promise<WalletTransaction> {
+    const now = new Date().toISOString();
+    const tx: WalletTransaction = {
+      ...data,
+      id: crypto.randomUUID(),
+      created_at: now,
+      updated_at: now,
+    };
+    this.walletTransactions.set(tx.id, tx);
+    return tx;
+  }
+
+  async getWalletTransactions(walletId: string, limit = 20): Promise<WalletTransaction[]> {
+    return Array.from(this.walletTransactions.values())
+      .filter((t) => t.wallet_id === walletId)
+      .sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime())
+      .slice(0, limit);
+  }
+
+  async getTransactionByIdempotencyKey(key: string): Promise<WalletTransaction | null> {
+    return (
+      Array.from(this.walletTransactions.values()).find((t) => t.idempotency_key === key) || null
+    );
+  }
+
+  async updateWalletBalance(walletId: string, newBalanceMinor: number): Promise<Wallet> {
+    const wallet = this.wallets.get(walletId);
+    if (!wallet) throw new Error(`Wallet ${walletId} not found`);
+    wallet.balance_minor = newBalanceMinor;
+    wallet.updated_at = new Date().toISOString();
+    return wallet;
+  }
+
+  async createWalletTopup(data: Omit<WalletTopup, 'id' | 'created_at'>): Promise<WalletTopup> {
+    const topup: WalletTopup = {
+      ...data,
+      id: crypto.randomUUID(),
+      created_at: new Date().toISOString(),
+    };
+    this.walletTopups.set(topup.id, topup);
+    return topup;
+  }
+
+  async getWalletTopupByIdempotencyKey(key: string): Promise<WalletTopup | null> {
+    return (
+      Array.from(this.walletTopups.values()).find(
+        (t) => t.idempotency_key === key || t.id === key
+      ) || null
+    );
+  }
+
+  async updateWalletTopupStatus(
+    id: string,
+    status: TopupStatus,
+    completedAt?: string
+  ): Promise<WalletTopup> {
+    const topup = this.walletTopups.get(id);
+    if (!topup) throw new Error(`Topup ${id} not found`);
+    topup.status = status;
+    if (completedAt) topup.completed_at = completedAt;
+    return topup;
+  }
+
+  async getWalletLimits(walletId: string): Promise<WalletLimit | null> {
+    return this.walletLimits.get(walletId) || null;
+  }
+
+  async saveWalletLimits(data: WalletLimit): Promise<WalletLimit> {
+    this.walletLimits.set(data.wallet_id, data);
+    return data;
+  }
+
+  async saveWalletProviderEvent(
+    data: Omit<WalletProviderEvent, 'id' | 'processed_at'>
+  ): Promise<void> {
+    const event: WalletProviderEvent = {
+      ...data,
+      id: crypto.randomUUID(),
+      processed_at: new Date().toISOString(),
+    };
+    this.walletProviderEvents.set(event.idempotency_key, event);
+  }
+
+  async getWalletProviderEvent(idempotencyKey: string): Promise<WalletProviderEvent | null> {
+    return this.walletProviderEvents.get(idempotencyKey) || null;
   }
 }

@@ -37,7 +37,9 @@ export const ConfigSchema = z.object({
   SERPER_API_KEY: z.string().optional(),
 
   // Agent Config
-  MAX_AGENT_STEPS: z.coerce.number().default(10),
+  MAX_AGENT_STEPS: z.coerce.number().default(5),
+  TOOL_TIMEOUT_MS: z.coerce.number().default(7000),
+  TOTAL_AGENT_DEADLINE_MS: z.coerce.number().default(22000),
   RATE_LIMIT_MAX_REQUESTS_PER_MINUTE: z.coerce.number().default(30),
   APPROVAL_TIMEOUT_MINUTES: z.coerce.number().default(60),
 });

@@ -15,6 +15,11 @@ export interface AIToolResult {
   isError?: boolean;
 }
 
+export interface AIMediaPart {
+  mimeType: string;
+  data: string; // Base64-encoded binary data
+}
+
 export interface AIMessage {
   role: AIMessageRole;
   content: string;
@@ -23,6 +28,7 @@ export interface AIMessage {
   toolResults?: AIToolResult[];
   rawModelContent?: any;
   rawModelParts?: any[];
+  media?: AIMediaPart;
 }
 
 export interface AIToolDeclaration {
@@ -46,6 +52,7 @@ export interface AICompletionOptions {
   systemInstruction?: string;
   tools?: AIToolDeclaration[];
   currentUserText?: string;
+  currentUserMedia?: AIMediaPart;
   requestTimeoutMs?: number;
   overallDeadlineMs?: number;
   rawHistory?: any[];

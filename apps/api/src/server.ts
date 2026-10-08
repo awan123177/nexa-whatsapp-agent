@@ -80,6 +80,8 @@ async function bootstrap() {
     oauthService,
     rateLimiter,
     maxAgentSteps: config.MAX_AGENT_STEPS,
+    toolTimeoutMs: config.TOOL_TIMEOUT_MS,
+    totalAgentDeadlineMs: config.TOTAL_AGENT_DEADLINE_MS,
   });
 
   // Graceful shutdown handling

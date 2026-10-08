@@ -11,6 +11,12 @@ import {
   AuditLog,
   ChannelType,
   ConnectedAccount,
+  Wallet,
+  WalletTransaction,
+  WalletTopup,
+  WalletLimit,
+  WalletProviderEvent,
+  TopupStatus,
 } from '@nexa/shared';
 import { IDatabaseRepository } from './types.js';
 
@@ -418,5 +424,220 @@ export class SupabaseRepository implements IDatabaseRepository {
       .eq('provider', provider);
 
     return !error;
+  }
+
+  // NEXA Wallet Operations
+  async getOrCreateWallet(userId: string, currency = 'INR'): Promise<Wallet> {
+    const existing = await this.getWalletByUserId(userId);
+    if (existing) return existing;
+
+    const { data, error } = await this.client
+      .from('wallets')
+      .insert({
+        user_id: userId,
+        currency,
+        balance_minor: 0,
+        status: 'active',
+      })
+      .select()
+      .single();
+
+    if (error) {
+      throw new Error(`Failed to create wallet: ${error.message}`);
+    }
+
+    return data as Wallet;
+  }
+
+  async getWalletByUserId(userId: string): Promise<Wallet | null> {
+    const { data, error } = await this.client
+      .from('wallets')
+      .select('*')
+      .eq('user_id', userId)
+      .maybeSingle();
+
+    if (error) {
+      throw new Error(`Failed to get wallet for user: ${error.message}`);
+    }
+
+    return (data as Wallet) || null;
+  }
+
+  async getWalletById(walletId: string): Promise<Wallet | null> {
+    const { data, error } = await this.client
+      .from('wallets')
+      .select('*')
+      .eq('id', walletId)
+      .maybeSingle();
+
+    if (error) {
+      throw new Error(`Failed to get wallet: ${error.message}`);
+    }
+
+    return (data as Wallet) || null;
+  }
+
+  async createWalletTransaction(
+    data: Omit<WalletTransaction, 'id' | 'created_at' | 'updated_at'>
+  ): Promise<WalletTransaction> {
+    const { data: created, error } = await this.client
+      .from('wallet_transactions')
+      .insert(data)
+      .select()
+      .single();
+
+    if (error) {
+      throw new Error(`Failed to create wallet transaction: ${error.message}`);
+    }
+
+    return created as WalletTransaction;
+  }
+
+  async getWalletTransactions(walletId: string, limit = 20): Promise<WalletTransaction[]> {
+    const { data, error } = await this.client
+      .from('wallet_transactions')
+      .select('*')
+      .eq('wallet_id', walletId)
+      .order('created_at', { ascending: false })
+      .limit(limit);
+
+    if (error) {
+      throw new Error(`Failed to list wallet transactions: ${error.message}`);
+    }
+
+    return (data as WalletTransaction[]) || [];
+  }
+
+  async getTransactionByIdempotencyKey(key: string): Promise<WalletTransaction | null> {
+    const { data, error } = await this.client
+      .from('wallet_transactions')
+      .select('*')
+      .eq('idempotency_key', key)
+      .maybeSingle();
+
+    if (error) {
+      throw new Error(`Failed to get transaction by key: ${error.message}`);
+    }
+
+    return (data as WalletTransaction) || null;
+  }
+
+  async updateWalletBalance(walletId: string, newBalanceMinor: number): Promise<Wallet> {
+    const { data, error } = await this.client
+      .from('wallets')
+      .update({
+        balance_minor: newBalanceMinor,
+        updated_at: new Date().toISOString(),
+      })
+      .eq('id', walletId)
+      .select()
+      .single();
+
+    if (error) {
+      throw new Error(`Failed to update wallet balance: ${error.message}`);
+    }
+
+    return data as Wallet;
+  }
+
+  async createWalletTopup(data: Omit<WalletTopup, 'id' | 'created_at'>): Promise<WalletTopup> {
+    const { data: created, error } = await this.client
+      .from('wallet_topups')
+      .insert(data)
+      .select()
+      .single();
+
+    if (error) {
+      throw new Error(`Failed to create wallet topup: ${error.message}`);
+    }
+
+    return created as WalletTopup;
+  }
+
+  async getWalletTopupByIdempotencyKey(key: string): Promise<WalletTopup | null> {
+    const { data, error } = await this.client
+      .from('wallet_topups')
+      .select('*')
+      .or(`idempotency_key.eq.${key},id.eq.${key}`)
+      .maybeSingle();
+
+    if (error) {
+      throw new Error(`Failed to get topup by key: ${error.message}`);
+    }
+
+    return (data as WalletTopup) || null;
+  }
+
+  async updateWalletTopupStatus(
+    id: string,
+    status: TopupStatus,
+    completedAt?: string
+  ): Promise<WalletTopup> {
+    const updateData: any = { status };
+    if (completedAt) updateData.completed_at = completedAt;
+
+    const { data, error } = await this.client
+      .from('wallet_topups')
+      .update(updateData)
+      .eq('id', id)
+      .select()
+      .single();
+
+    if (error) {
+      throw new Error(`Failed to update topup status: ${error.message}`);
+    }
+
+    return data as WalletTopup;
+  }
+
+  async getWalletLimits(walletId: string): Promise<WalletLimit | null> {
+    const { data, error } = await this.client
+      .from('wallet_limits')
+      .select('*')
+      .eq('wallet_id', walletId)
+      .maybeSingle();
+
+    if (error) {
+      throw new Error(`Failed to get wallet limits: ${error.message}`);
+    }
+
+    return (data as WalletLimit) || null;
+  }
+
+  async saveWalletLimits(data: WalletLimit): Promise<WalletLimit> {
+    const { data: saved, error } = await this.client
+      .from('wallet_limits')
+      .upsert(data)
+      .select()
+      .single();
+
+    if (error) {
+      throw new Error(`Failed to save wallet limits: ${error.message}`);
+    }
+
+    return saved as WalletLimit;
+  }
+
+  async saveWalletProviderEvent(
+    data: Omit<WalletProviderEvent, 'id' | 'processed_at'>
+  ): Promise<void> {
+    const { error } = await this.client.from('wallet_provider_events').insert(data);
+    if (error) {
+      throw new Error(`Failed to save wallet provider event: ${error.message}`);
+    }
+  }
+
+  async getWalletProviderEvent(idempotencyKey: string): Promise<WalletProviderEvent | null> {
+    const { data, error } = await this.client
+      .from('wallet_provider_events')
+      .select('*')
+      .eq('idempotency_key', idempotencyKey)
+      .maybeSingle();
+
+    if (error) {
+      throw new Error(`Failed to get wallet provider event: ${error.message}`);
+    }
+
+    return (data as WalletProviderEvent) || null;
   }
 }
