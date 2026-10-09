@@ -26,7 +26,14 @@ export interface ProductItem {
 
 // In-memory user active shopping cart state
 export interface UserCartRecord {
-  items: Array<{ name: string; priceMinor: number; quantity: number; store: string }>;
+  items: Array<{
+    name: string;
+    priceMinor: number;
+    quantity: number;
+    store: string;
+    packSize?: number;
+    totalUnits?: number;
+  }>;
   store: string;
   selectedAddress?: SavedAddress | string;
   lastVerifiedAt?: number;
@@ -62,6 +69,13 @@ export const shoppingAddToCartParametersSchema = z.object({
     }
     return typeof val === 'number' ? Math.round(val) : 1;
   }, z.number().int().min(1).max(50).default(1)).describe('Quantity to add (integer 1-50)'),
+  packSize: z.preprocess((val) => {
+    if (typeof val === 'string') {
+      const parsed = parseInt(val, 10);
+      return isNaN(parsed) ? undefined : parsed;
+    }
+    return typeof val === 'number' ? Math.round(val) : undefined;
+  }, z.number().int().min(1).max(50).optional()).describe('Number of units in pack (e.g. 3 for a 3-pack)'),
   currency: z.string().default('INR').describe('Currency code'),
 });
 
@@ -152,10 +166,30 @@ export function createShoppingTools(
             hostname = new URL(canonicalUrl).hostname;
           } catch {}
 
+          const hasExecutionContext = Boolean(
+            _context.abortSignal ||
+            _context.taskId ||
+            _context.requestId ||
+            _context.toolCallId
+          );
+          const browserOpts = hasExecutionContext
+            ? {
+                signal: _context.abortSignal,
+                timeoutMs: _context.timeoutMs ?? 15_000,
+                sessionId: _context.sessionId || _context.user?.id || 'default',
+                userId: _context.user?.id,
+                taskId: _context.taskId,
+                requestId: _context.requestId,
+                toolCallId: _context.toolCallId,
+              }
+            : undefined;
+
           const isAlreadyOnStore = currentUrl && hostname && currentUrl.includes(hostname);
           if (!isAlreadyOnStore) {
             console.log(`[Shopping] browser_navigation_start merchant=${storeName} url="${canonicalUrl}"`);
-            const openRes = await browserService.openPage(canonicalUrl);
+            const openRes = browserOpts
+              ? await browserService.openPage(canonicalUrl, browserOpts)
+              : await browserService.openPage(canonicalUrl);
             if (!openRes.success) {
               console.log(`[Shopping] browser_navigation_failed merchant=${storeName} error="${openRes.message}" error_type=${openRes.errorType}`);
 
@@ -188,7 +222,7 @@ export function createShoppingTools(
             }
 
             await browserService.waitForPageReady();
-            const pageState = await browserService.inspectPageState();
+            const pageState = await browserService.inspectPageState(browserOpts?.sessionId);
             if (pageState.challengeDetected || pageState.authState === 'BLOCKED' || pageState.authState === 'AUTH_REQUIRED') {
               console.log(`[Shopping] bot_challenge_detected merchant=${storeName} type="${pageState.challengeType || 'CAPTCHA'}"`);
 
@@ -220,7 +254,9 @@ export function createShoppingTools(
             }
           }
 
-          const browserRes = await browserService.adaptiveSearch(args.query);
+          const browserRes = browserOpts
+            ? await browserService.adaptiveSearch(args.query, browserOpts.sessionId, browserOpts)
+            : await browserService.adaptiveSearch(args.query);
           if (browserRes.success && browserRes.products.length > 0) {
             products = browserRes.products.map((p) => ({
               title: p.title,
@@ -344,7 +380,7 @@ export function createShoppingTools(
     parametersSchema: shoppingAddToCartParametersSchema,
     requiresApproval: () => ({ required: false }),
     execute: async (
-      args: { productName: string; price: number; store?: string; merchant?: string; quantity: number; currency: string },
+      args: { productName: string; price: number; store?: string; merchant?: string; quantity: number; packSize?: number; currency: string },
       context: ToolExecutionContext
     ): Promise<ToolResult> => {
       const userId = context.user.id;
@@ -356,11 +392,17 @@ export function createShoppingTools(
         userCarts.set(userId, cart);
       }
 
+      const inferredPackMatch = args.productName.match(/(\d+)[ -]?(?:pack|set|count|pcs|piece)/i);
+      const packSize = args.packSize || (inferredPackMatch ? parseInt(inferredPackMatch[1], 10) : 1);
+      const totalUnits = packSize * (args.quantity || 1);
+
       cart.items.push({
         name: args.productName,
         priceMinor,
         quantity: args.quantity || 1,
         store: storeName,
+        packSize,
+        totalUnits,
       });
       cart.lastVerifiedAt = Date.now();
 
@@ -375,6 +417,8 @@ export function createShoppingTools(
           addedItem: args.productName,
           store: storeName,
           quantity: args.quantity,
+          packSize,
+          totalUnits,
           cartTotalMinor: totalMinor,
           subtotalMinor: totalMinor,
           formattedTotal,
@@ -391,10 +435,15 @@ export function createShoppingTools(
     riskLevel: 'read_only',
     parametersSchema: z.object({
       expectedItem: z.string().optional().describe('Optional item name to verify in the cart'),
-      merchant: z.string().optional().describe('Merchant name (e.g. Blinkit)'),
+      merchant: z.string().optional().describe('Merchant name (e.g. Blinkit, Amazon)'),
+      maxBudget: z.number().optional().describe('Maximum allowed budget for verification (e.g. 1500 for ₹1,500)'),
+      minPackSize: z.number().optional().describe('Minimum pack size required (e.g. 3 for a 3-pack)'),
     }),
     requiresApproval: () => ({ required: false }),
-    execute: async (args: { expectedItem?: string; merchant?: string }, context: ToolExecutionContext): Promise<ToolResult> => {
+    execute: async (
+      args: { expectedItem?: string; merchant?: string; maxBudget?: number; minPackSize?: number },
+      context: ToolExecutionContext
+    ): Promise<ToolResult> => {
       const userId = context.user.id;
       console.log(`[Agent] verification_started step=shopping_cart target="${args.expectedItem || 'all_items'}"`);
       const cart = userCarts.get(userId);
@@ -407,8 +456,62 @@ export function createShoppingTools(
         };
       }
 
+      // If browserService is connected and on active page, verify with browser
+      if (browserService) {
+        try {
+          await browserService.verifyCart(
+            context.sessionId || userId,
+            args.expectedItem,
+            {
+              signal: context.abortSignal,
+              timeoutMs: context.timeoutMs,
+              taskId: context.taskId,
+              requestId: context.requestId,
+            }
+          );
+        } catch {}
+      }
+
       const totalMinor = cart.items.reduce((sum, item) => sum + item.priceMinor * item.quantity, 0);
       const formattedTotal = formatMinorUnits(totalMinor, 'INR');
+
+      // Check budget constraint
+      if (args.maxBudget && totalMinor > args.maxBudget * 100) {
+        console.log(`[Shopping] cart_verification_failed reason="budget_exceeded" total_minor=${totalMinor} budget_minor=${args.maxBudget * 100}`);
+        return {
+          success: false,
+          error: `Cart total ${formattedTotal} exceeds budget limit of ₹${args.maxBudget}.`,
+          userFacingMessage: `The cart total (${formattedTotal}) exceeds your specified budget of ₹${args.maxBudget}.`,
+          data: {
+            verified: false,
+            budgetExceeded: true,
+            totalMinor,
+            maxBudgetMinor: args.maxBudget * 100,
+            items: cart.items,
+          },
+        };
+      }
+
+      // Check pack size constraint
+      if (args.minPackSize) {
+        const hasMatchingPack = cart.items.some(
+          (i) => (i.packSize || 1) >= args.minPackSize! || (i.totalUnits || 1) >= args.minPackSize!
+        );
+        if (!hasMatchingPack) {
+          console.log(`[Shopping] cart_verification_failed reason="insufficient_pack_size" required=${args.minPackSize}`);
+          return {
+            success: false,
+            error: `Cart item does not satisfy required ${args.minPackSize}-pack size.`,
+            userFacingMessage: `The item in the cart does not have the required ${args.minPackSize}-pack size.`,
+            data: {
+              verified: false,
+              insufficientPackSize: true,
+              requiredPackSize: args.minPackSize,
+              items: cart.items,
+            },
+          };
+        }
+      }
 
       console.log(`[Agent] verification_passed step=shopping_cart items_count=${cart.items.length}`);
       console.log(`[Shopping] cart_verified merchant=${cart.store} items_count=${cart.items.length}`);

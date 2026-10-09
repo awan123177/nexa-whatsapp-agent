@@ -10,6 +10,18 @@ export function createBrowserTools(
   browserService: PlaywrightBrowserService,
   defaultWhatsappClient?: WhatsAppMediaSender
 ): BaseTool[] {
+  function getActionOptions(context: ToolExecutionContext, overrideSessionId?: string) {
+    return {
+      signal: context.abortSignal,
+      timeoutMs: context.timeoutMs,
+      sessionId: overrideSessionId || context.sessionId || context.user?.id || 'default',
+      userId: context.user?.id,
+      taskId: context.taskId,
+      requestId: context.requestId,
+      toolCallId: context.toolCallId,
+    };
+  }
+
   const browserOpenTool: BaseTool = {
     name: 'browser_open',
     description: 'Navigates the controlled browser to a public website URL to view live content.',
@@ -20,12 +32,7 @@ export function createBrowserTools(
     }),
     requiresApproval: () => ({ required: false }),
     execute: async (args: { url: string; sessionId?: string }, context: ToolExecutionContext): Promise<ToolResult> => {
-      const result = await browserService.openPage(args.url, {
-        timeoutMs: context.timeoutMs ?? 15_000,
-        signal: context.abortSignal,
-        sessionId: args.sessionId || context.user?.id || 'default',
-        userId: context.user?.id,
-      });
+      const result = await browserService.openPage(args.url, getActionOptions(context, args.sessionId));
       if (!result.success) {
         return {
           success: false,
@@ -41,21 +48,6 @@ export function createBrowserTools(
     },
   };
 
-  function withAbortCleanup<T>(promise: Promise<T>, context: ToolExecutionContext): Promise<T> {
-    if (!context.abortSignal) return promise;
-    if (context.abortSignal.aborted) {
-      browserService.cleanupPage().catch(() => {});
-      return Promise.reject(new Error('Browser action cancelled by abort signal.'));
-    }
-    const listener = () => {
-      browserService.cleanupPage().catch(() => {});
-    };
-    context.abortSignal.addEventListener('abort', listener, { once: true });
-    return promise.finally(() => {
-      context.abortSignal?.removeEventListener('abort', listener);
-    });
-  }
-
   const browserReadTool: BaseTool = {
     name: 'browser_read',
     description: 'Extracts textual content or an element from the currently opened webpage.',
@@ -65,7 +57,7 @@ export function createBrowserTools(
     }),
     requiresApproval: () => ({ required: false }),
     execute: async (args: { selector?: string }, context: ToolExecutionContext): Promise<ToolResult> => {
-      const data = await withAbortCleanup(browserService.readPage(args.selector), context);
+      const data = await browserService.readPage(args.selector, getActionOptions(context));
       return { success: true, data };
     },
   };
@@ -80,9 +72,10 @@ export function createBrowserTools(
     }),
     requiresApproval: () => ({ required: false }),
     execute: async (args: { selector: string; sessionId?: string }, context: ToolExecutionContext): Promise<ToolResult> => {
-      const data = await withAbortCleanup(
-        browserService.clickElement(args.selector, args.sessionId || context.user?.id || 'default'),
-        context
+      const data = await browserService.clickElement(
+        args.selector,
+        args.sessionId || context.user?.id || 'default',
+        getActionOptions(context, args.sessionId)
       );
       return { success: true, data };
     },
@@ -99,9 +92,11 @@ export function createBrowserTools(
     }),
     requiresApproval: () => ({ required: false }),
     execute: async (args: { selector: string; text: string; sessionId?: string }, context: ToolExecutionContext): Promise<ToolResult> => {
-      const data = await withAbortCleanup(
-        browserService.typeText(args.selector, args.text, args.sessionId || context.user?.id || 'default'),
-        context
+      const data = await browserService.typeText(
+        args.selector,
+        args.text,
+        args.sessionId || context.user?.id || 'default',
+        getActionOptions(context, args.sessionId)
       );
       return { success: true, data };
     },
@@ -117,7 +112,7 @@ export function createBrowserTools(
     }),
     requiresApproval: () => ({ required: false }),
     execute: async (args: { direction: 'up' | 'down'; amount?: number }, context: ToolExecutionContext): Promise<ToolResult> => {
-      const data = await withAbortCleanup(browserService.scrollPage(args.direction, args.amount), context);
+      const data = await browserService.scrollPage(args.direction, args.amount, undefined, getActionOptions(context));
       return { success: true, data };
     },
   };
@@ -133,7 +128,7 @@ export function createBrowserTools(
     requiresApproval: () => ({ required: false }),
     execute: async (args: { milliseconds?: number; selector?: string }, context: ToolExecutionContext): Promise<ToolResult> => {
       const waitTarget = args.selector || args.milliseconds || 1000;
-      const data = await withAbortCleanup(browserService.waitFor(waitTarget), context);
+      const data = await browserService.waitFor(waitTarget, undefined, getActionOptions(context));
       return { success: true, data };
     },
   };
@@ -168,6 +163,7 @@ export function createBrowserTools(
     ): Promise<ToolResult> => {
       // 1. Capture screenshot via PlaywrightBrowserService
       const screenshot = await browserService.takeScreenshot({
+        ...getActionOptions(context),
         fullPage: args.fullPage,
         selector: args.selector,
         timeoutMs: context.timeoutMs ?? 10_000,

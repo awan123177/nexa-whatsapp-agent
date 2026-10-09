@@ -358,8 +358,14 @@ export class SupabaseRepository implements IDatabaseRepository {
   }
 
   async saveMemory(data: Omit<Memory, 'id' | 'created_at' | 'updated_at'>): Promise<Memory> {
+    const memoryMetadata = {
+      ...(typeof data.metadata === 'object' && data.metadata !== null ? data.metadata : {}),
+      confirmed: data.confirmed ?? true,
+    };
+
     const payload: Record<string, unknown> = {
       ...data,
+      metadata: memoryMetadata,
       updated_at: new Date().toISOString(),
     };
 

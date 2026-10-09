@@ -180,6 +180,7 @@ describe('NEXA Production Memory Schema Contract & Merchant Gating Suite', () =>
       // AI Provider simulates calling save_memory on step 1, which will fail
       let callCount = 0;
       const mockAIProvider: AIProvider = {
+        name: 'mock-ai',
         generateResponse: vi.fn().mockImplementation(async () => {
           callCount++;
           if (callCount === 1) {
@@ -201,7 +202,7 @@ describe('NEXA Production Memory Schema Contract & Merchant Gating Suite', () =>
         }),
       };
 
-      const toolRegistry = createDefaultToolRegistry(db);
+      const toolRegistry = createDefaultToolRegistry({ db });
       // Register a failing tool
       toolRegistry.register({
         name: 'failing_test_tool',
@@ -275,13 +276,14 @@ describe('NEXA Production Memory Schema Contract & Merchant Gating Suite', () =>
       });
 
       const mockAIProvider: AIProvider = {
+        name: 'mock-ai',
         generateResponse: vi.fn().mockResolvedValue({
           text: 'Hello! I am NEXA, your personal AI assistant. How can I help you today?',
           toolCalls: [],
         }),
       };
 
-      const toolRegistry = createDefaultToolRegistry(db);
+      const toolRegistry = createDefaultToolRegistry({ db });
       const orchestrator = new AgentOrchestrator(mockAIProvider, toolRegistry, db);
 
       await orchestrator.processMessage({
@@ -309,13 +311,14 @@ describe('NEXA Production Memory Schema Contract & Merchant Gating Suite', () =>
       });
 
       const mockAIProvider: AIProvider = {
+        name: 'mock-ai',
         generateResponse: vi.fn().mockResolvedValue({
           text: 'An API (Application Programming Interface) allows software systems to talk to each other.',
           toolCalls: [],
         }),
       };
 
-      const toolRegistry = createDefaultToolRegistry(db);
+      const toolRegistry = createDefaultToolRegistry({ db });
       const orchestrator = new AgentOrchestrator(mockAIProvider, toolRegistry, db);
 
       await orchestrator.processMessage({

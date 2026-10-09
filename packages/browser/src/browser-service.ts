@@ -22,13 +22,21 @@ import { validateBrowserUrl, detectCaptchaOrBotBlock, detectAuthenticationRequir
 import { computerUseResolver, ComputerUseResolver } from './computer-use-resolver.js';
 import { PermissionEngine } from '@nexa/security';
 
-export interface ScreenshotOptions {
+export interface BrowserActionOptions {
+  timeoutMs?: number;
+  signal?: AbortSignal;
+  sessionId?: string;
+  userId?: string;
+  taskId?: string;
+  requestId?: string;
+  toolCallId?: string;
+}
+
+export interface ScreenshotOptions extends BrowserActionOptions {
   fullPage?: boolean;
   selector?: string;
   type?: 'png' | 'jpeg';
   quality?: number;
-  timeoutMs?: number;
-  signal?: AbortSignal;
 }
 
 export interface ScreenshotResult {
@@ -37,12 +45,7 @@ export interface ScreenshotResult {
   base64: string;
 }
 
-export interface BrowserOpenOptions {
-  timeoutMs?: number;
-  signal?: AbortSignal;
-  sessionId?: string;
-  userId?: string;
-}
+export interface BrowserOpenOptions extends BrowserActionOptions {}
 
 function sanitizeUrlForLogs(targetUrl: string): string {
   try {
@@ -60,6 +63,87 @@ export class PlaywrightBrowserService {
   private activeUrl: string | null = null;
   private sessions: Map<string, BrowserSessionMetadata> = new Map();
   private activeSessionId: string = 'default';
+  private sessionLocks: Map<string, Promise<void>> = new Map();
+  private terminalTasks: Set<string> = new Set();
+
+  markTaskTerminal(taskId: string): void {
+    if (!taskId) return;
+    this.terminalTasks.add(taskId);
+    console.log(`[Browser] task_marked_terminal taskId=${taskId}`);
+  }
+
+  isTaskTerminal(taskId?: string): boolean {
+    return taskId ? this.terminalTasks.has(taskId) : false;
+  }
+
+  private async withSessionLock<T>(
+    sessionId: string,
+    operationName: string,
+    options: BrowserActionOptions | undefined,
+    action: () => Promise<T>
+  ): Promise<T> {
+    const taskId = options?.taskId;
+    if (this.isTaskTerminal(taskId)) {
+      console.log(`[Browser] late_result_discarded taskId=${taskId} operation=${operationName} reason="task_already_terminal"`);
+      throw new ToolExecutionError(operationName, `Task ${taskId} has already reached a terminal state; action discarded.`);
+    }
+
+    if (options?.signal?.aborted) {
+      console.log(`[Browser] action_aborted_early operation=${operationName} sessionId=${sessionId}`);
+      await this.cleanupPage().catch(() => {});
+      throw new ToolExecutionError(operationName, `Operation ${operationName} cancelled before lock acquisition.`);
+    }
+
+    const previousLock = this.sessionLocks.get(sessionId) || Promise.resolve();
+
+    let releaseLock: () => void;
+    const currentLock = new Promise<void>((resolve) => {
+      releaseLock = resolve;
+    });
+
+    this.sessionLocks.set(sessionId, currentLock);
+
+    try {
+      await previousLock;
+
+      if (this.isTaskTerminal(taskId)) {
+        console.log(`[Browser] late_result_discarded taskId=${taskId} operation=${operationName} reason="task_terminal_after_lock"`);
+        throw new ToolExecutionError(operationName, `Task ${taskId} became terminal while waiting for lock.`);
+      }
+
+      if (options?.signal?.aborted) {
+        console.log(`[Browser] action_aborted_after_lock operation=${operationName} sessionId=${sessionId}`);
+        await this.cleanupPage().catch(() => {});
+        throw new ToolExecutionError(operationName, `Operation ${operationName} was aborted while waiting for session lock.`);
+      }
+
+      let abortListener: (() => void) | null = null;
+      if (options?.signal) {
+        abortListener = () => {
+          console.log(`[Browser] abort_signal_fired operation=${operationName} sessionId=${sessionId}`);
+          this.cleanupPage().catch(() => {});
+        };
+        options.signal.addEventListener('abort', abortListener, { once: true });
+      }
+
+      try {
+        const result = await action();
+
+        if (this.isTaskTerminal(taskId) || options?.signal?.aborted) {
+          console.log(`[Browser] late_result_discarded taskId=${taskId} operation=${operationName} reason="aborted_or_terminal_after_run"`);
+          throw new ToolExecutionError(operationName, `Operation ${operationName} result discarded due to cancellation.`);
+        }
+
+        return result;
+      } finally {
+        if (abortListener && options?.signal) {
+          options.signal.removeEventListener('abort', abortListener);
+        }
+      }
+    } finally {
+      releaseLock!();
+    }
+  }
 
   getOrCreateSession(sessionId = 'default', userId?: string): BrowserSessionMetadata {
     let session = this.sessions.get(sessionId);
@@ -122,56 +206,68 @@ export class PlaywrightBrowserService {
     return { allowed: true };
   }
 
-  async verifyCart(sessionId = 'default', expectedItem?: string): Promise<BrowserCartState> {
-    console.log(`[Agent] verification_started step=cart target="${expectedItem || 'cart_items'}"`);
-    const session = this.getOrCreateSession(sessionId);
+  async verifyCart(
+    sessionId = 'default',
+    expectedItem?: string,
+    options?: BrowserActionOptions
+  ): Promise<BrowserCartState> {
+    const effectiveSessionId = options?.sessionId || sessionId || this.activeSessionId || 'default';
+    return this.withSessionLock(effectiveSessionId, 'verify_cart', options, async () => {
+      console.log(`[Agent] verification_started step=cart target="${expectedItem || 'cart_items'}"`);
+      const session = this.getOrCreateSession(effectiveSessionId);
 
-    const page = this.page;
-    let cartItems: CartItem[] = [];
-    let totalPriceMinor = 0;
+      const page = this.page;
+      let cartItems: CartItem[] = [];
+      let totalPriceMinor = 0;
 
-    if (page && !page.isClosed()) {
-      try {
-        const pageContent = await page.evaluate(() => document.body.innerText || '');
-        const lines = pageContent.split('\n').map((l) => l.trim()).filter(Boolean);
+      if (page && !page.isClosed()) {
+        try {
+          const pageContent = await page.evaluate(() => document.body.innerText || '');
+          const lines = pageContent.split('\n').map((l) => l.trim()).filter(Boolean);
 
-        if (expectedItem) {
-          const found = lines.some((l) => l.toLowerCase().includes(expectedItem.toLowerCase()));
-          if (found) {
-            cartItems.push({
-              name: expectedItem,
-              quantity: 1,
-            });
+          if (expectedItem) {
+            const found = lines.some((l) => l.toLowerCase().includes(expectedItem.toLowerCase()));
+            if (found) {
+              cartItems.push({
+                name: expectedItem,
+                quantity: 1,
+              });
+            }
           }
-        }
 
-        const priceMatch = pageContent.match(/(?:total|subtotal|grand total|amount|price)[:\s]*([₹$€]?\s*[\d,]+(?:\.\d{2})?)/i);
-        if (priceMatch && priceMatch[1]) {
-          const cleanedPrice = priceMatch[1].replace(/[^0-9.]/g, '');
-          const parsed = parseFloat(cleanedPrice);
-          if (!isNaN(parsed)) {
-            totalPriceMinor = Math.round(parsed * 100);
+          const priceMatch = pageContent.match(/(?:total|subtotal|grand total|amount|price)[:\s]*([₹$€]?\s*[\d,]+(?:\.\d{2})?)/i);
+          if (priceMatch && priceMatch[1]) {
+            const cleanedPrice = priceMatch[1].replace(/[^0-9.]/g, '');
+            const parsed = parseFloat(cleanedPrice);
+            if (!isNaN(parsed)) {
+              totalPriceMinor = Math.round(parsed * 100);
+            }
           }
-        }
-      } catch {}
-    }
+        } catch {}
+      }
 
-    if (expectedItem && cartItems.length === 0 && session.cartState?.items.length) {
-      cartItems = session.cartState.items;
-      totalPriceMinor = session.cartState.totalPriceMinor || 0;
-    }
+      if (expectedItem && cartItems.length === 0 && session.cartState?.items.length) {
+        cartItems = session.cartState.items;
+        totalPriceMinor = session.cartState.totalPriceMinor || 0;
+      }
 
-    const verifiedState: BrowserCartState = {
-      items: cartItems.length > 0 ? cartItems : (session.cartState?.items || []),
-      totalPriceMinor: totalPriceMinor || (session.cartState?.totalPriceMinor || 0),
-      currency: session.cartState?.currency || 'INR',
-      lastVerifiedAt: Date.now(),
-    };
+      const verifiedState: BrowserCartState = {
+        items: cartItems.length > 0 ? cartItems : (session.cartState?.items || []),
+        totalPriceMinor: totalPriceMinor || (session.cartState?.totalPriceMinor || 0),
+        currency: session.cartState?.currency || 'INR',
+        lastVerifiedAt: Date.now(),
+      };
 
-    session.cartState = verifiedState;
-    console.log(`[ComputerUse] page_state_changed state=cart_verified items_count=${verifiedState.items.length}`);
-    console.log(`[Agent] verification_passed step=cart items_count=${verifiedState.items.length}`);
-    return verifiedState;
+      if (this.isTaskTerminal(options?.taskId) || options?.signal?.aborted) {
+        console.log(`[Browser] late_result_discarded taskId=${options?.taskId} operation="verifyCart"`);
+        return session.cartState || verifiedState;
+      }
+
+      session.cartState = verifiedState;
+      console.log(`[ComputerUse] page_state_changed state=cart_verified items_count=${verifiedState.items.length}`);
+      console.log(`[Agent] verification_passed step=cart items_count=${verifiedState.items.length}`);
+      return verifiedState;
+    });
   }
 
   async restoreSession(sessionId = 'default'): Promise<{
@@ -326,10 +422,35 @@ export class PlaywrightBrowserService {
   }
 
   async openPage(targetUrl: string, options?: BrowserOpenOptions): Promise<BrowserOpenResult> {
+    const sessionId = options?.sessionId || this.activeSessionId || 'default';
+    try {
+      return await this.withSessionLock(sessionId, 'browser_open', options, async () => {
+        return this.internalOpenPage(targetUrl, sessionId, options);
+      });
+    } catch (err: any) {
+      const isTimeout =
+        options?.signal?.aborted ||
+        err.name === 'ToolTimeoutError' ||
+        err.name === 'TimeoutError' ||
+        (err.message && err.message.toLowerCase().includes('timeout')) ||
+        (err.message && err.message.toLowerCase().includes('abort'));
+
+      return {
+        success: false,
+        errorType: isTimeout ? 'TIMEOUT' : 'NAVIGATION_FAILED',
+        message: err.message || 'Browser navigation failed',
+      };
+    }
+  }
+
+  private async internalOpenPage(
+    targetUrl: string,
+    sessionId: string,
+    options?: BrowserOpenOptions
+  ): Promise<BrowserOpenResult> {
     const startNav = Date.now();
     const timeoutMs = options?.timeoutMs ?? BROWSER_NAVIGATION_TIMEOUT_MS;
     const sanitizedLogUrl = sanitizeUrlForLogs(targetUrl);
-    const sessionId = options?.sessionId || this.activeSessionId || 'default';
     const session = this.getOrCreateSession(sessionId, options?.userId);
     console.log(`[Browser] open_start url="${sanitizedLogUrl}" timeout_ms=${timeoutMs}`);
     console.log(`[ComputerUse] navigation url="${sanitizedLogUrl}"`);
@@ -506,7 +627,20 @@ export class PlaywrightBrowserService {
     }
   }
 
-  async readPage(selector?: string): Promise<{ text: string; url: string; observation?: PageObservation }> {
+  async readPage(
+    selector?: string,
+    options?: BrowserActionOptions
+  ): Promise<{ text: string; url: string; observation?: PageObservation }> {
+    const sessionId = options?.sessionId || this.activeSessionId || 'default';
+    return this.withSessionLock(sessionId, 'browser_read', options, async () => {
+      return this.internalReadPage(selector, options);
+    });
+  }
+
+  private async internalReadPage(
+    selector?: string,
+    _options?: BrowserActionOptions
+  ): Promise<{ text: string; url: string; observation?: PageObservation }> {
     const readStart = Date.now();
     const page = await this.ensurePage();
     if (!this.activeUrl) {
@@ -555,7 +689,18 @@ export class PlaywrightBrowserService {
   async clickElement(
     selector: string,
     sessionId = 'default',
-    options?: { timeoutMs?: number }
+    options?: BrowserActionOptions
+  ): Promise<{ success: boolean; url: string; preventedDuplicate?: boolean }> {
+    const effectiveSessionId = options?.sessionId || sessionId || this.activeSessionId || 'default';
+    return this.withSessionLock(effectiveSessionId, 'browser_click', options, async () => {
+      return this.internalClickElement(selector, effectiveSessionId, options);
+    });
+  }
+
+  private async internalClickElement(
+    selector: string,
+    sessionId = 'default',
+    options?: BrowserActionOptions
   ): Promise<{ success: boolean; url: string; preventedDuplicate?: boolean }> {
     const session = this.getOrCreateSession(sessionId);
     const check = this.canExecuteAction(sessionId, 'click', selector);
@@ -621,7 +766,19 @@ export class PlaywrightBrowserService {
     selector: string,
     text: string,
     sessionId = 'default',
-    options?: { timeoutMs?: number }
+    options?: BrowserActionOptions
+  ): Promise<{ success: boolean; recovered?: boolean }> {
+    const effectiveSessionId = options?.sessionId || sessionId || this.activeSessionId || 'default';
+    return this.withSessionLock(effectiveSessionId, 'browser_type', options, async () => {
+      return this.internalTypeText(selector, text, effectiveSessionId, options);
+    });
+  }
+
+  private async internalTypeText(
+    selector: string,
+    text: string,
+    sessionId = 'default',
+    options?: BrowserActionOptions
   ): Promise<{ success: boolean; recovered?: boolean }> {
     const session = this.getOrCreateSession(sessionId);
     const page = await this.ensurePage();
@@ -713,7 +870,7 @@ export class PlaywrightBrowserService {
     selector: string,
     text: string,
     sessionId = 'default',
-    options?: { timeoutMs?: number }
+    options?: BrowserActionOptions
   ): Promise<{ success: boolean; recovered?: boolean }> {
     return this.typeText(selector, text, sessionId, options);
   }
@@ -721,7 +878,18 @@ export class PlaywrightBrowserService {
   async pressKey(
     key: string,
     sessionId = 'default',
-    options?: { timeoutMs?: number }
+    options?: BrowserActionOptions
+  ): Promise<{ success: boolean }> {
+    const effectiveSessionId = options?.sessionId || sessionId || this.activeSessionId || 'default';
+    return this.withSessionLock(effectiveSessionId, 'browser_press', options, async () => {
+      return this.internalPressKey(key, effectiveSessionId, options);
+    });
+  }
+
+  private async internalPressKey(
+    key: string,
+    sessionId = 'default',
+    options?: BrowserActionOptions
   ): Promise<{ success: boolean }> {
     const page = await this.ensurePage();
     const timeoutMs = options?.timeoutMs ?? BROWSER_ACTION_TIMEOUT_MS;
@@ -753,7 +921,19 @@ export class PlaywrightBrowserService {
     selector: string,
     value: string,
     sessionId = 'default',
-    options?: { timeoutMs?: number }
+    options?: BrowserActionOptions
+  ): Promise<{ success: boolean }> {
+    const effectiveSessionId = options?.sessionId || sessionId || this.activeSessionId || 'default';
+    return this.withSessionLock(effectiveSessionId, 'browser_select', options, async () => {
+      return this.internalSelectOption(selector, value, effectiveSessionId, options);
+    });
+  }
+
+  private async internalSelectOption(
+    selector: string,
+    value: string,
+    sessionId = 'default',
+    options?: BrowserActionOptions
   ): Promise<{ success: boolean }> {
     const page = await this.ensurePage();
     const timeoutMs = options?.timeoutMs ?? BROWSER_ACTION_TIMEOUT_MS;
@@ -786,7 +966,18 @@ export class PlaywrightBrowserService {
   async hoverElement(
     selector: string,
     sessionId = 'default',
-    options?: { timeoutMs?: number }
+    options?: BrowserActionOptions
+  ): Promise<{ success: boolean }> {
+    const effectiveSessionId = options?.sessionId || sessionId || this.activeSessionId || 'default';
+    return this.withSessionLock(effectiveSessionId, 'browser_hover', options, async () => {
+      return this.internalHoverElement(selector, effectiveSessionId, options);
+    });
+  }
+
+  private async internalHoverElement(
+    selector: string,
+    sessionId = 'default',
+    options?: BrowserActionOptions
   ): Promise<{ success: boolean }> {
     const page = await this.ensurePage();
     const timeoutMs = options?.timeoutMs ?? BROWSER_ACTION_TIMEOUT_MS;
@@ -852,7 +1043,19 @@ export class PlaywrightBrowserService {
 
   async adaptiveSearch(
     query: string,
-    sessionId = 'default'
+    sessionId = 'default',
+    options?: BrowserActionOptions
+  ): Promise<{ success: boolean; products: ShoppingProduct[]; query: string; url: string }> {
+    const effectiveSessionId = options?.sessionId || sessionId || this.activeSessionId || 'default';
+    return this.withSessionLock(effectiveSessionId, 'adaptive_search', options, async () => {
+      return this.internalAdaptiveSearch(query, effectiveSessionId, options);
+    });
+  }
+
+  private async internalAdaptiveSearch(
+    query: string,
+    sessionId = 'default',
+    _options?: BrowserActionOptions
   ): Promise<{ success: boolean; products: ShoppingProduct[]; query: string; url: string }> {
     const page = await this.ensurePage();
     const start = Date.now();
@@ -905,7 +1108,24 @@ export class PlaywrightBrowserService {
     };
   }
 
-  async scrollPage(direction: 'up' | 'down', amount = 500): Promise<{ scrolled: boolean }> {
+  async scrollPage(
+    direction: 'up' | 'down',
+    amount = 500,
+    sessionId = 'default',
+    options?: BrowserActionOptions
+  ): Promise<{ scrolled: boolean }> {
+    const effectiveSessionId = options?.sessionId || sessionId || this.activeSessionId || 'default';
+    return this.withSessionLock(effectiveSessionId, 'browser_scroll', options, async () => {
+      return this.internalScrollPage(direction, amount, effectiveSessionId, options);
+    });
+  }
+
+  private async internalScrollPage(
+    direction: 'up' | 'down',
+    amount = 500,
+    _sessionId = 'default',
+    _options?: BrowserActionOptions
+  ): Promise<{ scrolled: boolean }> {
     const page = await this.ensurePage();
     try {
       const scrollY = direction === 'down' ? amount : -amount;
@@ -916,7 +1136,22 @@ export class PlaywrightBrowserService {
     }
   }
 
-  async waitFor(selectorOrMs: string | number): Promise<{ success: boolean }> {
+  async waitFor(
+    selectorOrMs: string | number,
+    sessionId = 'default',
+    options?: BrowserActionOptions
+  ): Promise<{ success: boolean }> {
+    const effectiveSessionId = options?.sessionId || sessionId || this.activeSessionId || 'default';
+    return this.withSessionLock(effectiveSessionId, 'browser_wait', options, async () => {
+      return this.internalWaitFor(selectorOrMs, effectiveSessionId, options);
+    });
+  }
+
+  private async internalWaitFor(
+    selectorOrMs: string | number,
+    _sessionId = 'default',
+    _options?: BrowserActionOptions
+  ): Promise<{ success: boolean }> {
     const page = await this.ensurePage();
     try {
       if (typeof selectorOrMs === 'number') {
@@ -940,6 +1175,13 @@ export class PlaywrightBrowserService {
   }
 
   async takeScreenshot(options?: ScreenshotOptions): Promise<ScreenshotResult> {
+    const sessionId = options?.sessionId || this.activeSessionId || 'default';
+    return this.withSessionLock(sessionId, 'browser_screenshot', options, async () => {
+      return this.internalTakeScreenshot(options);
+    });
+  }
+
+  private async internalTakeScreenshot(options?: ScreenshotOptions): Promise<ScreenshotResult> {
     console.log('[Browser] screenshot_start');
     if (!this.activeUrl) {
       throw new ToolExecutionError('browser_screenshot', 'No page currently open. Use browser_open first.');

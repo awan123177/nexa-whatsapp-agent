@@ -18,6 +18,10 @@ export interface ToolExecutionContext {
   recipientPhone?: string;
   abortSignal?: AbortSignal;
   timeoutMs?: number;
+  requestId?: string;
+  taskId?: string;
+  toolCallId?: string;
+  sessionId?: string;
 }
 
 export interface ToolResult<T = unknown> {

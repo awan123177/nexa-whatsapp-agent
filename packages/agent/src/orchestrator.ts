@@ -801,7 +801,9 @@ export class AgentOrchestrator {
 
       // Case A: Model returned plain text without calling any tools
       if (!aiResponse.toolCalls || aiResponse.toolCalls.length === 0) {
-        console.log(`[Agent] step_completed step=${currentStep}`);
+        if (!latestExecutionToolFailed) {
+          console.log(`[Agent] step_completed step=${currentStep}`);
+        }
         finalReply = aiResponse.text;
         break;
       }
@@ -969,8 +971,24 @@ export class AgentOrchestrator {
         const configuredToolTimeout = resolveToolTimeout(tcName, this.toolTimeoutMs);
         const elapsedSinceStart = Date.now() - requestStartTime;
         const remainingUntilDeadline = effectiveDeadlineMs - elapsedSinceStart;
+
+        // Hard minimum meaningful tool budget (at least 3000ms). Never launch a 1-second doomed tool call!
+        const MIN_MEANINGFUL_TOOL_BUDGET_MS = 3000;
+        if (remainingUntilDeadline < MIN_MEANINGFUL_TOOL_BUDGET_MS) {
+          console.log(`[Agent] deadline_insufficient remaining_ms=${remainingUntilDeadline} min_required_ms=${MIN_MEANINGFUL_TOOL_BUDGET_MS} tool=${tcName}`);
+          deadlineApproaching = true;
+          if (stateMachine.canTransitionTo('FAILED')) {
+            stateMachine.transitionTo('FAILED');
+          }
+          console.log(`[Agent] task_failed reason="deadline_exceeded" steps=${currentStep}`);
+          if (this.browserService && currentActiveTaskId) {
+            this.browserService.markTaskTerminal(currentActiveTaskId);
+          }
+          break;
+        }
+
         // Keep 1500ms safety buffer for response serialization / network return
-        const maxAvailableForTool = Math.max(1000, remainingUntilDeadline - 1500);
+        const maxAvailableForTool = Math.max(MIN_MEANINGFUL_TOOL_BUDGET_MS, remainingUntilDeadline - 1500);
         const effectiveTimeoutMs = Math.min(configuredToolTimeout, maxAvailableForTool);
 
         // Check 4: Execute tool with cancellation AbortController
@@ -999,6 +1017,10 @@ export class AgentOrchestrator {
 
         const toolExecutionContext: ToolExecutionContext = {
           ...context,
+          requestId: currentRequestId,
+          taskId: currentActiveTaskId,
+          toolCallId: tc.id,
+          sessionId: (context as any).sessionId || context.user?.id || 'default',
           abortSignal: abortController.signal,
           timeoutMs: effectiveTimeoutMs,
         };
@@ -1083,6 +1105,9 @@ export class AgentOrchestrator {
           if (!abortController.signal.aborted) {
             abortController.abort(err);
           }
+          if (this.browserService) {
+            await this.browserService.cleanupPage().catch(() => {});
+          }
 
           // Check if this was an intentional pause for user confirmation!
           if (err instanceof ApprovalRequiredError || err?.name === 'ApprovalRequiredError') {
@@ -1109,6 +1134,9 @@ export class AgentOrchestrator {
 
           // Tool execution error / timeout
           if (stateMachine.isTerminal() || taskAbortController.signal.aborted) {
+            if (this.browserService && currentActiveTaskId) {
+              this.browserService.markTaskTerminal(currentActiveTaskId);
+            }
             console.log(`[Agent] tool_result_discarded tool=${tcName} reason="terminal_or_aborted"`);
             break;
           }
@@ -1231,19 +1259,31 @@ export class AgentOrchestrator {
     }
 
     if (deadlineApproaching) {
+      if (this.browserService && currentActiveTaskId) {
+        this.browserService.markTaskTerminal(currentActiveTaskId);
+      }
       // Already transitioned to FAILED and logged [Agent] task_failed reason="deadline_approaching"
     } else if (latestExecutionToolFailed) {
       if (stateMachine.canTransitionTo('FAILED')) {
         stateMachine.transitionTo('FAILED');
+      }
+      if (this.browserService && currentActiveTaskId) {
+        this.browserService.markTaskTerminal(currentActiveTaskId);
       }
       console.log(`[Agent] task_failed reason="action_execution_failed" steps=${currentStep}`);
     } else if (modelFailed) {
       if (stateMachine.canTransitionTo('FAILED')) {
         stateMachine.transitionTo('FAILED');
       }
+      if (this.browserService && currentActiveTaskId) {
+        this.browserService.markTaskTerminal(currentActiveTaskId);
+      }
     } else if (currentStep >= effectiveMaxSteps && !finalReply) {
       if (stateMachine.canTransitionTo('FAILED')) {
         stateMachine.transitionTo('FAILED');
+      }
+      if (this.browserService && currentActiveTaskId) {
+        this.browserService.markTaskTerminal(currentActiveTaskId);
       }
       console.log(`[Agent] task_failed reason="max_steps_reached" steps=${currentStep}`);
     } else if (finalReply && !modelFailed && !latestExecutionToolFailed && !deadlineApproaching) {

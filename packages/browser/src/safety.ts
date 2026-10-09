@@ -189,6 +189,23 @@ export function detectCaptchaOrBotBlock(pageContent: string): {
     };
   }
 
+  // 6. Amazon Robot Check & CAPTCHA
+  if (
+    contentLower.includes('enter the characters you see below') ||
+    contentLower.includes('type the characters you see in this image') ||
+    contentLower.includes('sorry, we just need to make sure you\'re not a robot') ||
+    contentLower.includes('validatecaptcha') ||
+    contentLower.includes('amazon.com/errors/validatecaptcha')
+  ) {
+    console.log('[ComputerUse] challenge_detected type="Amazon Robot Check"');
+    return {
+      detected: true,
+      type: 'Amazon Robot Check',
+      message:
+        'Amazon robot check / CAPTCHA detected. Automated browsing cannot bypass this challenge and human verification is required.',
+    };
+  }
+
   return { detected: false };
 }
 
