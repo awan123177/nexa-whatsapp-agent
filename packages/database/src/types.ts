@@ -40,6 +40,7 @@ export interface IDatabaseRepository {
   // Approvals
   createApproval(data: Omit<Approval, 'id' | 'requested_at'>): Promise<Approval>;
   getPendingApproval(conversationId: string): Promise<Approval | null>;
+  getLatestApproval(conversationId: string): Promise<Approval | null>;
   updateApprovalStatus(approvalId: string, status: ApprovalStatus, respondedAt?: string): Promise<Approval>;
 
   // Memories

@@ -314,6 +314,22 @@ export class SupabaseRepository implements IDatabaseRepository {
     return (data as Approval) || null;
   }
 
+  async getLatestApproval(conversationId: string): Promise<Approval | null> {
+    const { data, error } = await this.client
+      .from('approvals')
+      .select('*')
+      .eq('conversation_id', conversationId)
+      .order('requested_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    if (error) {
+      throw new Error(`Failed to get latest approval: ${error.message}`);
+    }
+
+    return (data as Approval) || null;
+  }
+
   async updateApprovalStatus(
     approvalId: string,
     status: ApprovalStatus,

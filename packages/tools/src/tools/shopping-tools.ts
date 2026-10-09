@@ -24,7 +24,7 @@ export interface ProductItem {
 }
 
 // In-memory user active shopping cart state
-interface UserCartRecord {
+export interface UserCartRecord {
   items: Array<{ name: string; priceMinor: number; quantity: number; store: string }>;
   store: string;
   selectedAddress?: SavedAddress | string;
@@ -32,8 +32,37 @@ interface UserCartRecord {
 }
 const userCarts = new Map<string, UserCartRecord>();
 
+export function clearUserCart(userId: string): void {
+  userCarts.delete(userId);
+}
+
+export function getUserCart(userId: string): UserCartRecord | undefined {
+  return userCarts.get(userId);
+}
+
 // Verified orders ledger (prevents fabricated orders)
 const verifiedOrders = new Map<string, OrderDetails>();
+
+export const shoppingAddToCartParametersSchema = z.object({
+  productName: z.string().describe('Name of product to add'),
+  price: z.preprocess((val) => {
+    if (typeof val === 'string') {
+      const parsed = parseFloat(val.replace(/[^0-9.]/g, ''));
+      return isNaN(parsed) ? 0 : parsed;
+    }
+    return typeof val === 'number' ? val : 0;
+  }, z.number().min(0)).describe('Product price (e.g. 40 for ₹40)'),
+  store: z.string().optional().describe('Store or platform name (e.g. Blinkit, Amazon, Swiggy Instamart)'),
+  merchant: z.string().optional().describe('Merchant or platform name alias'),
+  quantity: z.preprocess((val) => {
+    if (typeof val === 'string') {
+      const parsed = parseInt(val, 10);
+      return isNaN(parsed) ? 1 : parsed;
+    }
+    return typeof val === 'number' ? Math.round(val) : 1;
+  }, z.number().int().min(1).max(50).default(1)).describe('Quantity to add (integer 1-50)'),
+  currency: z.string().default('INR').describe('Currency code'),
+});
 
 export function createShoppingTools(
   searchProvider: SearchProvider = new DuckDuckGoSearchProvider(),
@@ -104,9 +133,34 @@ export function createShoppingTools(
 
       let products: ProductItem[] = [];
 
-      // 1. If active browser page is on merchant, perform adaptive search via browser UI!
-      if (browserService && browserService.getActiveUrl()) {
+      // 1. Real browser navigation & adaptive search when browserService is available
+      if (browserService) {
+        const canonicalUrl = resolved?.canonicalUrl || 'https://www.swiggy.com/instamart';
         try {
+          const currentUrl = browserService.getActiveUrl();
+          let hostname = '';
+          try {
+            hostname = new URL(canonicalUrl).hostname;
+          } catch {}
+
+          const isAlreadyOnStore = currentUrl && hostname && currentUrl.includes(hostname);
+          if (!isAlreadyOnStore) {
+            console.log(`[Shopping] browser_navigation_start merchant=${storeName} url="${canonicalUrl}"`);
+            const openRes = await browserService.openPage(canonicalUrl);
+            if (openRes.success) {
+              await browserService.waitForPageReady();
+              const pageState = await browserService.inspectPageState();
+              if (pageState.challengeDetected) {
+                console.log(`[Shopping] bot_challenge_detected merchant=${storeName} type="${pageState.challengeType}"`);
+                return {
+                  success: false,
+                  error: `Merchant ${storeName} requires human verification (${pageState.challengeType || 'CAPTCHA'}).`,
+                  userFacingMessage: `${storeName} presented a verification check. Please solve it in your browser or try again shortly.`,
+                };
+              }
+            }
+          }
+
           const browserRes = await browserService.adaptiveSearch(args.query);
           if (browserRes.success && browserRes.products.length > 0) {
             products = browserRes.products.map((p) => ({
@@ -117,8 +171,8 @@ export function createShoppingTools(
               snippet: p.snippet,
             }));
           }
-        } catch {
-          // Fall through to bounded web search
+        } catch (err: any) {
+          console.log(`[Shopping] browser_search_fallback merchant=${storeName} reason="${err.message}"`);
         }
       }
 
@@ -228,14 +282,7 @@ export function createShoppingTools(
     name: 'shopping_add_to_cart',
     description: 'Adds a selected item to the user shopping cart on the specified store.',
     riskLevel: 'low_risk',
-    parametersSchema: z.object({
-      productName: z.string().describe('Name of product to add'),
-      price: z.number().describe('Product price (e.g. 40 for ₹40)'),
-      store: z.string().optional().describe('Store or platform name (e.g. Blinkit, Amazon, Swiggy Instamart)'),
-      merchant: z.string().optional().describe('Merchant or platform name alias'),
-      quantity: z.number().default(1).describe('Quantity to add'),
-      currency: z.string().default('INR').describe('Currency code'),
-    }),
+    parametersSchema: shoppingAddToCartParametersSchema,
     requiresApproval: () => ({ required: false }),
     execute: async (
       args: { productName: string; price: number; store?: string; merchant?: string; quantity: number; currency: string },
@@ -536,6 +583,51 @@ export function createShoppingTools(
           { ...args, store: storeName, amount: amountMinor / 100, itemSummary, deliveryAddress },
           'high'
         );
+      }
+
+      // 2. Server Boundary Enforcement: Verify an unconsumed, matching approved record exists in DB
+      if (db) {
+        const conversationId = context.conversation?.id;
+        const latestApproval = conversationId ? await db.getLatestApproval(conversationId) : null;
+        const isApproved =
+          latestApproval &&
+          latestApproval.status === 'approved' &&
+          latestApproval.metadata?.consumed !== true &&
+          new Date(latestApproval.expires_at).getTime() > Date.now() &&
+          (latestApproval.tool_name === 'shopping_checkout' || latestApproval.tool_name === 'request_user_confirmation');
+
+        if (!isApproved) {
+          console.log(`[Shopping] checkout_blocked reason="no_valid_unconsumed_approval"`);
+          throw new ApprovalRequiredError(
+            `*Order Confirmation Required*\n\n` +
+              `• *Action*: Place Purchase Order\n` +
+              `• *Merchant*: ${storeName}\n` +
+              `• *Items*: ${itemSummary}\n` +
+              `• *Delivery Address*: ${deliveryAddress}\n` +
+              `• *TOTAL*: *${formattedAmount}*\n\n` +
+              `Previous approval was expired, missing, or already consumed. Please confirm again.`,
+            'shopping_checkout',
+            { ...args, store: storeName, amount: amountMinor / 100, itemSummary, deliveryAddress },
+            'high'
+          );
+        }
+
+        // Verify merchant matches
+        const appArgs = (latestApproval.arguments || {}) as Record<string, any>;
+        const approvedStore = (appArgs.store || appArgs.merchant || '').toLowerCase();
+        if (approvedStore && approvedStore !== storeName.toLowerCase()) {
+          console.log(`[Shopping] checkout_blocked reason="store_mismatch" expected="${approvedStore}" actual="${storeName}"`);
+          throw new Error(`Approval was for merchant "${approvedStore}", but checkout was attempted for "${storeName}".`);
+        }
+
+        // Mark consumed so it cannot be reused!
+        if (latestApproval.metadata) {
+          latestApproval.metadata.consumed = true;
+          latestApproval.metadata.consumed_at = new Date().toISOString();
+        } else {
+          latestApproval.metadata = { consumed: true, consumed_at: new Date().toISOString() };
+        }
+        await db.updateApprovalStatus(latestApproval.id, 'approved', new Date().toISOString()).catch(() => {});
       }
 
       console.log(`[Agent] execution_started action=shopping_checkout merchant=${storeName}`);

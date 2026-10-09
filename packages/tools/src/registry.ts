@@ -174,6 +174,31 @@ export class ToolRegistry {
   }
 
   /**
+   * Recursively unwraps modifiers like ZodOptional, ZodNullable, ZodDefault, ZodEffects
+   */
+  private unwrapZod(zodType: z.ZodTypeAny): { unwrapped: z.ZodTypeAny; isOptional: boolean } {
+    let curr = zodType;
+    let isOptional = false;
+    while (true) {
+      if (curr instanceof z.ZodOptional) {
+        isOptional = true;
+        curr = curr.unwrap();
+      } else if (curr instanceof z.ZodNullable) {
+        isOptional = true;
+        curr = curr.unwrap();
+      } else if (curr instanceof z.ZodDefault) {
+        isOptional = true;
+        curr = (curr as any)._def.innerType;
+      } else if (curr instanceof z.ZodEffects) {
+        curr = (curr as any)._def.schema;
+      } else {
+        break;
+      }
+    }
+    return { unwrapped: curr, isOptional };
+  }
+
+  /**
    * Helper to convert basic Zod schemas into JSON Schema for Gemini
    */
   private zodToJsonSchema(schema: z.ZodType<any>): {
@@ -183,17 +208,13 @@ export class ToolRegistry {
     const properties: Record<string, unknown> = {};
     const required: string[] = [];
 
-    if (schema instanceof z.ZodObject) {
-      const shape = schema.shape;
+    const { unwrapped: unwrappedSchema } = this.unwrapZod(schema);
+
+    if (unwrappedSchema instanceof z.ZodObject) {
+      const shape = unwrappedSchema.shape;
       for (const [key, value] of Object.entries(shape)) {
         const zodProp = value as z.ZodTypeAny;
-        let isOptional = false;
-        let unwrapped = zodProp;
-
-        if (unwrapped instanceof z.ZodOptional) {
-          isOptional = true;
-          unwrapped = unwrapped.unwrap();
-        }
+        const { unwrapped, isOptional } = this.unwrapZod(zodProp);
 
         if (!isOptional) {
           required.push(key);
@@ -207,35 +228,46 @@ export class ToolRegistry {
   }
 
   private zodTypeToJsonType(zodType: z.ZodTypeAny): Record<string, unknown> {
-    if (zodType instanceof z.ZodString) {
-      return { type: 'string', description: zodType.description || '' };
+    const { unwrapped } = this.unwrapZod(zodType);
+
+    if (unwrapped instanceof z.ZodString) {
+      return { type: 'string', description: unwrapped.description || '' };
     }
-    if (zodType instanceof z.ZodNumber) {
-      return { type: 'number', description: zodType.description || '' };
+    if (unwrapped instanceof z.ZodNumber) {
+      return { type: 'number', description: unwrapped.description || '' };
     }
-    if (zodType instanceof z.ZodBoolean) {
-      return { type: 'boolean', description: zodType.description || '' };
+    if (unwrapped instanceof z.ZodBoolean) {
+      return { type: 'boolean', description: unwrapped.description || '' };
     }
-    if (zodType instanceof z.ZodArray) {
+    if (unwrapped instanceof z.ZodArray) {
       return {
         type: 'array',
-        items: this.zodTypeToJsonType((zodType as any).element),
+        items: this.zodTypeToJsonType((unwrapped as any).element),
+        description: unwrapped.description || '',
       };
     }
-    if (zodType instanceof z.ZodEnum) {
+    if (unwrapped instanceof z.ZodEnum) {
       return {
         type: 'string',
-        enum: (zodType as any)._def.values,
+        enum: (unwrapped as any)._def.values,
+        description: unwrapped.description || '',
       };
     }
-    if (zodType instanceof z.ZodObject) {
-      const inner = this.zodToJsonSchema(zodType);
+    if (unwrapped instanceof z.ZodObject) {
+      const inner = this.zodToJsonSchema(unwrapped);
       return {
         type: 'object',
         properties: inner.properties,
         required: inner.required,
+        description: unwrapped.description || '',
       };
     }
-    return { type: 'string' };
+    if (unwrapped instanceof z.ZodRecord) {
+      return {
+        type: 'object',
+        description: unwrapped.description || '',
+      };
+    }
+    return { type: 'string', description: unwrapped.description || '' };
   }
 }

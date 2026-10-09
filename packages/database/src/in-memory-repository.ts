@@ -265,6 +265,13 @@ export class InMemoryRepository implements IDatabaseRepository {
     );
   }
 
+  async getLatestApproval(conversationId: string): Promise<Approval | null> {
+    const list = Array.from(this.approvals.values())
+      .filter((a) => a.conversation_id === conversationId)
+      .sort((a, b) => new Date(b.requested_at).getTime() - new Date(a.requested_at).getTime());
+    return list[0] || null;
+  }
+
   async updateApprovalStatus(
     approvalId: string,
     status: ApprovalStatus,

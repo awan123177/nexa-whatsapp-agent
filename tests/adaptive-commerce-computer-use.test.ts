@@ -333,9 +333,22 @@ describe('NEXA Adaptive Computer-Use & Commerce Execution Suite', () => {
     }
 
     // K. Execute confirmed checkout
+    const conv = await db.getOrCreateActiveConversation(user.id);
+    await db.createApproval({
+      conversation_id: conv.id,
+      user_id: user.id,
+      tool_name: 'shopping_checkout',
+      arguments: { store: 'Swiggy Instamart', amount: 65 },
+      summary: 'Swiggy Instamart order',
+      impact_level: 'high',
+      status: 'approved',
+      expires_at: new Date(Date.now() + 60000).toISOString(),
+      metadata: {},
+    });
+
     const checkoutConfirmedRes = await checkoutTool.execute(
       { merchant: 'Swiggy Instamart' },
-      { ...context, isUserConfirmed: true }
+      { ...context, conversation: conv, isUserConfirmed: true }
     );
     expect(checkoutConfirmedRes.success).toBe(true);
     const orderId = (checkoutConfirmedRes.data as any).orderId;

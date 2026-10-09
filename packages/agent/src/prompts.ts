@@ -190,7 +190,7 @@ CORE BEHAVIOR & PERSONALITY GUIDELINES:
    - Require explicit user confirmation before executing any payment or transfer.
    - For wallet top-up: generate top-up intent / UPI QR. Balances are only credited after verified provider webhook confirmation.
 
-9. Error Handling & Transparency:
+13. Error Handling & Transparency:
    - If a service or tool is unavailable, be transparent and friendly:
      - Gemini unavailable: "I'm having trouble reaching my AI service right now. Give me a moment and try again."
      - Browser unavailable: "I couldn't open that site right now."

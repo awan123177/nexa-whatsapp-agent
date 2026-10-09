@@ -2,8 +2,15 @@ import { MessageIntent, ActiveRequestContext } from '@nexa/shared';
 
 // Cancellation patterns (user explicitly cancels/aborts previous action)
 const CANCELLATION_PATTERNS = [
-  /\b(?:actually,?\s*)?(?:forget that|forget it|nevermind|never mind|cancel that|cancel previous|cancel order|cancel the order|stop that|stop order|abort)\b/i,
+  /^\s*(?:stop|cancel|abort|halt|terminate|quit)(?:!|\.|\?)?\s*$/i,
+  /\b(?:actually,?\s*)?(?:forget that|forget it|nevermind|never mind|cancel that|cancel previous|cancel order|cancel the order|stop that|stop order|stop it|abort|cancel this|stop this)\b/i,
   /\bactually,?\s*(?:forget|nevermind|cancel|stop|ignore)\b/i,
+];
+
+// Pause patterns (user explicitly pauses active flow)
+const PAUSE_PATTERNS = [
+  /^\s*(?:wait|pause|hold on|hang on|hold up)(?:!|\.|\?)?\s*$/i,
+  /\b(?:wait a minute|wait a sec|give me a second|hold on a second|wait please|pause please|hold please)\b/i,
 ];
 
 // Continuation patterns (user explicitly continues previous task)
@@ -50,9 +57,25 @@ const WALLET_PATTERNS = [
   /\b(?:wallet|balance|pay\b|transfer\b|send money|top ?up|recharge|payment)\b/i,
 ];
 
+// Browser automation patterns
+const BROWSER_PATTERNS = [
+  /\b(?:open page|open url|open website|go to https?:\/\/|navigate to|scrape website|extract from website)\b/i,
+  /^https?:\/\//i,
+];
+
+// Reminder patterns
+const REMINDER_PATTERNS = [
+  /\b(?:remind me to|set a reminder|create a reminder|reminder for|remind me)\b/i,
+];
+
 export function isCancellationMessage(text: string): boolean {
   if (!text) return false;
-  return CANCELLATION_PATTERNS.some((p) => p.test(text));
+  return CANCELLATION_PATTERNS.some((p) => p.test(text.trim()));
+}
+
+export function isPauseMessage(text: string): boolean {
+  if (!text) return false;
+  return PAUSE_PATTERNS.some((p) => p.test(text.trim()));
 }
 
 export function isContinuationMessage(text: string): boolean {
@@ -62,16 +85,12 @@ export function isContinuationMessage(text: string): boolean {
 
 export function classifyMessageIntent(
   text: string,
-  options?: { isContinuation?: boolean; isCancellation?: boolean }
+  options?: { isContinuation?: boolean; isCancellation?: boolean; isPause?: boolean }
 ): MessageIntent {
   const clean = (text || '').trim();
   if (!clean) return 'CONVERSATION';
 
-  if (options?.isContinuation) {
-    return 'SHOPPING';
-  }
-
-  // If cancellation, check remainder
+  // 0. Control commands
   if (options?.isCancellation || isCancellationMessage(clean)) {
     let withoutCancellation = clean;
     for (const p of CANCELLATION_PATTERNS) {
@@ -79,10 +98,22 @@ export function classifyMessageIntent(
     }
     withoutCancellation = withoutCancellation.replace(/^[.,!?\s]+/, '').replace(/[.,!?\s]+$/, '').trim();
 
-    if (!withoutCancellation || CONVERSATION_PATTERNS.some((p) => p.test(withoutCancellation))) {
+    if (!withoutCancellation) {
+      if (/^\s*stop/i.test(clean)) return 'CONTROL_STOP';
+      return 'CONTROL_CANCEL';
+    }
+    if (CONVERSATION_PATTERNS.some((p) => p.test(withoutCancellation))) {
       return 'CONVERSATION';
     }
     return classifyMessageIntent(withoutCancellation);
+  }
+
+  if (options?.isPause || isPauseMessage(clean)) {
+    return 'CONTROL_WAIT';
+  }
+
+  if (options?.isContinuation) {
+    return 'CONTROL_RESUME';
   }
 
   // 1. Conversational intent (greetings, capabilities, chit-chat)
@@ -113,12 +144,22 @@ export function classifyMessageIntent(
     return 'EMAIL';
   }
 
-  // 6. Calendar intent
+  // 6. Reminder intent
+  if (REMINDER_PATTERNS.some((p) => p.test(clean))) {
+    return 'REMINDER';
+  }
+
+  // 7. Calendar intent
   if (CALENDAR_PATTERNS.some((p) => p.test(clean))) {
     return 'CALENDAR';
   }
 
-  // 7. Research intent
+  // 8. Browser automation intent
+  if (BROWSER_PATTERNS.some((p) => p.test(clean))) {
+    return 'BROWSER_AUTOMATION';
+  }
+
+  // 9. Research intent
   if (RESEARCH_PATTERNS.some((p) => p.test(clean))) {
     return 'RESEARCH';
   }
@@ -141,14 +182,15 @@ export function createRequestContext(
 ): ActiveRequestContext {
   const requestId = `req_${Date.now()}_${Math.random().toString(36).substring(2, 8)}`;
   const isCancel = isCancellationMessage(text);
-  const isContinue = !isCancel && hasPreviousUnfinishedTask && isContinuationMessage(text);
+  const isPause = isPauseMessage(text);
+  const isContinue = !isCancel && !isPause && hasPreviousUnfinishedTask && isContinuationMessage(text);
 
   let taskId = `task_${conversationId}_${Date.now()}`;
   if (isContinue) {
     taskId = `task_${conversationId}_resumed`;
   }
 
-  const intent = classifyMessageIntent(text, { isContinuation: isContinue, isCancellation: isCancel });
+  const intent = classifyMessageIntent(text, { isContinuation: isContinue, isCancellation: isCancel, isPause });
 
   return {
     requestId,

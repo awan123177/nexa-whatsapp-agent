@@ -6,5 +6,6 @@ export * from './types/wallet.js';
 export * from './types/browser.js';
 export * from './types/merchants.js';
 export * from './types/tasks.js';
+export * from './types/capabilities.js';
 export * from './errors/index.js';
 export * from './config/index.js';

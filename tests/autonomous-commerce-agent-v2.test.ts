@@ -357,6 +357,18 @@ describe('NEXA Autonomous Account + Commerce Agent V2 Suite', () => {
       isUserConfirmed: true,
     };
 
+    await db.createApproval({
+      conversation_id: 'c4',
+      user_id: user.id,
+      tool_name: 'shopping_checkout',
+      arguments: { store: 'Blinkit', amount: 65 },
+      summary: 'Blinkit order',
+      impact_level: 'high',
+      status: 'approved',
+      expires_at: new Date(Date.now() + 60000).toISOString(),
+      metadata: {},
+    });
+
     const checkoutTool = toolRegistry.getTool('shopping_checkout');
     const checkoutRes = await checkoutTool.execute(
       {

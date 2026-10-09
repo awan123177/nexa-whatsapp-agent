@@ -29,12 +29,13 @@ import {
   ActiveRequestContext,
 } from '@nexa/shared';
 import { IDatabaseRepository, MemoryService } from '@nexa/database';
-import { ToolRegistry, merchantResolver } from '@nexa/tools';
+import { ToolRegistry, merchantResolver, clearUserCart } from '@nexa/tools';
 import { buildSystemInstruction } from './prompts.js';
 import { IdentityManager } from './identity.js';
 import { TaskStateMachine } from './task-state-machine.js';
 import {
   isCancellationMessage,
+  isPauseMessage,
   isContinuationMessage,
   classifyMessageIntent,
 } from './request-context.js';
@@ -165,7 +166,21 @@ export function normalizeToolSignature(name: string, args?: Record<string, unkno
   }
 }
 
+export interface ActiveRunningTask {
+  taskId: string;
+  conversationId: string;
+  abortController: AbortController;
+  stateMachine: TaskStateMachine;
+  paused?: boolean;
+}
+
 export class AgentOrchestrator {
+  private static activeRunningTasks = new Map<string, ActiveRunningTask>();
+
+  public static getActiveRunningTasks(): Map<string, ActiveRunningTask> {
+    return AgentOrchestrator.activeRunningTasks;
+  }
+
   constructor(
     private aiProvider: AIProvider,
     private toolRegistry: ToolRegistry,
@@ -253,7 +268,8 @@ export class AgentOrchestrator {
     );
 
     const isCancel = isCancellationMessage(input.text || '');
-    const isContinue = !isCancel && hasPreviousUnfinishedTask && isContinuationMessage(input.text || '');
+    const isPause = isPauseMessage(input.text || '');
+    const isContinue = !isCancel && !isPause && hasPreviousUnfinishedTask && isContinuationMessage(input.text || '');
 
     const currentRequestId = `req_${Date.now()}_${Math.random().toString(36).substring(2, 8)}`;
     const currentActiveTaskId = isContinue
@@ -265,13 +281,71 @@ export class AgentOrchestrator {
     const intent = classifyMessageIntent(input.text || '', {
       isContinuation: isContinue,
       isCancellation: isCancel,
+      isPause,
     });
     console.log(`[Context] request_intent_classified intent=${intent} requestId=${currentRequestId}`);
 
     if (isCancel) {
       console.log(`[Context] stale_context_rejected reason="user_cancelled"`);
       console.log(`[Context] previous_task_not_resumed reason="user_cancelled"`);
-    } else if (hasPreviousUnfinishedTask && !isContinue) {
+
+      const running = AgentOrchestrator.activeRunningTasks.get(conversation.id);
+      if (running) {
+        running.abortController.abort(new Error('Task cancelled by user'));
+        if (running.stateMachine.canTransitionTo('CANCELLED')) {
+          running.stateMachine.transitionTo('CANCELLED');
+        }
+        AgentOrchestrator.activeRunningTasks.delete(conversation.id);
+      }
+
+      if (pendingApproval) {
+        await this.db.updateApprovalStatus(pendingApproval.id, 'rejected');
+      }
+
+      clearUserCart(user.id);
+
+      const cancelStateMachine = new TaskStateMachine('CREATED');
+      if (cancelStateMachine.canTransitionTo('CANCELLED')) {
+        cancelStateMachine.transitionTo('CANCELLED');
+      }
+      console.log(`[Agent] task_cancelled reason="user_cancelled" steps=0`);
+
+      const reply = "I've stopped and cancelled your active request. Your cart has been cleared. What would you like to do next?";
+      await this.db.saveMessage({
+        conversation_id: conversation.id,
+        sender_type: 'assistant',
+        content: reply,
+      });
+
+      return {
+        replyText: reply,
+        conversationId: conversation.id,
+        stepsCount: 0,
+      };
+    }
+
+    if (isPause) {
+      const running = AgentOrchestrator.activeRunningTasks.get(conversation.id);
+      if (running) {
+        running.paused = true;
+      }
+      console.log(`[Agent] task_paused reason="user_paused"`);
+
+      const reply = "Paused. I've put everything on hold. Just say 'continue' or 'proceed' whenever you're ready!";
+      await this.db.saveMessage({
+        conversation_id: conversation.id,
+        sender_type: 'assistant',
+        content: reply,
+      });
+
+      return {
+        replyText: reply,
+        conversationId: conversation.id,
+        stepsCount: 0,
+      };
+    }
+
+    if (hasPreviousUnfinishedTask && !isContinue) {
       console.log(`[Context] previous_task_not_resumed reason="no_explicit_continuation"`);
     }
 
@@ -429,12 +503,20 @@ export class AgentOrchestrator {
       lastHistoryMsg.media = userMediaPart;
     }
 
-    // Intent Tool Gate (Bug 6)
+    // Intent Tool Gate (Bug 6 & Universal Intents)
     const allDeclarations = this.toolRegistry.getDeclarations();
     let toolDeclarations: typeof allDeclarations = [];
 
-    if (intent === 'CONVERSATION') {
-      // Pure conversation / capabilities / greetings: NO tools provided so Gemini cannot call shopping_search
+    const isControlOrConversation = [
+      'CONVERSATION',
+      'CONTROL_STOP',
+      'CONTROL_CANCEL',
+      'CONTROL_WAIT',
+      'CONTROL_RESUME',
+    ].includes(intent);
+
+    if (isControlOrConversation) {
+      // Pure conversation / capabilities / greetings / controls: NO tools provided so Gemini cannot call shopping_search
       toolDeclarations = [];
     } else if (intent === 'RESEARCH') {
       // Web search and browser tools only; no commerce, booking, or financial tools
@@ -444,6 +526,14 @@ export class AgentOrchestrator {
           !t.name.startsWith('wallet_') &&
           !t.name.startsWith('book_') &&
           !['search_products', 'compare_prices', 'send_email'].includes(t.name)
+      );
+    } else if (intent === 'BROWSER_AUTOMATION') {
+      toolDeclarations = allDeclarations.filter(
+        (t) =>
+          t.name.startsWith('browser_') ||
+          t.name.startsWith('computer_use') ||
+          t.name === 'web_search' ||
+          t.name.startsWith('memory_')
       );
     } else if (intent === 'SHOPPING') {
       // Shopping and browser tools
@@ -463,6 +553,10 @@ export class AgentOrchestrator {
       toolDeclarations = allDeclarations.filter(
         (t) => t.name.includes('email') || t.name.startsWith('memory_')
       );
+    } else if (intent === 'REMINDER') {
+      toolDeclarations = allDeclarations.filter(
+        (t) => t.name.includes('reminder') || t.name.includes('calendar') || t.name.startsWith('memory_')
+      );
     } else if (intent === 'CALENDAR') {
       toolDeclarations = allDeclarations.filter(
         (t) => t.name.includes('calendar') || t.name.includes('reminder') || t.name.startsWith('memory_')
@@ -476,15 +570,16 @@ export class AgentOrchestrator {
     }
 
     // Exact Merchant Resolution & Commerce Task Routing
-    // Hard rule: If intent === 'CONVERSATION', MerchantResolver MUST NOT run
+    // Hard rule: If intent is conversational or control, MerchantResolver MUST NOT run
     const resolvedMerchant =
-      intent !== 'CONVERSATION' ? merchantResolver.resolve(input.text || '') : null;
+      !isControlOrConversation ? merchantResolver.resolve(input.text || '') : null;
     if (resolvedMerchant) {
       console.log(`[Agent] merchant_resolved merchant=${resolvedMerchant.name} canonical_url=${resolvedMerchant.canonicalUrl}`);
     }
 
     const isCommerceTask =
-      intent !== 'CONVERSATION' &&
+      !isControlOrConversation &&
+      !['RESEARCH', 'TRAVEL', 'EMAIL', 'CALENDAR', 'REMINDER', 'WALLET', 'BROWSER_AUTOMATION'].includes(intent) &&
       (intent === 'SHOPPING' ||
         Boolean(resolvedMerchant) ||
         (isContinue && hasPreviousUnfinishedCommerce));
@@ -495,7 +590,7 @@ export class AgentOrchestrator {
     if (isCommerceTask) {
       effectiveMaxSteps = Math.max(this.maxSteps, this.commerceMaxSteps);
       effectiveDeadlineMs = Math.max(this.totalDeadlineMs, this.commerceDeadlineMs);
-    } else if (intent === 'RESEARCH') {
+    } else if (intent === 'RESEARCH' || intent === 'BROWSER_AUTOMATION') {
       effectiveMaxSteps = 10;
       effectiveDeadlineMs =
         this.totalDeadlineMs >= TOTAL_AGENT_DEADLINE_MS
@@ -526,22 +621,36 @@ export class AgentOrchestrator {
     // Active in-memory raw Gemini Content[] history for intermediate tool turns
     let activeRawHistory: any[] | undefined = undefined;
 
-    while (currentStep < effectiveMaxSteps) {
-      // Overall request deadline check
-      const elapsedMs = Date.now() - requestStartTime;
-      const remainingMs = effectiveDeadlineMs - elapsedMs;
-      if (remainingMs <= 3000) {
-        console.log(`[Agent] deadline_approaching remaining_ms=${remainingMs}`);
-        deadlineApproaching = true;
-        if (stateMachine.canTransitionTo('FAILED')) {
-          stateMachine.transitionTo('FAILED');
-        }
-        console.log(`[Agent] task_failed reason="deadline_approaching" steps=${currentStep}`);
-        break;
-      }
+    const taskAbortController = new AbortController();
+    AgentOrchestrator.activeRunningTasks.set(conversation.id, {
+      taskId: currentActiveTaskId,
+      conversationId: conversation.id,
+      abortController: taskAbortController,
+      stateMachine,
+    });
 
-      currentStep++;
-      console.log(`[Agent] step_started step=${currentStep}`);
+    try {
+      while (currentStep < effectiveMaxSteps) {
+        if (stateMachine.isTerminal() || taskAbortController.signal.aborted) {
+          console.log(`[Agent] task_execution_aborted is_terminal=${stateMachine.isTerminal()} aborted=${taskAbortController.signal.aborted}`);
+          break;
+        }
+
+        // Overall request deadline check
+        const elapsedMs = Date.now() - requestStartTime;
+        const remainingMs = effectiveDeadlineMs - elapsedMs;
+        if (remainingMs <= 3000) {
+          console.log(`[Agent] deadline_approaching remaining_ms=${remainingMs}`);
+          deadlineApproaching = true;
+          if (stateMachine.canTransitionTo('FAILED')) {
+            stateMachine.transitionTo('FAILED');
+          }
+          console.log(`[Agent] task_failed reason="deadline_approaching" steps=${currentStep}`);
+          break;
+        }
+
+        currentStep++;
+        console.log(`[Agent] step_started step=${currentStep}`);
 
       const thinkingLevel = resolveThinkingLevel(currentTurnContent, currentStep, input.thinkingLevel);
       console.log(`[WhatsApp Path] gemini_request_start step=${currentStep} thinking_level=${thinkingLevel}`);
@@ -634,6 +743,10 @@ export class AgentOrchestrator {
       const functionResponseParts: any[] = [];
 
       for (const tc of aiResponse.toolCalls) {
+        if (stateMachine.isTerminal() || taskAbortController.signal.aborted) {
+          console.log(`[Agent] tool_execution_skipped tool=${tc.name} reason="terminal_or_aborted"`);
+          break;
+        }
         const tcName = tc.name;
 
         // Verify request ID and task ID boundaries (Bug 1, Rule 9)
@@ -749,6 +862,17 @@ export class AgentOrchestrator {
 
         // Check 4: Execute tool with cancellation AbortController
         const abortController = new AbortController();
+        if (taskAbortController.signal.aborted) {
+          abortController.abort(new Error('Task was aborted'));
+        } else {
+          taskAbortController.signal.addEventListener(
+            'abort',
+            () => {
+              abortController.abort(new Error('Task was aborted'));
+            },
+            { once: true }
+          );
+        }
         let timeoutTimer: NodeJS.Timeout | null = null;
         const timeoutPromise = new Promise<never>((_, reject) => {
           timeoutTimer = setTimeout(() => {
@@ -770,6 +894,11 @@ export class AgentOrchestrator {
           const execPromise = this.toolRegistry.executeTool(tcName, tc.arguments, toolExecutionContext);
           const result = await Promise.race([execPromise, timeoutPromise]);
           if (timeoutTimer) clearTimeout(timeoutTimer);
+
+          if (stateMachine.isTerminal() || taskAbortController.signal.aborted) {
+            console.log(`[Agent] tool_result_discarded tool=${tcName} reason="terminal_or_aborted"`);
+            break;
+          }
 
           if (result.success) {
             latestExecutionToolFailed = false;
@@ -863,6 +992,11 @@ export class AgentOrchestrator {
           }
 
           // Tool execution error / timeout
+          if (stateMachine.isTerminal() || taskAbortController.signal.aborted) {
+            console.log(`[Agent] tool_result_discarded tool=${tcName} reason="terminal_or_aborted"`);
+            break;
+          }
+
           latestExecutionToolFailed = true;
           const errMsg = err.message || 'Tool execution failed';
           const attempts = (toolFailures.get(tcName) || 0) + 1;
@@ -922,8 +1056,15 @@ export class AgentOrchestrator {
         });
       }
 
-      console.log(`[Agent] step_completed step=${currentStep}`);
+      if (!stateMachine.isTerminal() && !taskAbortController.signal.aborted) {
+        console.log(`[Agent] step_completed step=${currentStep}`);
+      }
     }
+  } finally {
+    if (AgentOrchestrator.activeRunningTasks.get(conversation.id)?.taskId === currentActiveTaskId) {
+      AgentOrchestrator.activeRunningTasks.delete(conversation.id);
+    }
+  }
 
     if (currentStep >= effectiveMaxSteps && !finalReply) {
       console.log(`[Agent] max_steps_reached limit=${effectiveMaxSteps}`);
@@ -989,7 +1130,7 @@ export class AgentOrchestrator {
       }
       console.log(`[Agent] task_failed reason="max_steps_reached" steps=${currentStep}`);
     } else if (finalReply && !modelFailed && !latestExecutionToolFailed && !deadlineApproaching) {
-      if (stateMachine.canTransitionTo('COMPLETED')) {
+      if (!stateMachine.isTerminal() && stateMachine.canTransitionTo('COMPLETED')) {
         stateMachine.transitionTo('COMPLETED');
         console.log(`[Agent] task_completed steps=${currentStep}`);
       } else {

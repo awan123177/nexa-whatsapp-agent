@@ -1,13 +1,17 @@
 export type TaskState =
   | 'CREATED'
+  | 'QUEUED'
   | 'PLANNING'
+  | 'RUNNING'
   | 'EXECUTING'
+  | 'WAITING_FOR_USER'
   | 'WAITING_AUTH'
   | 'AUTHENTICATING'
   | 'WAITING_APPROVAL'
   | 'EXECUTING_PAYMENT'
   | 'VERIFYING'
   | 'RECOVERING'
+  | 'PAUSED'
   | 'COMPLETED'
   | 'FAILED'
   | 'BLOCKED'
@@ -50,11 +54,17 @@ export type ShoppingStepState =
 export type MessageIntent =
   | 'CONVERSATION'
   | 'RESEARCH'
+  | 'BROWSER_AUTOMATION'
   | 'SHOPPING'
   | 'TRAVEL'
   | 'EMAIL'
   | 'CALENDAR'
+  | 'REMINDER'
   | 'WALLET'
+  | 'CONTROL_STOP'
+  | 'CONTROL_CANCEL'
+  | 'CONTROL_WAIT'
+  | 'CONTROL_RESUME'
   | 'OTHER';
 
 export interface ActiveRequestContext {
