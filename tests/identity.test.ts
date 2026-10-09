@@ -278,6 +278,46 @@ describe('Identity & User Onboarding State Suite', () => {
     expect(result.stepsCount).toBe(0);
   });
 
+  it('Production shopping query containing "check out or make a payment" does NOT trigger name ambiguity', async () => {
+    const db = new InMemoryRepository();
+    const toolRegistry = createDefaultToolRegistry({ db });
+    let aiCalled = false;
+    const mockAi = new MockAIProvider(async () => {
+      aiCalled = true;
+      return { text: 'Starting shopping search on Amazon India.' };
+    });
+    const orchestrator = new AgentOrchestrator(mockAi, toolRegistry, db);
+
+    const result = await orchestrator.processMessage({
+      phoneNumber: '+19991110009',
+      text: 'Find the best iPhone 16 Pro Max screen guard on Amazon India. I need one pack containing at least 3 guards for under ₹1,500. Use the existing browser session if Amazon is already open. Verify the actual product page, add one qualifying pack to my cart, open the real cart, and send me a genuine screenshot through WhatsApp. Do not check out or make a payment. If login is required, ask me to sign in.',
+      channel: 'whatsapp',
+    });
+
+    expect(result.replyText).not.toContain('Should I call you Out or Make');
+    expect(aiCalled).toBe(true);
+  });
+
+  it('Instructions containing "tea or coffee" or "16 or 15" do NOT trigger name ambiguity', async () => {
+    const db = new InMemoryRepository();
+    const toolRegistry = createDefaultToolRegistry({ db });
+    let aiCalled = false;
+    const mockAi = new MockAIProvider(async () => {
+      aiCalled = true;
+      return { text: 'I found both tea and coffee options.' };
+    });
+    const orchestrator = new AgentOrchestrator(mockAi, toolRegistry, db);
+
+    const result = await orchestrator.processMessage({
+      phoneNumber: '+19991110010',
+      text: 'Should I buy tea or coffee for breakfast?',
+      channel: 'whatsapp',
+    });
+
+    expect(result.replyText).not.toContain('Should I call you');
+    expect(aiCalled).toBe(true);
+  });
+
   it('First message containing unrelated question asks user name and stops turn without answering question', async () => {
     const db = new InMemoryRepository();
     const toolRegistry = createDefaultToolRegistry({ db });

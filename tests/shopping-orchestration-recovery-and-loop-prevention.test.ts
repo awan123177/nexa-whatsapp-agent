@@ -834,5 +834,207 @@ describe('NEXA Shopping Orchestration, Loop Prevention & State Preservation Suit
       const logs = consoleSpy.mock.calls.map((c) => c[0]);
       expect(logs.some((l) => typeof l === 'string' && l.includes('[ComputerUse] challenge_detected'))).toBe(true);
     });
+
+    it('preserves 1:1 Gemini functionCall-functionResponse pairing when tool loop encounters terminal state or skip', async () => {
+      const mockDb = new InMemoryRepository();
+      const registry = new ToolRegistry();
+
+      registry.register({
+        name: 'tool_one',
+        description: 'First tool',
+        riskLevel: 'read_only',
+        parametersSchema: z.any(),
+        requiresApproval: () => ({ required: false }),
+        execute: async () => {
+          throw new Error('Terminal critical failure in tool_one');
+        },
+      });
+
+      registry.register({
+        name: 'tool_two',
+        description: 'Second tool',
+        riskLevel: 'read_only',
+        parametersSchema: z.any(),
+        requiresApproval: () => ({ required: false }),
+        execute: async () => ({ success: true }),
+      });
+
+      let turn = 0;
+      let recordedRawHistory: any = null;
+      const mockAI = new MockAIProvider(async (_msgs, opts) => {
+        turn++;
+        if (turn === 1) {
+          return {
+            text: '',
+            toolCalls: [
+              { id: 'call_1', name: 'tool_one', arguments: {} },
+              { id: 'call_2', name: 'tool_two', arguments: {} },
+            ],
+          };
+        }
+        recordedRawHistory = opts?.rawHistory;
+        return {
+          text: 'Acknowledged failure safely.',
+          toolCalls: [],
+        };
+      });
+
+      const orchestrator = new AgentOrchestrator(
+        mockAI,
+        registry,
+        mockDb,
+        5,
+        undefined,
+        15000,
+        120000,
+        5,
+        120000
+      );
+
+      await orchestrator.processMessage({
+        phoneNumber: '+919876543210',
+        text: 'Execute tool one and tool two',
+      });
+
+      // Verify that raw history has pairing for both call_1 and call_2
+      expect(recordedRawHistory).toBeDefined();
+      const userResponseTurn = recordedRawHistory.find(
+        (t: any) => t.role === 'user' && t.parts.some((p: any) => p.functionResponse)
+      );
+      expect(userResponseTurn).toBeDefined();
+      expect(userResponseTurn.parts.length).toBe(2);
+      expect(userResponseTurn.parts[0].functionResponse.name).toBe('tool_one');
+      expect(userResponseTurn.parts[1].functionResponse.name).toBe('tool_two');
+    });
+
+    it('prompts for Amazon sign-in only when authState is AUTH_REQUIRED and never when false', async () => {
+      const mockDb = new InMemoryRepository();
+      const registry = new ToolRegistry();
+
+      const mockBrowser: any = {
+        getActiveUrl: vi.fn().mockReturnValue('https://www.amazon.in/ap/signin'),
+        getSessionMetadata: vi.fn().mockReturnValue({
+          authState: 'AUTH_REQUIRED',
+          pageState: 'challenged',
+        }),
+        cleanupPage: vi.fn().mockResolvedValue(undefined),
+        markTaskTerminal: vi.fn(),
+      };
+
+      const mockAI = new MockAIProvider(async () => {
+        return {
+          text: '',
+          toolCalls: [],
+        };
+      });
+
+      const orchestrator = new AgentOrchestrator(
+        mockAI,
+        registry,
+        mockDb,
+        5,
+        undefined,
+        15000,
+        120000,
+        5,
+        120000,
+        mockBrowser
+      );
+
+      const res = await orchestrator.processMessage({
+        phoneNumber: '+919876543210',
+        text: 'Find iPhone 16 screen guard on Amazon India and add to cart',
+      });
+
+      expect(res.replyText).toContain('Amazon India requires you to sign in');
+    });
+
+    it('prevents fabricated claims of cart addition or screenshot delivery when unverified', async () => {
+      const mockDb = new InMemoryRepository();
+      const registry = new ToolRegistry();
+
+      // AI hallucinates that it verified cart and sent screenshot, without calling any tools
+      const mockAI = new MockAIProvider(async () => {
+        return {
+          text: 'I have added the Spigen screen guard, verified your Amazon cart, and sent you a screenshot on WhatsApp!',
+          toolCalls: [],
+        };
+      });
+
+      const orchestrator = new AgentOrchestrator(
+        mockAI,
+        registry,
+        mockDb,
+        5,
+        undefined,
+        15000,
+        120000,
+        5,
+        120000
+      );
+
+      const res = await orchestrator.processMessage({
+        phoneNumber: '+919876543210',
+        text: 'Find iPhone 16 screen guard on Amazon India, add to cart, and send screenshot',
+      });
+
+      // The fabricated claim must be sanitized/prevented
+      expect(res.replyText).not.toContain('sent you a screenshot');
+      expect(res.replyText).toContain('unable to complete adding the screen guard to your cart');
+    });
+
+    it('full production shopping request remains in shopping workflow without clarification questions', async () => {
+      const mockDb = new InMemoryRepository();
+      const registry = new ToolRegistry();
+
+      registry.register({
+        name: 'browser_observe',
+        description: 'Observe webpage',
+        riskLevel: 'read_only',
+        parametersSchema: z.any(),
+        requiresApproval: () => ({ required: false }),
+        execute: async () => ({
+          success: true,
+          data: {
+            products: [{ title: 'Spigen 3 Pack Screen Protector', price: '₹1,399', asin: 'B0DHCVXYZ1', packSize: 3 }],
+          },
+        }),
+      });
+
+      let turn = 0;
+      const mockAI = new MockAIProvider(async () => {
+        turn++;
+        if (turn === 1) {
+          return {
+            text: '',
+            toolCalls: [{ id: 'call_obs', name: 'browser_observe', arguments: {} }],
+          };
+        }
+        return {
+          text: 'Found Spigen iPhone 16 Pro Max 3-pack screen guard under ₹1,500 on Amazon India.',
+          toolCalls: [],
+        };
+      });
+
+      const orchestrator = new AgentOrchestrator(
+        mockAI,
+        registry,
+        mockDb,
+        5,
+        undefined,
+        15000,
+        120000,
+        5,
+        120000
+      );
+
+      const res = await orchestrator.processMessage({
+        phoneNumber: '+919876543210',
+        text: 'Find the best iPhone 16 Pro Max screen guard on Amazon India. I need one pack containing at least 3 guards for under ₹1,500. Use the existing browser session if Amazon is already open. Verify the actual product page, add one qualifying pack to my cart, open the real cart, and send me a genuine screenshot through WhatsApp. Do not check out or make a payment. If login is required, ask me to sign in.',
+      });
+
+      expect(res.replyText).not.toContain('Should I call you Out or Make');
+      expect(res.replyText).toContain('Spigen');
+    });
   });
 });

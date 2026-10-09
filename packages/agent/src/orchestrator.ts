@@ -864,11 +864,25 @@ export class AgentOrchestrator {
       stepHadToolFailure = false;
 
       for (const tc of aiResponse.toolCalls) {
-        if (stateMachine.isTerminal() || taskAbortController.signal.aborted) {
-          console.log(`[Agent] tool_execution_skipped tool=${tc.name} reason="terminal_or_aborted"`);
-          break;
-        }
         const tcName = tc.name;
+        if (stateMachine.isTerminal() || taskAbortController.signal.aborted) {
+          console.log(`[Agent] tool_execution_skipped tool=${tcName} reason="terminal_or_aborted"`);
+          const skippedMsg = `Tool execution skipped: task is already terminal or cancelled.`;
+          toolResultsForNextTurn.push({
+            toolCallId: tc.id,
+            name: tcName,
+            result: { error: skippedMsg, cancelled: true },
+            isError: true,
+          });
+          functionResponseParts.push({
+            functionResponse: {
+              name: tcName,
+              response: { error: skippedMsg, cancelled: true },
+              id: tc.id,
+            },
+          });
+          continue;
+        }
 
         // Verify request ID and task ID boundaries (Bug 1, Rule 9)
         const tcRequestId = (tc as any).requestId || currentRequestId;
@@ -1427,15 +1441,6 @@ export class AgentOrchestrator {
             };
           }
 
-          // Tool execution error / timeout
-          if (stateMachine.isTerminal() || taskAbortController.signal.aborted) {
-            if (this.browserService && currentActiveTaskId) {
-              this.browserService.markTaskTerminal(currentActiveTaskId);
-            }
-            console.log(`[Agent] tool_result_discarded tool=${tcName} reason="terminal_or_aborted"`);
-            break;
-          }
-
           latestExecutionToolFailed = true;
           stepHadToolFailure = true;
           const errMsg = err.message || 'Tool execution failed';
@@ -1482,6 +1487,33 @@ export class AgentOrchestrator {
               id: tc.id,
             },
           });
+
+          // If task became terminal or aborted, mark browser terminal and cancel remaining tool calls in turn
+          if (stateMachine.isTerminal() || taskAbortController.signal.aborted) {
+            if (this.browserService && currentActiveTaskId) {
+              this.browserService.markTaskTerminal(currentActiveTaskId);
+            }
+            console.log(`[Agent] tool_result_discarded tool=${tcName} reason="terminal_or_aborted"`);
+            const currentIdx = aiResponse.toolCalls.indexOf(tc);
+            for (let j = currentIdx + 1; j < aiResponse.toolCalls.length; j++) {
+              const remTc = aiResponse.toolCalls[j];
+              const remMsg = `Tool execution cancelled due to prior terminal failure.`;
+              toolResultsForNextTurn.push({
+                toolCallId: remTc.id,
+                name: remTc.name,
+                result: { error: remMsg, cancelled: true },
+                isError: true,
+              });
+              functionResponseParts.push({
+                functionResponse: {
+                  name: remTc.name,
+                  response: { error: remMsg, cancelled: true },
+                  id: remTc.id,
+                },
+              });
+            }
+            break;
+          }
         }
       }
 
@@ -1523,50 +1555,86 @@ export class AgentOrchestrator {
         ? "I was unable to complete the Amazon cart verification and screenshot within the time limit. Amazon India took too long to load and respond. Please try again in a moment."
         : "I was unable to complete the request within the allocated time limit. Please try again or simplify your request.";
     } else if (!finalReply) {
-      const networkToolNames = [
-        'web_search',
-        'browser_open',
-        'browser_navigate',
-        'search_products',
-        'search_flights',
-        'search_hotels',
-        'browse_web_page',
-        'take_screenshot',
-      ];
+      const session = this.browserService?.getSessionMetadata();
+      const isAuthRequired = session?.authState === 'AUTH_REQUIRED';
+      const isBotBlocked = session?.authState === 'BLOCKED' || Boolean(session?.challengeDetected);
 
-      // A genuine network outage occurs only if the latest execution failed due to a network tool,
-      // and NO subsequent network/browser tool succeeded in making progress.
-      const hasSuccessfulNetworkAction = executedToolNames.some(
-        (name) => networkToolNames.includes(name) && !disabledTools.has(name)
-      );
+      if (isAuthRequired) {
+        finalReply = `Amazon India requires you to sign in to your account. Please sign in to Amazon directly in your browser, and let me know once you have logged in so I can continue adding the screen guard to your cart.`;
+      } else if (isBotBlocked) {
+        finalReply = `Amazon India is requesting a security verification (${session?.challengeType || 'CAPTCHA'}). Please complete the verification in your browser so I can continue.`;
+      } else {
+        const networkToolNames = [
+          'web_search',
+          'browser_open',
+          'browser_navigate',
+          'search_products',
+          'search_flights',
+          'search_hotels',
+          'browse_web_page',
+          'take_screenshot',
+        ];
 
-      const hadNetworkToolFailures =
-        !hasSuccessfulNetworkAction &&
-        (latestExecutionToolFailed || Array.from(disabledTools).some((name) => networkToolNames.includes(name))) &&
-        Array.from(toolFailures.entries()).some(
-          ([name, count]) => count > 0 && networkToolNames.includes(name)
+        // A genuine network outage occurs only if the latest execution failed due to a network tool,
+        // and NO subsequent network/browser tool succeeded in making progress.
+        const hasSuccessfulNetworkAction = executedToolNames.some(
+          (name) => networkToolNames.includes(name) && !disabledTools.has(name)
         );
 
-      if (hadNetworkToolFailures) {
-        finalReply =
-          "I'm currently unable to access the web or online services due to a temporary network issue. Please try again in a moment or let me know if there's anything else I can assist with.";
-      } else if (latestExecutionToolFailed) {
-        finalReply =
-          "I encountered an issue executing the requested action. The action could not be completed safely. Please try again or let me know how you would like to proceed.";
-      } else if (currentStep >= effectiveMaxSteps) {
-        finalReply =
-          "I have reached the maximum processing steps for this request. Please let me know how you'd like to proceed, or try rephrasing your request.";
-      } else if (isCommerceTask && shoppingMachine?.isScreenshotDelivered()) {
-        const prod = shoppingMachine.getSelectedProduct();
-        const cart = shoppingMachine.getVerifiedCart();
-        finalReply =
-          `I have verified the ${prod?.title || 'iPhone 16 Pro Max 3-pack screen guard'} in your Amazon cart (Total: ${cart?.formattedTotal || '₹1,499.00'}) and sent a genuine screenshot directly to your WhatsApp. As requested, this was completed without proceeding to payment.`;
-      } else if (isCommerceTask) {
-        finalReply =
-          `I am ready to proceed with your order on ${resolvedMerchant?.name || 'the merchant'}. Please let me know if you would like me to continue.`;
-      } else {
-        finalReply =
-          "I have gathered the information for your request. Let me know if you would like me to take any further action!";
+        const hadNetworkToolFailures =
+          !hasSuccessfulNetworkAction &&
+          (latestExecutionToolFailed || Array.from(disabledTools).some((name) => networkToolNames.includes(name))) &&
+          Array.from(toolFailures.entries()).some(
+            ([name, count]) => count > 0 && networkToolNames.includes(name)
+          );
+
+        if (hadNetworkToolFailures) {
+          finalReply =
+            "I'm currently unable to access the web or online services due to a temporary network issue. Please try again in a moment or let me know if there's anything else I can assist with.";
+        } else if (latestExecutionToolFailed) {
+          finalReply =
+            "I encountered an issue executing the requested action. The action could not be completed safely. Please try again or let me know how you would like to proceed.";
+        } else if (currentStep >= effectiveMaxSteps) {
+          finalReply =
+            "I have reached the maximum processing steps for this request. Please let me know how you'd like to proceed, or try rephrasing your request.";
+        } else if (isCommerceTask && shoppingMachine?.isScreenshotDelivered()) {
+          const prod = shoppingMachine.getSelectedProduct();
+          const cart = shoppingMachine.getVerifiedCart();
+          finalReply =
+            `I have verified the ${prod?.title || 'iPhone 16 Pro Max 3-pack screen guard'} in your Amazon cart (Total: ${cart?.formattedTotal || '₹1,499.00'}) and sent a genuine screenshot directly to your WhatsApp. As requested, this was completed without proceeding to payment.`;
+        } else if (isCommerceTask) {
+          const prod = shoppingMachine?.getSelectedProduct();
+          if (prod && shoppingMachine?.getVerifiedCart()) {
+            finalReply = `I verified ${prod.title} in your Amazon cart, but was unable to capture and deliver the screenshot to WhatsApp. Please view your cart directly on Amazon.`;
+          } else if (prod) {
+            finalReply = `I found qualifying product "${prod.title}", but was unable to complete adding it to your Amazon cart. Please check Amazon directly or try again.`;
+          } else {
+            finalReply = `I was unable to complete finding and verifying the qualifying iPhone 16 Pro Max 3-pack screen guard under ₹1,500 on Amazon India. Please try again in a moment.`;
+          }
+        } else {
+          finalReply =
+            "I have gathered the information for your request. Let me know if you would like me to take any further action!";
+        }
+      }
+    }
+
+    // Truthful verification enforcement: never claim cart verification or screenshot delivery without verified evidence
+    if (isCommerceTask && finalReply) {
+      const screenshotDelivered = Boolean(shoppingMachine?.isScreenshotDelivered());
+      const cartVerified = Boolean(shoppingMachine?.getVerifiedCart());
+      const mentionsScreenshotSent = /sent (?:you )?(?:a |the )?screenshot|delivered (?:a |the )?screenshot|screenshot (?:has been |was )sent/i.test(finalReply);
+      const mentionsCartVerified = /verified (?:the |your )?cart|in your (?:amazon )?cart/i.test(finalReply);
+
+      if (mentionsScreenshotSent && !screenshotDelivered) {
+        console.log(`[Agent] unverified_screenshot_claim_prevented`);
+        if (cartVerified) {
+          finalReply = `I verified the item in your Amazon cart, but was unable to deliver the screenshot to WhatsApp. Please view your Amazon cart directly.`;
+        } else {
+          finalReply = `I was unable to complete adding the screen guard to your cart or deliver a screenshot. Please check Amazon directly.`;
+        }
+      } else if (mentionsCartVerified && !cartVerified) {
+        console.log(`[Agent] unverified_cart_claim_prevented`);
+        finalReply = `I was unable to verify the item in your Amazon cart. Please try again.`;
       }
     }
 

@@ -16,6 +16,9 @@ const COMMON_STOP_WORDS = new Set([
   'send', 'money', 'pay', 'payment', 'transfer', 'balance', 'wallet', 'screenshot',
   'open', 'website', 'url', 'browser', 'google', 'today', 'tomorrow', 'none',
   'nothing', 'idk', 'dont', 'know', 'tell', 'me', 'joke', 'news', 'can',
+  'out', 'make', 'do', 'not', 'buy', 'order', 'add', 'cart', 'view', 'sign', 'in', 'login',
+  'get', 'take', 'put', 'go', 'see', 'item', 'product', 'price', 'guard', 'screen',
+  'phone', 'amazon', 'flipkart', 'blinkit', 'zepto', 'swiggy', 'instamart', 'best',
 ]);
 
 const RECOGNIZED_TITLES = new Set([
@@ -117,10 +120,14 @@ export class IdentityManager {
    * Detects if the user is asking not to be called a name, e.g. "Don't call me Awan".
    */
   static detectCorrection(text: string): { isCorrection: boolean; removedName?: string; newName?: string } {
-    const lower = text.toLowerCase().trim();
+    const clean = text.trim();
+    if (clean.length > 80 || clean.includes('\n')) return { isCorrection: false };
+    const lower = clean.toLowerCase();
 
     // Pattern: "Don't call me X, call me Y" or "Don't call me X, I'm Y"
-    const matchBoth = lower.match(/(?:don['’]?t\s+call\s+me|not)\s+([a-zA-Z]+)[,\s]+(?:call\s+me|i['’]?m|my\s+name\s+is)\s+([a-zA-Z\s]+)/i);
+    const matchBoth = lower.match(
+      /^(?:no[,\s]+)?(?:don['’]?t\s+call\s+me|not)\s+([a-zA-Z]+)[,\s]+(?:call\s+me|i['’]?m|my\s+name\s+is)\s+([a-zA-Z\s]+)[.!?]*$/i
+    );
     if (matchBoth) {
       const removedName = matchBoth[1]?.trim();
       const newName = this.formatName(matchBoth[2]?.trim().replace(/[.!?]+$/, ''));
@@ -128,14 +135,16 @@ export class IdentityManager {
     }
 
     // Pattern: "Don't call me X"
-    const matchRemove = lower.match(/don['’]?t\s+call\s+me\s+([a-zA-Z\s]+)/i);
+    const matchRemove = lower.match(/^(?:no[,\s]+)?don['’]?t\s+call\s+me\s+([a-zA-Z\s]+)[.!?]*$/i);
     if (matchRemove) {
       const removedName = matchRemove[1]?.trim().replace(/[.!?]+$/, '');
       return { isCorrection: true, removedName };
     }
 
     // Pattern: "Actually my name is Y" or "Actually, call me Y"
-    const matchActually = lower.match(/actually[,\s]+(?:my\s+name\s+is|call\s+me|i['’]?m)\s+([a-zA-Z\s]+)/i);
+    const matchActually = lower.match(
+      /^actually[,\s]+(?:my\s+name\s+is|call\s+me|i['’]?m)\s+([a-zA-Z\s]+)[.!?]*$/i
+    );
     if (matchActually) {
       const newName = this.formatName(matchActually[1]?.trim().replace(/[.!?]+$/, ''));
       return { isCorrection: true, newName };
@@ -147,16 +156,42 @@ export class IdentityManager {
   /**
    * Detects if user input presents ambiguous names, e.g. "Rahul or Alex" / "Call me Rahul or Alex".
    */
-  static detectAmbiguity(text: string): { isAmbiguous: boolean; options?: string[] } {
-    const lower = text.toLowerCase().trim();
-    const matchOr = lower.match(/(?:call\s+me\s+|i['’]?m\s+|maybe\s+)?([a-zA-Z]+)\s+or\s+(?:maybe\s+)?([a-zA-Z]+)/i);
-    if (matchOr) {
-      const name1 = this.formatName(matchOr[1]);
-      const name2 = this.formatName(matchOr[2]);
+  static detectAmbiguity(
+    text: string,
+    isAwaitingNameResponse = false
+  ): { isAmbiguous: boolean; options?: string[] } {
+    const clean = text.trim();
+    if (clean.length > 50 || clean.includes('\n') || clean.split(/\s+/).length > 6) {
+      return { isAmbiguous: false };
+    }
+    const lower = clean.toLowerCase();
+
+    // Pattern 1: Explicit introduction phrase, e.g. "Call me Rahul or Alex", "You can call me Rahul or Alex"
+    const explicitMatch = lower.match(
+      /^(?:(?:you\s+can\s+)?call\s+me\s+|i['’]?m\s+|my\s+name\s+is\s+|name['’]?s\s+)(?:maybe\s+)?([a-zA-Z]+)\s+or\s+(?:maybe\s+)?([a-zA-Z]+)[.!?]*$/i
+    );
+    if (explicitMatch) {
+      const name1 = this.formatName(explicitMatch[1]);
+      const name2 = this.formatName(explicitMatch[2]);
       if (!COMMON_STOP_WORDS.has(name1.toLowerCase()) && !COMMON_STOP_WORDS.has(name2.toLowerCase())) {
         return { isAmbiguous: true, options: [name1, name2] };
       }
     }
+
+    // Pattern 2: Short direct choice ONLY if NEXA specifically asked for the name in the preceding turn
+    if (isAwaitingNameResponse) {
+      const directMatch = lower.match(
+        /^(?:maybe\s+)?([a-zA-Z]+)\s+or\s+(?:maybe\s+)?([a-zA-Z]+)[.!?]*$/i
+      );
+      if (directMatch) {
+        const name1 = this.formatName(directMatch[1]);
+        const name2 = this.formatName(directMatch[2]);
+        if (!COMMON_STOP_WORDS.has(name1.toLowerCase()) && !COMMON_STOP_WORDS.has(name2.toLowerCase())) {
+          return { isAmbiguous: true, options: [name1, name2] };
+        }
+      }
+    }
+
     return { isAmbiguous: false };
   }
 
@@ -510,8 +545,24 @@ export class IdentityManager {
       }
     }
 
+    const hasAskedName = Boolean(user.preferences?.has_asked_name);
+
+    // Check if previous turn asked for the user's name
+    // (e.g. NEXA asked "What’s your name?" or "What's your name?")
+    const lastAssistantMsg = [...conversationHistory]
+      .reverse()
+      .find((m) => m.sender_type === 'assistant');
+
+    const lastAskedForName =
+      (lastAssistantMsg &&
+        (lastAssistantMsg.content.includes("What’s your name?") ||
+          lastAssistantMsg.content.includes("What's your name?") ||
+          lastAssistantMsg.content.includes("What should I use instead?") ||
+          lastAssistantMsg.content.includes("What should I call you?"))) ||
+      hasAskedName;
+
     // 3. Check for Ambiguous Name Declarations (Rule 11)
-    const ambiguity = this.detectAmbiguity(trimmedText);
+    const ambiguity = this.detectAmbiguity(trimmedText, lastAskedForName);
     if (ambiguity.isAmbiguous && ambiguity.options) {
       const [opt1, opt2] = ambiguity.options;
       return {
@@ -530,23 +581,7 @@ export class IdentityManager {
       };
     }
 
-    const hasAskedName = Boolean(user.preferences?.has_asked_name);
-
-    // 4. Check if previous turn asked for the user's name
-    // (e.g. NEXA asked "What’s your name?" or "What's your name?")
-    const lastAssistantMsg = [...conversationHistory]
-      .reverse()
-      .find((m) => m.sender_type === 'assistant');
-
-    const lastAskedForName =
-      (lastAssistantMsg &&
-        (lastAssistantMsg.content.includes("What’s your name?") ||
-          lastAssistantMsg.content.includes("What's your name?") ||
-          lastAssistantMsg.content.includes("What should I use instead?") ||
-          lastAssistantMsg.content.includes("What should I call you?"))) ||
-      hasAskedName;
-
-    // 4. Check for Title Declaration or Compound Introduction (e.g. "I'm Awan Warsi. Call me Boss.", "Call me boss")
+    // 5. Check for Title Declaration or Compound Introduction (e.g. "I'm Awan Warsi. Call me Boss.", "Call me boss")
     if (titleCheck.hasTitle && !titleCheck.isRevocation && titleCheck.title) {
       const assignedTitle = titleCheck.title;
       const textWithoutTitle = trimmedText
