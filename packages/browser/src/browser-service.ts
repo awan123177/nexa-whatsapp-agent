@@ -1038,6 +1038,46 @@ export class PlaywrightBrowserService {
     }
   }
 
+  async addCookies(cookies: Array<{ name: string; value: string; [key: string]: any }>): Promise<void> {
+    if (!cookies || !Array.isArray(cookies) || cookies.length === 0) return;
+    await this.ensurePage();
+    if (this.context) {
+      const validCookies = cookies
+        .filter((c) => Boolean(c.name && c.value))
+        .map((c) => ({
+          name: c.name,
+          value: c.value,
+          domain: c.domain || (c.url ? undefined : '.swiggy.com'),
+          path: c.path || '/',
+          url: c.url,
+          expires: c.expires,
+          httpOnly: c.httpOnly,
+          secure: c.secure,
+          sameSite: c.sameSite || 'Lax',
+        }));
+      if (validCookies.length > 0) {
+        await this.context.addCookies(validCookies as any);
+        console.log(`[Browser] cookies_applied count=${validCookies.length}`);
+      }
+    }
+  }
+
+  async setExtraHTTPHeaders(headers: Record<string, string>): Promise<void> {
+    if (!headers || typeof headers !== 'object') return;
+    await this.ensurePage();
+    if (this.context) {
+      await this.context.setExtraHTTPHeaders(headers);
+      console.log(`[Browser] extra_headers_applied count=${Object.keys(headers).length}`);
+    }
+  }
+
+  async clearCookies(): Promise<void> {
+    if (this.context) {
+      await this.context.clearCookies();
+      console.log('[Browser] cookies_cleared');
+    }
+  }
+
   async close(): Promise<void> {
     if (this.page && !this.page.isClosed()) {
       await this.page.close().catch(() => {});

@@ -13,6 +13,7 @@
     "@nexa/shared": "workspace:*",
     "@nexa/security": "workspace:*",
     "@nexa/database": "workspace:*",
+    "@nexa/browser": "workspace:*",
     "@nexa/tools": "workspace:*",
     "@nexa/ai": "workspace:*"
   },

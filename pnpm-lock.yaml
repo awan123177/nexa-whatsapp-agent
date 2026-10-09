@@ -75,6 +75,9 @@ importers:
       '@nexa/ai':
         specifier: workspace:*
         version: link:../ai
+      '@nexa/browser':
+        specifier: workspace:*
+        version: link:../browser
       '@nexa/database':
         specifier: workspace:*
         version: link:../database

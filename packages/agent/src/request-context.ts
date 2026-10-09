@@ -15,8 +15,8 @@ const PAUSE_PATTERNS = [
 
 // Continuation patterns (user explicitly continues previous task)
 const CONTINUATION_PATTERNS = [
-  /^\s*(?:continue|go ahead|continue the order|finish that|continue with the previous task|proceed|yes continue|keep going|do it)\b/i,
-  /\b(?:continue with|go ahead and (?:order|buy|finish|proceed))\b/i,
+  /^\s*(?:continue|resume|go ahead|continue the order|finish that|continue with the previous task|proceed|yes continue|keep going|do it)\b/i,
+  /\b(?:continue with|resume with|go ahead and (?:order|buy|finish|proceed))\b/i,
 ];
 
 // Conversational / Greeting / Capability patterns

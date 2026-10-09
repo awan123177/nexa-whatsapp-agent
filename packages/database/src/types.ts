@@ -52,6 +52,8 @@ export interface IDatabaseRepository {
   saveMemory(data: Omit<Memory, 'id' | 'created_at' | 'updated_at'>): Promise<Memory>;
   getUserMemories(userId: string, category?: string): Promise<Memory[]>;
   deleteMemory(id: string, userId: string): Promise<boolean>;
+  deleteUserMemoriesByCategory?(userId: string, category: string): Promise<number>;
+  deleteAllUserMemories?(userId: string): Promise<number>;
 
   // Tasks
   createTask(data: Omit<Task, 'id' | 'created_at' | 'updated_at'>): Promise<Task>;

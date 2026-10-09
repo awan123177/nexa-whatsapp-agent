@@ -13,6 +13,7 @@ import { IDatabaseRepository } from '@nexa/database';
 import { PlaywrightBrowserService } from '@nexa/browser';
 import { SearchProvider, DuckDuckGoSearchProvider } from './web-search.js';
 import { merchantResolver } from '../merchants/merchant-resolver.js';
+import { UserAssistedHandoffManager } from '../accounts/user-assisted-handoff.js';
 
 export interface ProductItem {
   title: string;
@@ -67,8 +68,11 @@ export const shoppingAddToCartParametersSchema = z.object({
 export function createShoppingTools(
   searchProvider: SearchProvider = new DuckDuckGoSearchProvider(),
   db?: IDatabaseRepository,
-  browserService?: PlaywrightBrowserService
+  browserService?: PlaywrightBrowserService,
+  handoffManager?: UserAssistedHandoffManager
 ): BaseTool[] {
+  const handoffMgr = handoffManager || (db ? UserAssistedHandoffManager.getInstance(db) : undefined);
+
   const searchProductsTool: BaseTool = {
     name: 'search_products',
     description: 'Searches across e-commerce platforms and online stores for products, specs, and current availability.',
@@ -137,6 +141,11 @@ export function createShoppingTools(
       if (browserService) {
         const canonicalUrl = resolved?.canonicalUrl || 'https://www.swiggy.com/instamart';
         try {
+          // If user has an authorized session, inject session credentials into browser context
+          if (handoffMgr && _context.user?.id) {
+            await handoffMgr.applySessionToBrowser(browserService, _context.user.id, storeName);
+          }
+
           const currentUrl = browserService.getActiveUrl();
           let hostname = '';
           try {
@@ -149,23 +158,64 @@ export function createShoppingTools(
             const openRes = await browserService.openPage(canonicalUrl);
             if (!openRes.success) {
               console.log(`[Shopping] browser_navigation_failed merchant=${storeName} error="${openRes.message}" error_type=${openRes.errorType}`);
+
+              // Stop automated retries and record handoff
+              let userFacingMessage = openRes.errorType === 'BOT_BLOCKED' || (openRes as any).status === 429
+                ? `${storeName} is currently presenting bot protection or rate limits (HTTP ${ (openRes as any).status || 429 }). Please try again shortly.`
+                : `I couldn't open ${storeName} right now: ${openRes.message}`;
+
+              if (handoffMgr && _context.user?.id) {
+                const handoff = await handoffMgr.initiateHandoff({
+                  userId: _context.user.id,
+                  merchant: storeName,
+                  canonicalUrl,
+                  openResult: openRes,
+                });
+                userFacingMessage = handoff.userFacingMessage;
+              }
+
               return {
                 success: false,
                 error: `Unable to open ${storeName}: ${openRes.message}`,
-                userFacingMessage: openRes.errorType === 'BOT_BLOCKED' || (openRes as any).status === 429
-                  ? `${storeName} is currently presenting bot protection or rate limits (HTTP ${ (openRes as any).status || 429 }). Please try again shortly.`
-                  : `I couldn't open ${storeName} right now: ${openRes.message}`,
+                userFacingMessage,
+                data: {
+                  handoffRequired: true,
+                  merchant: storeName,
+                  canonicalUrl,
+                  errorType: openRes.errorType,
+                },
               };
             }
 
             await browserService.waitForPageReady();
             const pageState = await browserService.inspectPageState();
-            if (pageState.challengeDetected || pageState.authState === 'BLOCKED') {
+            if (pageState.challengeDetected || pageState.authState === 'BLOCKED' || pageState.authState === 'AUTH_REQUIRED') {
               console.log(`[Shopping] bot_challenge_detected merchant=${storeName} type="${pageState.challengeType || 'CAPTCHA'}"`);
+
+              let userFacingMessage = `${storeName} presented a verification check. Please solve it in your browser or try again shortly.`;
+
+              if (handoffMgr && _context.user?.id) {
+                const handoff = await handoffMgr.initiateHandoff({
+                  userId: _context.user.id,
+                  merchant: storeName,
+                  canonicalUrl,
+                  authState: (pageState.authState as any) || 'BLOCKED',
+                  failureReason: `Merchant presented verification challenge (${pageState.challengeType || 'CAPTCHA'})`,
+                  errorType: pageState.challengeType ? 'CAPTCHA_REQUIRED' : 'BOT_BLOCKED',
+                });
+                userFacingMessage = handoff.userFacingMessage;
+              }
+
               return {
                 success: false,
                 error: `Merchant ${storeName} requires human verification (${pageState.challengeType || 'CAPTCHA'}).`,
-                userFacingMessage: `${storeName} presented a verification check. Please solve it in your browser or try again shortly.`,
+                userFacingMessage,
+                data: {
+                  handoffRequired: true,
+                  merchant: storeName,
+                  canonicalUrl,
+                  authState: pageState.authState,
+                },
               };
             }
           }

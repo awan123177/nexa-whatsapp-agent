@@ -401,6 +401,33 @@ export class SupabaseRepository implements IDatabaseRepository {
     return !error;
   }
 
+  async deleteUserMemoriesByCategory(userId: string, category: string): Promise<number> {
+    const { data, error } = await this.client
+      .from('memories')
+      .delete()
+      .eq('user_id', userId)
+      .eq('category', category)
+      .select('id');
+
+    if (error) {
+      throw new Error(`Failed to delete memories by category: ${error.message}`);
+    }
+    return data ? data.length : 0;
+  }
+
+  async deleteAllUserMemories(userId: string): Promise<number> {
+    const { data, error } = await this.client
+      .from('memories')
+      .delete()
+      .eq('user_id', userId)
+      .select('id');
+
+    if (error) {
+      throw new Error(`Failed to delete all user memories: ${error.message}`);
+    }
+    return data ? data.length : 0;
+  }
+
   async createTask(data: Omit<Task, 'id' | 'created_at' | 'updated_at'>): Promise<Task> {
     const { data: created, error } = await this.client
       .from('tasks')

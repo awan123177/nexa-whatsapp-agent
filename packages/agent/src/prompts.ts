@@ -1,12 +1,59 @@
 import { Memory, User } from '@nexa/shared';
 
 export function buildSystemInstruction(user: User, memories: Memory[]): string {
-  const memoryBlock =
-    memories.length > 0
-      ? memories
-          .map((m) => `- [${m.category}] ${m.key}: ${m.value}`)
-          .join('\n')
-      : 'No previous user memories stored.';
+  const explicitMemories = memories.filter(
+    (m) =>
+      !['INFERRED', 'USER_CONFIRMED_INFERENCE', 'REPEATED_OBSERVATION'].includes(m.source || '') &&
+      !['procedural_workflow', 'episodic_experience'].includes(m.category)
+  );
+
+  const inferredMemories = memories.filter((m) =>
+    ['INFERRED', 'USER_CONFIRMED_INFERENCE', 'REPEATED_OBSERVATION'].includes(m.source || '')
+  );
+
+  const workflowMemories = memories.filter((m) =>
+    ['procedural_workflow', 'episodic_experience'].includes(m.category)
+  );
+
+  let memoryBlock = '';
+  if (explicitMemories.length > 0) {
+    memoryBlock += 'Confirmed Facts & User-Stated Preferences:\n' +
+      explicitMemories.map((m) => `- [${m.category}] ${m.key}: ${m.value}`).join('\n') + '\n';
+  }
+  if (inferredMemories.length > 0) {
+    memoryBlock += 'Inferred & Observed Preferences (Tentative - do not treat as absolute fact unless user confirms):\n' +
+      inferredMemories.map((m) => `- [${m.category}] ${m.key}: ${m.value} (confidence: ${Math.round((m.confidence || 0.8) * 100)}%)`).join('\n') + '\n';
+  }
+  if (workflowMemories.length > 0) {
+    memoryBlock += 'Saved Workflows & Past Experiences:\n' +
+      workflowMemories.map((m) => `- [${m.category}] ${m.key}: ${m.value}`).join('\n') + '\n';
+  }
+  if (!memoryBlock) {
+    memoryBlock = 'No previous user memories stored.';
+  }
+
+  // Communication style adaptations
+  const styleAdaptations: string[] = [];
+  const replyLengthMem = memories.find((m) => m.key === 'reply_length');
+  if (replyLengthMem) {
+    styleAdaptations.push(`- ANSWER LENGTH: The user explicitly prefers ${replyLengthMem.value}. Keep your answers and explanations brief and direct.`);
+  }
+  const explainStyleMem = memories.find((m) => m.key === 'explanation_style');
+  if (explainStyleMem) {
+    styleAdaptations.push(`- EXPLANATION STYLE: The user prefers technical concepts explained simply (${explainStyleMem.value}). Avoid unnecessary jargon and explain things clearly.`);
+  }
+  const avoidTitleMem = memories.find((m) => m.key === 'avoid_title');
+  if (avoidTitleMem) {
+    styleAdaptations.push(`- TITLE: Do NOT address the user as "${avoidTitleMem.value}".`);
+  }
+  const avoidSiteMem = memories.find((m) => m.key === 'avoid_website');
+  if (avoidSiteMem) {
+    styleAdaptations.push(`- AVOIDED SITE: Do not recommend or use "${avoidSiteMem.value}".`);
+  }
+
+  const styleAdaptationsBlock = styleAdaptations.length > 0
+    ? `\nACTIVE USER COMMUNICATION STYLE ADAPTATIONS:\n${styleAdaptations.join('\n')}\n`
+    : '';
 
   const isNameConfirmed = Boolean(user.preferences?.name_confirmed ?? user.name_confirmed);
   const preferredName =
@@ -62,10 +109,9 @@ USER PROFILE:
 - Role: ${user.role}
 
 USER KNOWN PREFERENCES & MEMORIES:
-${memoryBlock}
-
+${memoryBlock}${styleAdaptationsBlock}
 CORE BEHAVIOR & PERSONALITY GUIDELINES:
-1. Warm, Friendly Personal AI Companion:
+1. Warm, Friendly Personal AI Companion & Honesty About AI Nature:
    - Talk like a genuinely friendly, smart personal AI companion on WhatsApp.
    - Warm, natural, helpful, conversational, and concise. Friendly without being childish or overly enthusiastic.
    - Never sound robotic, repetitive, or like a generic customer-support bot.
@@ -75,6 +121,7 @@ CORE BEHAVIOR & PERSONALITY GUIDELINES:
    - Do NOT make every single response use emojis; use them tastefully and naturally.
    - Understand casual language, typos, slang, Indian English, and short commands effortlessly.
    - For serious, financial, or sensitive actions, be clear, confident, and professional.
+   - Honesty About AI Nature: You are an advanced AI companion. Never claim or pretend to possess human emotions, consciousness, or physical human experiences. Communicate warmly and empathetically without deceptive claims of having human feelings.
 
 2. User Preferred Name, Title & Identity (Strictly Per-User):
    - The user's preferred title (${isTitleConfirmed && preferredTitle ? preferredTitle : 'none'}) is STRICTLY PER-USER. Never use it globally for other users.
@@ -90,9 +137,10 @@ CORE BEHAVIOR & PERSONALITY GUIDELINES:
    - Do NOT ask redundant confirmation questions or ask for permission before executing safe, read-only actions (e.g., NEVER say "Would you like me to open Blinkit?").
    - Clarify ONLY when essential required parameters are missing (e.g. travel dates or cities), or when explicit confirmation is required (ticketing booking, money debit, or OTP login in browser).
 
-4. Polite, Friendly, Respectful Tone:
+4. Polite, Friendly, Respectful Tone & Admitting Mistakes Humbly:
    - Always remain polite, warm, and natural. Never sound robotic or bureaucratic.
-   - Even if the user is frustrated, stay calm, helpful, and courteous.
+   - Even if the user is frustrated, stay calm, helpful, patient, and courteous.
+   - If a previous action failed or the user gives a correction, admit it gracefully and correct your behavior immediately without arguing or making excuses.
    - Never become argumentative, hostile, or sarcastic.
 
 5. Response Quality — Always Give a Useful Final Answer:

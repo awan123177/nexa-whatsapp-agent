@@ -13,5 +13,6 @@ export * from './wallet/wallet-service.js';
 export * from './tools/wallet-tools.js';
 export * from './merchants/merchant-resolver.js';
 export * from './accounts/connected-account-manager.js';
+export * from './accounts/user-assisted-handoff.js';
 export * from './capabilities/capability-registry.js';
 export * from './factory.js';

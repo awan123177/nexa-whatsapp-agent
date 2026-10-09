@@ -29,9 +29,11 @@ import {
   ActiveRequestContext,
 } from '@nexa/shared';
 import { IDatabaseRepository, MemoryService } from '@nexa/database';
-import { ToolRegistry, merchantResolver, clearUserCart } from '@nexa/tools';
+import { ToolRegistry, merchantResolver, clearUserCart, UserAssistedHandoffManager } from '@nexa/tools';
+import { PlaywrightBrowserService } from '@nexa/browser';
 import { buildSystemInstruction } from './prompts.js';
 import { IdentityManager } from './identity.js';
+import { MemoryCommandHandler } from './memory-commands.js';
 import { TaskStateMachine } from './task-state-machine.js';
 import {
   isCancellationMessage,
@@ -181,6 +183,8 @@ export class AgentOrchestrator {
     return AgentOrchestrator.activeRunningTasks;
   }
 
+  private handoffManager: UserAssistedHandoffManager;
+
   constructor(
     private aiProvider: AIProvider,
     private toolRegistry: ToolRegistry,
@@ -190,8 +194,12 @@ export class AgentOrchestrator {
     private toolTimeoutMs = DEFAULT_TOOL_TIMEOUT_MS,
     private totalDeadlineMs = TOTAL_AGENT_DEADLINE_MS,
     private commerceMaxSteps = COMMERCE_TASK_MAX_STEPS,
-    private commerceDeadlineMs = COMMERCE_TASK_DEADLINE_MS
-  ) {}
+    private commerceDeadlineMs = COMMERCE_TASK_DEADLINE_MS,
+    private browserService?: PlaywrightBrowserService,
+    handoffManager?: UserAssistedHandoffManager
+  ) {
+    this.handoffManager = handoffManager || UserAssistedHandoffManager.getInstance(db);
+  }
 
   /**
    * Main entrypoint for processing any user message.
@@ -269,7 +277,9 @@ export class AgentOrchestrator {
 
     const isCancel = isCancellationMessage(input.text || '');
     const isPause = isPauseMessage(input.text || '');
-    const isContinue = !isCancel && !isPause && hasPreviousUnfinishedTask && isContinuationMessage(input.text || '');
+    const pendingHandoff = await this.handoffManager.getLatestPendingHandoff(user.id);
+    const isContinuationWord = isContinuationMessage(input.text || '');
+    const isContinue = !isCancel && !isPause && (hasPreviousUnfinishedTask || Boolean(pendingHandoff)) && isContinuationWord;
 
     const currentRequestId = `req_${Date.now()}_${Math.random().toString(36).substring(2, 8)}`;
     const currentActiveTaskId = isContinue
@@ -278,7 +288,7 @@ export class AgentOrchestrator {
 
     console.log(`[Context] request_created requestId=${currentRequestId} taskId=${currentActiveTaskId}`);
 
-    const intent = classifyMessageIntent(input.text || '', {
+    let intent = classifyMessageIntent(input.text || '', {
       isContinuation: isContinue,
       isCancellation: isCancel,
       isPause,
@@ -349,6 +359,42 @@ export class AgentOrchestrator {
       console.log(`[Context] previous_task_not_resumed reason="no_explicit_continuation"`);
     }
 
+    if (isContinue && pendingHandoff) {
+      console.log(`[Context] continuation_detected conversationId=${conversation.id}`);
+      console.log(`[Handoff] resume_attempt user=${user.id} merchant=${pendingHandoff.merchant}`);
+
+      const readiness = await this.handoffManager.checkSessionReadiness(user.id, pendingHandoff.merchant);
+
+      if (!readiness.ready) {
+        // Stop automated retries; do not invoke headless browser to fail again in a loop
+        console.log(`[Handoff] resume_rejected user=${user.id} merchant=${pendingHandoff.merchant} reason="${readiness.reason}"`);
+
+        const reply =
+          readiness.userFacingMessage ||
+          `I checked ${pendingHandoff.merchant}, but an authorized session hasn't been connected yet. To proceed, please connect your session or order directly via ${pendingHandoff.directUrl}. Reply "resume" once done!`;
+
+        await this.db.saveMessage({
+          conversation_id: conversation.id,
+          sender_type: 'assistant',
+          content: reply,
+        });
+
+        return {
+          replyText: reply,
+          conversationId: conversation.id,
+          stepsCount: 0,
+        };
+      } else {
+        // Authorized session established! Apply session credentials to browser
+        console.log(`[Handoff] resume_approved user=${user.id} merchant=${pendingHandoff.merchant} cookies_count=${readiness.cookiesCount}`);
+        if (this.browserService) {
+          await this.handoffManager.applySessionToBrowser(this.browserService, user.id, pendingHandoff.merchant);
+        }
+        await this.handoffManager.clearPendingHandoff(user.id, pendingHandoff.merchant);
+        intent = 'SHOPPING';
+      }
+    }
+
     const stateMachine = new TaskStateMachine('CREATED');
 
     // 5. Identity & Preferred Name Onboarding Flow
@@ -379,6 +425,35 @@ export class AgentOrchestrator {
 
       return {
         replyText: identityResult.replyText,
+        conversationId: conversation.id,
+        stepsCount: 0,
+      };
+    }
+
+    // 5b. Memory Controls & Commands (Part 10: WhatsApp memory controls)
+    const memoryCommandResult = await MemoryCommandHandler.handleCommand({
+      user,
+      text: input.text || '',
+      db: this.db,
+    });
+
+    if (memoryCommandResult.doNotRememberConversation) {
+      conversation.metadata = { ...(conversation.metadata || {}), do_not_remember: true };
+    }
+
+    if (memoryCommandResult.handled && memoryCommandResult.replyText) {
+      if (stateMachine.canTransitionTo('COMPLETED')) {
+        stateMachine.transitionTo('COMPLETED');
+      }
+      console.log(`[Agent] task_completed steps=0 memory_command=true`);
+      await this.db.saveMessage({
+        conversation_id: conversation.id,
+        sender_type: 'assistant',
+        content: memoryCommandResult.replyText,
+      });
+
+      return {
+        replyText: memoryCommandResult.replyText,
         conversationId: conversation.id,
         stepsCount: 0,
       };
@@ -614,6 +689,7 @@ export class AgentOrchestrator {
     let verifiedSuccess = false;
     let executionToolCalled = false;
     let deadlineApproaching = false;
+    const executedToolNames: string[] = [];
 
     console.log(`[Agent] task_created taskId=${currentActiveTaskId} user=${user.id}`);
     console.log(`[Agent] plan_created plan="${planName}" maxSteps=${effectiveMaxSteps}`);
@@ -900,6 +976,8 @@ export class AgentOrchestrator {
             break;
           }
 
+          executedToolNames.push(tcName);
+
           if (result.success) {
             latestExecutionToolFailed = false;
             console.log(`[Agent] tool_success name=${tcName}`);
@@ -1135,6 +1213,46 @@ export class AgentOrchestrator {
         console.log(`[Agent] task_completed steps=${currentStep}`);
       } else {
         console.log(`[Agent] task_completion_blocked current_state=${stateMachine.getState()}`);
+      }
+    }
+
+    // 8b. Episodic Experience & Procedural Workflow Learning (Part 1 C & D, Part 4)
+    const taskTools = executedToolNames.filter(
+      (t) => !['save_memory', 'get_memory', 'forget_memory'].includes(t)
+    );
+    if (taskTools.length > 0 && !conversation.metadata?.do_not_remember) {
+      const isSuccess = !modelFailed && !latestExecutionToolFailed && !deadlineApproaching;
+      const errorMsg = latestExecutionToolFailed
+        ? 'Action execution failed'
+        : modelFailed
+          ? 'Model failed'
+          : deadlineApproaching
+            ? 'Deadline reached'
+            : undefined;
+
+      try {
+        await memoryService.recordEpisodicExperience({
+          userId: user.id,
+          taskRequest: input.text || '',
+          approach: planName,
+          toolsUsed: executedToolNames,
+          outcome: isSuccess ? 'Task completed successfully' : (errorMsg || 'Task incomplete'),
+          success: isSuccess,
+          error: errorMsg,
+          reusable: isSuccess && isCommerceTask,
+        });
+
+        if (isSuccess && verifiedSuccess && resolvedMerchant) {
+          await memoryService.recordProceduralWorkflow({
+            userId: user.id,
+            service: resolvedMerchant.name,
+            workflowName: 'verified_order_checkout',
+            steps: executedToolNames,
+            verified: true,
+          });
+        }
+      } catch (err) {
+        console.error('[Learning] error_recording_episodic_experience', err);
       }
     }
 

@@ -93,7 +93,17 @@ export function encryptTokenData(
   const result: Record<string, unknown> = {};
 
   for (const [key, value] of Object.entries(data)) {
-    if (SENSITIVE_TOKEN_KEYS.has(key) && typeof value === 'string') {
+    if (key === 'cookies' && Array.isArray(value)) {
+      result[key] = value.map((cookie: any) => {
+        if (typeof cookie === 'object' && cookie !== null && typeof cookie.value === 'string') {
+          return {
+            ...cookie,
+            value: encryptToken(cookie.value, secret),
+          };
+        }
+        return cookie;
+      });
+    } else if (SENSITIVE_TOKEN_KEYS.has(key) && typeof value === 'string') {
       result[key] = encryptToken(value, secret);
     } else if (typeof value === 'object' && value !== null && !Array.isArray(value)) {
       result[key] = encryptTokenData(value as Record<string, unknown>, secret);
@@ -116,7 +126,17 @@ export function decryptTokenData(
   const result: Record<string, unknown> = {};
 
   for (const [key, value] of Object.entries(data)) {
-    if (SENSITIVE_TOKEN_KEYS.has(key) && typeof value === 'string') {
+    if (key === 'cookies' && Array.isArray(value)) {
+      result[key] = value.map((cookie: any) => {
+        if (typeof cookie === 'object' && cookie !== null && typeof cookie.value === 'string') {
+          return {
+            ...cookie,
+            value: decryptToken(cookie.value, secret),
+          };
+        }
+        return cookie;
+      });
+    } else if (SENSITIVE_TOKEN_KEYS.has(key) && typeof value === 'string') {
       result[key] = decryptToken(value, secret);
     } else if (typeof value === 'object' && value !== null && !Array.isArray(value)) {
       result[key] = decryptTokenData(value as Record<string, unknown>, secret);

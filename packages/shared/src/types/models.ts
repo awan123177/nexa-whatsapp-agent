@@ -17,6 +17,7 @@ export interface User {
   title_confirmed?: boolean;
   title_source?: TitleSource | null;
   memory_version?: number;
+  personalization_enabled?: boolean;
   created_at: string;
   updated_at: string;
 }
@@ -63,6 +64,11 @@ export interface Message {
 
 export type MemoryCategory =
   | 'identity'
+  | 'personal_profile'
+  | 'profile'
+  | 'feedback_correction'
+  | 'episodic_experience'
+  | 'procedural_workflow'
   | 'preferences'
   | 'communication_style'
   | 'travel_preferences'
@@ -78,9 +84,34 @@ export type MemoryCategory =
   | 'other_user_preferences'
   | 'preference'
   | 'travel'
-  | 'profile'
   | 'fact'
   | 'work';
+
+export type MemorySourceType =
+  | 'EXPLICIT_USER_STATEMENT'
+  | 'USER_CORRECTION'
+  | 'VERIFIED_TASK_OUTCOME'
+  | 'REPEATED_OBSERVATION'
+  | 'USER_CONFIRMED_INFERENCE'
+  | 'USER_PROVIDED'
+  | 'USER_CONFIRMED'
+  | 'INFERRED'
+  | 'SYSTEM';
+
+export type MemorySensitivity = 'low' | 'medium' | 'high';
+
+export type MemoryStatus =
+  | 'active'
+  | 'archived'
+  | 'expired'
+  | 'contradicted'
+  | 'pending_confirmation';
+
+export interface MemoryCorrectionHistoryItem {
+  timestamp: string;
+  previous_value: string;
+  reason?: string;
+}
 
 export interface Memory {
   id: string;
@@ -89,13 +120,39 @@ export interface Memory {
   key: string;
   value: string;
   confidence: number;
-  source?: 'USER_PROVIDED' | 'USER_CONFIRMED' | 'INFERRED' | 'SYSTEM' | null;
+  source?: MemorySourceType | null;
   confirmed?: boolean;
   version?: number;
+  evidence_summary?: string | null;
+  last_used_at?: string | null;
+  last_confirmed_at?: string | null;
+  expires_at?: string | null;
+  sensitivity?: MemorySensitivity | null;
+  status?: MemoryStatus | null;
+  correction_history?: MemoryCorrectionHistoryItem[];
   source_message_id?: string | null;
   metadata: Record<string, unknown>;
   created_at: string;
   updated_at: string;
+}
+
+export interface EpisodicExperience {
+  taskRequest: string;
+  approach: string;
+  toolsUsed: string[];
+  outcome: string;
+  success: boolean;
+  error?: string;
+  learning?: string;
+  reusable: boolean;
+}
+
+export interface ProceduralWorkflow {
+  service: string;
+  workflowName: string;
+  steps: string[];
+  conditions?: string;
+  verified: boolean;
 }
 
 export type TaskStatus = 'pending' | 'in_progress' | 'completed' | 'failed' | 'cancelled';

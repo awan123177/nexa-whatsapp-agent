@@ -300,12 +300,31 @@ export class InMemoryRepository implements IDatabaseRepository {
 
     const now = new Date().toISOString();
     if (existing) {
+      if (existing.value !== data.value) {
+        const history = existing.correction_history || [];
+        existing.correction_history = [
+          ...history,
+          {
+            timestamp: now,
+            previous_value: existing.value,
+            reason: data.evidence_summary || 'Updated preference',
+          },
+        ];
+      }
       existing.value = data.value;
       existing.confidence = data.confidence;
-      existing.metadata = data.metadata;
+      existing.metadata = { ...(existing.metadata || {}), ...(data.metadata || {}) };
       if (data.source !== undefined) existing.source = data.source;
-      if (data.confirmed !== undefined) existing.confirmed = data.confirmed;
-      if (data.version !== undefined) existing.version = data.version;
+      if (data.confirmed !== undefined) {
+        existing.confirmed = data.confirmed;
+        if (data.confirmed) existing.last_confirmed_at = now;
+      }
+      existing.version = (existing.version || 1) + 1;
+      if (data.evidence_summary !== undefined) existing.evidence_summary = data.evidence_summary;
+      if (data.last_used_at !== undefined) existing.last_used_at = data.last_used_at;
+      if (data.expires_at !== undefined) existing.expires_at = data.expires_at;
+      if (data.sensitivity !== undefined) existing.sensitivity = data.sensitivity;
+      if (data.status !== undefined) existing.status = data.status;
       existing.updated_at = now;
       return existing;
     }
@@ -313,9 +332,16 @@ export class InMemoryRepository implements IDatabaseRepository {
     const memory: Memory = {
       ...data,
       id: crypto.randomUUID(),
-      source: data.source || 'USER_PROVIDED',
+      source: data.source || 'EXPLICIT_USER_STATEMENT',
       confirmed: data.confirmed !== false,
       version: data.version || 1,
+      status: data.status || 'active',
+      sensitivity: data.sensitivity || 'low',
+      evidence_summary: data.evidence_summary || null,
+      last_confirmed_at: data.confirmed !== false ? now : null,
+      last_used_at: data.last_used_at || null,
+      expires_at: data.expires_at || null,
+      correction_history: data.correction_history || [],
       created_at: now,
       updated_at: now,
     };
@@ -337,6 +363,28 @@ export class InMemoryRepository implements IDatabaseRepository {
       return this.memories.delete(id);
     }
     return false;
+  }
+
+  async deleteUserMemoriesByCategory(userId: string, category: string): Promise<number> {
+    let deleted = 0;
+    for (const [id, m] of this.memories.entries()) {
+      if (m.user_id === userId && m.category === category) {
+        this.memories.delete(id);
+        deleted++;
+      }
+    }
+    return deleted;
+  }
+
+  async deleteAllUserMemories(userId: string): Promise<number> {
+    let deleted = 0;
+    for (const [id, m] of this.memories.entries()) {
+      if (m.user_id === userId) {
+        this.memories.delete(id);
+        deleted++;
+      }
+    }
+    return deleted;
   }
 
   async createTask(data: Omit<Task, 'id' | 'created_at' | 'updated_at'>): Promise<Task> {
