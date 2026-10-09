@@ -24,7 +24,7 @@ import { IDatabaseRepository } from './types.js';
 
 export class SupabaseRepository implements IDatabaseRepository {
   private client: SupabaseClient;
-  private hasExtendedMemoryColumns: boolean | null = null;
+  private hasExtendedMemoryColumns: boolean = false;
 
   constructor(supabaseUrl: string, supabaseKey: string) {
     this.client = createClient(supabaseUrl, supabaseKey, {

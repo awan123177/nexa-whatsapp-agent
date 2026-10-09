@@ -77,6 +77,53 @@ export class DuckDuckGoSearchProvider implements SearchProvider {
     return results;
   }
 
+  private async executeTierFetch(
+    url: string,
+    fetchInit: RequestInit,
+    budgetMs: number,
+    parentSignal?: AbortSignal
+  ): Promise<Response> {
+    if (parentSignal?.aborted) {
+      throw parentSignal.reason || new Error(`Web search timed out after ${budgetMs}ms`);
+    }
+
+    const tierController = new AbortController();
+    let timedOut = false;
+    const tierTimer = setTimeout(() => {
+      timedOut = true;
+      tierController.abort(new Error(`Tier request timed out after ${budgetMs}ms`));
+    }, budgetMs);
+
+    const onParentAbort = () => {
+      tierController.abort(parentSignal?.reason || new Error(`Web search timed out after ${budgetMs}ms`));
+    };
+
+    if (parentSignal) {
+      parentSignal.addEventListener('abort', onParentAbort, { once: true });
+    }
+
+    try {
+      const response = await fetch(url, {
+        ...fetchInit,
+        signal: tierController.signal,
+      });
+      return response;
+    } catch (err: any) {
+      if (parentSignal?.aborted) {
+        throw parentSignal.reason || new Error(`Web search timed out after ${budgetMs}ms`);
+      }
+      if (timedOut || err.name === 'AbortError' || err.message?.includes('aborted')) {
+        throw new Error(`Tier request timed out after ${budgetMs}ms`);
+      }
+      throw err;
+    } finally {
+      clearTimeout(tierTimer);
+      if (parentSignal) {
+        parentSignal.removeEventListener('abort', onParentAbort);
+      }
+    }
+  }
+
   async search(
     query: string,
     maxResults = 5,
@@ -87,7 +134,7 @@ export class DuckDuckGoSearchProvider implements SearchProvider {
     console.log(`[WebSearch] search_start query="${query.slice(0, 100)}" timeout_ms=${timeoutMs}`);
 
     if (options?.signal?.aborted) {
-      console.log(`[WebSearch] search_timeout timeout_ms=${timeoutMs}`);
+      console.log(`[WebSearch] search_aborted query="${query.slice(0, 50)}"`);
       throw new Error('Search aborted by caller');
     }
 
@@ -109,21 +156,18 @@ export class DuckDuckGoSearchProvider implements SearchProvider {
       // Tier 1: HTML endpoint (budgeted to half of timeout or 4000ms max)
       const tier1BudgetMs = Math.min(4000, Math.floor(timeoutMs / 2));
       try {
-        const tier1Abort = new AbortController();
-        const tier1Timer = setTimeout(() => tier1Abort.abort(), tier1BudgetMs);
-        const onAbort = () => tier1Abort.abort();
-        abortController.signal.addEventListener('abort', onAbort, { once: true });
-
         const url = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`;
-        const res = await fetch(url, {
-          signal: tier1Abort.signal,
-          headers: {
-            'User-Agent':
-              'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        const res = await this.executeTierFetch(
+          url,
+          {
+            headers: {
+              'User-Agent':
+                'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            },
           },
-        });
-        clearTimeout(tier1Timer);
-        abortController.signal.removeEventListener('abort', onAbort);
+          tier1BudgetMs,
+          abortController.signal
+        );
 
         if (res.ok) {
           const html = await res.text();
@@ -136,7 +180,7 @@ export class DuckDuckGoSearchProvider implements SearchProvider {
           }
         }
       } catch (tier1Err: any) {
-        if (abortController.signal.aborted) throw tier1Err;
+        if (abortController.signal.aborted || callerSignal?.aborted) throw tier1Err;
         console.warn(`[WebSearch] tier1_html_fallback query="${query.slice(0, 50)}" reason="${tier1Err.message}"`);
       }
 
@@ -145,24 +189,21 @@ export class DuckDuckGoSearchProvider implements SearchProvider {
         try {
           const tier2BudgetMs = Math.min(4000, timeoutMs - (Date.now() - startTime));
           if (tier2BudgetMs > 500) {
-            const tier2Abort = new AbortController();
-            const tier2Timer = setTimeout(() => tier2Abort.abort(), tier2BudgetMs);
-            const onAbort = () => tier2Abort.abort();
-            abortController.signal.addEventListener('abort', onAbort, { once: true });
-
             const liteUrl = `https://lite.duckduckgo.com/lite/`;
-            const liteRes = await fetch(liteUrl, {
-              method: 'POST',
-              signal: tier2Abort.signal,
-              headers: {
-                'Content-Type': 'application/x-www-form-urlencoded',
-                'User-Agent':
-                  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            const liteRes = await this.executeTierFetch(
+              liteUrl,
+              {
+                method: 'POST',
+                headers: {
+                  'Content-Type': 'application/x-www-form-urlencoded',
+                  'User-Agent':
+                    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                },
+                body: `q=${encodeURIComponent(query)}`,
               },
-              body: `q=${encodeURIComponent(query)}`,
-            });
-            clearTimeout(tier2Timer);
-            abortController.signal.removeEventListener('abort', onAbort);
+              tier2BudgetMs,
+              abortController.signal
+            );
 
             if (liteRes.ok) {
               const liteHtml = await liteRes.text();
@@ -176,7 +217,7 @@ export class DuckDuckGoSearchProvider implements SearchProvider {
             }
           }
         } catch (tier2Err: any) {
-          if (abortController.signal.aborted) throw tier2Err;
+          if (abortController.signal.aborted || callerSignal?.aborted) throw tier2Err;
           console.warn(`[WebSearch] tier2_lite_fallback query="${query.slice(0, 50)}" reason="${tier2Err.message}"`);
         }
       }
@@ -186,18 +227,15 @@ export class DuckDuckGoSearchProvider implements SearchProvider {
         try {
           const tier3BudgetMs = Math.min(2500, timeoutMs - (Date.now() - startTime));
           if (tier3BudgetMs > 500) {
-            const tier3Abort = new AbortController();
-            const tier3Timer = setTimeout(() => tier3Abort.abort(), tier3BudgetMs);
-            const onAbort = () => tier3Abort.abort();
-            abortController.signal.addEventListener('abort', onAbort, { once: true });
-
             const apiUrl = `https://api.duckduckgo.com/?q=${encodeURIComponent(query)}&format=json&no_html=1`;
-            const apiRes = await fetch(apiUrl, {
-              signal: tier3Abort.signal,
-              headers: { 'User-Agent': 'NEXA-Agent/2.0' },
-            });
-            clearTimeout(tier3Timer);
-            abortController.signal.removeEventListener('abort', onAbort);
+            const apiRes = await this.executeTierFetch(
+              apiUrl,
+              {
+                headers: { 'User-Agent': 'NEXA-Agent/2.0' },
+              },
+              tier3BudgetMs,
+              abortController.signal
+            );
 
             if (apiRes.ok) {
               const data = (await apiRes.json()) as any;
@@ -230,7 +268,8 @@ export class DuckDuckGoSearchProvider implements SearchProvider {
             }
           }
         } catch (tier3Err: any) {
-          if (abortController.signal.aborted) throw tier3Err;
+          if (abortController.signal.aborted || callerSignal?.aborted) throw tier3Err;
+          console.warn(`[WebSearch] tier3_api_fallback query="${query.slice(0, 50)}" reason="${tier3Err.message}"`);
         }
       }
 
@@ -242,10 +281,16 @@ export class DuckDuckGoSearchProvider implements SearchProvider {
       clearTimeout(timer);
       if (callerSignal) callerSignal.removeEventListener('abort', abortListener);
 
+      const isCallerAborted = Boolean(callerSignal?.aborted) || (err.message === 'Search aborted by caller' && Boolean(callerSignal));
+      if (isCallerAborted) {
+        console.log(`[WebSearch] search_aborted query="${query.slice(0, 50)}"`);
+        throw new Error('Search aborted by caller');
+      }
+
       const isTimeout =
+        abortController.signal.aborted ||
         err.name === 'AbortError' ||
-        (err.message && err.message.toLowerCase().includes('time')) ||
-        Boolean(callerSignal?.aborted);
+        (err.message && err.message.toLowerCase().includes('time'));
 
       if (isTimeout) {
         console.log(`[WebSearch] search_timeout timeout_ms=${timeoutMs}`);

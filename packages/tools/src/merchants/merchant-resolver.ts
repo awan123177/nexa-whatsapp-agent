@@ -113,19 +113,15 @@ export class MerchantResolver {
   }
 
   /**
-   * Resolves a user request, query, or store name into a canonical supported merchant.
-   * Logs requested, resolved, and canonical_url telemetry.
+   * Extracts a supported merchant from explicit mentions, aliases, or text with word boundaries.
+   * Returns the canonical ResolvedMerchant or null if not specified or inferred.
    */
-  public resolve(input: string): ResolvedMerchant | null {
+  public extractMerchant(input: string): ResolvedMerchant | null {
     if (!input || typeof input !== 'string') return null;
     const cleanInput = input.trim().toLowerCase();
-
-    // Hard rule: Casual words like "hello", "hey", "hi", "hello nexa", etc. are never merchants
     if (isCasualGreetingOrConversational(cleanInput)) {
       return null;
     }
-
-    console.log(`[Merchant] requested merchant="${cleanInput}"`);
 
     // 1. Direct match on merchantId or name
     for (const m of this.merchants) {
@@ -133,8 +129,6 @@ export class MerchantResolver {
         cleanInput === m.merchantId.toLowerCase() ||
         cleanInput === m.name.toLowerCase()
       ) {
-        console.log(`[Merchant] resolved merchant=${m.name}`);
-        console.log(`[Merchant] canonical_url url=${m.canonicalUrl}`);
         return m;
       }
     }
@@ -142,26 +136,52 @@ export class MerchantResolver {
     // 2. Direct match on aliases
     for (const m of this.merchants) {
       if (m.aliases.some((alias) => alias.toLowerCase() === cleanInput)) {
-        console.log(`[Merchant] resolved merchant=${m.name}`);
-        console.log(`[Merchant] canonical_url url=${m.canonicalUrl}`);
         return m;
       }
     }
 
-    // 3. Substring / sentence detection (e.g. "Order a Diet Coke from Blinkit")
-    // Use word boundaries so "amazon" matches "from amazon" but not "amazing"
+    // 3. Substring / sentence detection using word boundaries
     for (const m of this.merchants) {
       for (const alias of m.aliases) {
         const regex = new RegExp(`\\b${alias.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i');
         if (regex.test(cleanInput)) {
-          console.log(`[Merchant] resolved merchant=${m.name}`);
-          console.log(`[Merchant] canonical_url url=${m.canonicalUrl}`);
           return m;
         }
       }
     }
 
     return null;
+  }
+
+  /**
+   * Resolves a user request, query, or store name into a canonical supported merchant.
+   * Logs requested merchant token (never full sentences), resolved, and canonical_url telemetry.
+   */
+  public resolve(input: string): ResolvedMerchant | null {
+    if (!input || typeof input !== 'string') return null;
+    const cleanInput = input.trim();
+    if (isCasualGreetingOrConversational(cleanInput)) {
+      return null;
+    }
+
+    const matched = this.extractMerchant(cleanInput);
+    if (!matched) {
+      // Only log if input is a concise standalone candidate name (<= 25 chars, no spaces)
+      if (cleanInput.length <= 25 && !cleanInput.includes(' ')) {
+        console.log(`[Merchant] requested merchant="${cleanInput.toLowerCase()}"`);
+      }
+      return null;
+    }
+
+    // Log the concise extracted merchant name/token, NEVER the full user request sentence
+    const requestedToken = cleanInput.length <= 25 && !cleanInput.includes(' ')
+      ? cleanInput.toLowerCase()
+      : matched.name.toLowerCase();
+
+    console.log(`[Merchant] requested merchant="${requestedToken}"`);
+    console.log(`[Merchant] resolved merchant=${matched.name}`);
+    console.log(`[Merchant] canonical_url url=${matched.canonicalUrl}`);
+    return matched;
   }
 
   public getAllSupportedMerchants(): ResolvedMerchant[] {

@@ -303,7 +303,7 @@ describe('NEXA Reconciled Memory Schema Contract & Search Recovery Suite', () =>
 
       const tool = createWebSearchTool(mockSearchProvider);
       const executionContext: ToolExecutionContext = {
-        user: { id: 'usr-1', phone_number: '123', role: 'user', status: 'active', preferences: {} },
+        user: { id: 'usr-1', phone_number: '123', role: 'user', status: 'active', preferences: {}, created_at: '', updated_at: '' },
         conversation: { id: 'conv-1', user_id: 'usr-1', channel: 'whatsapp', status: 'active', metadata: {}, created_at: '', updated_at: '' },
         messageId: 'msg-1',
         sourceChannel: 'whatsapp',

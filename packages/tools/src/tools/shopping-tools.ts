@@ -8,6 +8,7 @@ import {
   parseToMinorUnits,
   OrderDetails,
   SavedAddress,
+  ResolvedMerchant,
 } from '@nexa/shared';
 import { IDatabaseRepository } from '@nexa/database';
 import { PlaywrightBrowserService } from '@nexa/browser';
@@ -23,6 +24,8 @@ export interface ProductItem {
   url: string;
   snippet?: string;
   packSize?: number;
+  inStock?: boolean;
+  availability?: string;
 }
 
 // In-memory user active shopping cart state
@@ -97,40 +100,112 @@ export function createShoppingTools(
       category: z.string().optional().describe('Optional category filter (e.g. grocery, electronics)'),
     }),
     requiresApproval: () => ({ required: false }),
-    execute: async (args: { query: string; category?: string }, _context: ToolExecutionContext): Promise<ToolResult> => {
+    execute: async (args: { query: string; category?: string }, context: ToolExecutionContext): Promise<ToolResult> => {
       console.log(`[Shopping] search query="${args.query}"`);
-      let results: any[] = [];
+      const searchTerms = `${args.query} buy online price`;
+      const searchTimeoutMs = Math.min(context.timeoutMs ?? 10_000, 8_000);
+
       try {
-        const searchTerms = `${args.query} buy online price`;
-        const searchPromise = searchProvider.search(searchTerms, 6);
-        const timeoutPromise = new Promise<never>((_, reject) =>
-          setTimeout(() => reject(new Error('Search timeout')), 4000)
-        );
-        results = await Promise.race([searchPromise, timeoutPromise]);
-      } catch {
-        results = [];
-      }
+        const results = await searchProvider.search(searchTerms, 6, {
+          signal: context.abortSignal,
+          timeoutMs: searchTimeoutMs,
+        });
 
-      const products: ProductItem[] = results.map((r) => {
-        let store = 'online';
-        try {
-          store = new URL(r.url).hostname.replace('www.', '');
-        } catch {}
+        const products: ProductItem[] = results.map((r) => {
+          let store = 'online';
+          try {
+            store = new URL(r.url).hostname.replace('www.', '');
+          } catch {}
+
+          // Extract price from title or snippet (e.g. ₹699, Rs. 1,499)
+          let price: number | undefined = undefined;
+          const priceMatch = `${r.snippet} ${r.title}`.match(/(?:₹|Rs\.?|INR)\s*([\d,]+(?:\.\d{2})?)/i);
+          if (priceMatch && priceMatch[1]) {
+            const parsed = parseFloat(priceMatch[1].replace(/,/g, ''));
+            if (!isNaN(parsed)) price = parsed;
+          }
+
+          // Extract pack size (e.g. 3-pack, pack of 3, 3 pcs, set of 3)
+          let packSize: number | undefined = undefined;
+          const packMatch =
+            `${r.title} ${r.snippet}`.match(/(\d+)\s*(?:[- ]?pack|pcs|piece|pieces|units?|count|set)\b/i) ||
+            `${r.title} ${r.snippet}`.match(/\b(?:pack of|set of)\s*(\d+)/i);
+          if (packMatch && packMatch[1]) {
+            const parsedPack = parseInt(packMatch[1], 10);
+            if (!isNaN(parsedPack)) packSize = parsedPack;
+          }
+
+          // Extract observable availability
+          let inStock: boolean | undefined = undefined;
+          let availability: string | undefined = undefined;
+          if (/(?:out of stock|currently unavailable|sold out)/i.test(r.snippet)) {
+            inStock = false;
+            availability = 'Out of Stock';
+          } else if (/(?:in stock|available|buy now|add to cart)/i.test(r.snippet)) {
+            inStock = true;
+            availability = 'In Stock';
+          }
+
+          return {
+            title: r.title,
+            store,
+            price,
+            currency: price !== undefined ? 'INR' : undefined,
+            url: r.url,
+            snippet: r.snippet,
+            packSize,
+            inStock,
+            availability,
+          };
+        });
+
+        if (products.length === 0) {
+          console.log(`[Shopping] search_empty query="${args.query}"`);
+          return {
+            success: true,
+            data: {
+              query: args.query,
+              count: 0,
+              products: [],
+              empty: true,
+              suggestedAction:
+                'No products found via web search. Transition directly to browser automation on the merchant (e.g. Amazon India https://www.amazon.in) using browser_open or shopping_search.',
+            },
+            userFacingMessage: `No products found matching "${args.query}".`,
+          };
+        }
+
         return {
-          title: r.title,
-          store,
-          url: r.url,
-          snippet: r.snippet,
+          success: true,
+          data: {
+            query: args.query,
+            count: products.length,
+            products,
+          },
         };
-      });
+      } catch (err: any) {
+        const errMsg = err.message || 'Product search failed';
+        const isTimeout =
+          errMsg.toLowerCase().includes('timed out') ||
+          errMsg.toLowerCase().includes('timeout') ||
+          Boolean(context.abortSignal?.aborted);
 
-      return {
-        success: true,
-        data: {
-          query: args.query,
-          products,
-        },
-      };
+        console.log(`[Shopping] search_error query="${args.query}" error="${errMsg}" is_timeout=${isTimeout}`);
+
+        return {
+          success: false,
+          error: errMsg,
+          data: {
+            success: false,
+            errorType: isTimeout ? 'TIMEOUT' : 'SEARCH_FAILED',
+            message: errMsg,
+            retriable: true,
+            suggestedAction:
+              'Product search failed or timed out. Transition directly to browser automation on the merchant (e.g. Amazon India https://www.amazon.in) using browser_open, shopping_search, or other browser tools.',
+          },
+          userFacingMessage: 'Product search was unable to retrieve live items at this time. Falling back to direct merchant browsing.',
+        };
+      }
     },
   };
 
@@ -144,9 +219,16 @@ export function createShoppingTools(
     }),
     requiresApproval: () => ({ required: false }),
     execute: async (args: { query: string; merchant?: string }, _context: ToolExecutionContext): Promise<ToolResult> => {
-      const merchantInput = args.merchant || args.query;
-      const resolved = merchantResolver.resolve(merchantInput) || merchantResolver.resolve('blinkit');
-      const storeName = resolved ? resolved.name : (args.merchant || 'Blinkit');
+      let resolved: ResolvedMerchant | null = null;
+      if (args.merchant) {
+        resolved = merchantResolver.resolve(args.merchant);
+      } else if (args.query) {
+        resolved = merchantResolver.extractMerchant(args.query);
+      }
+
+      // If no merchant is specified or inferred, leave it unset rather than using the full query string
+      const storeName = resolved ? resolved.name : (args.merchant || 'Amazon');
+      const canonicalUrl = resolved?.canonicalUrl || (storeName === 'Amazon' ? 'https://www.amazon.in' : 'https://www.swiggy.com/instamart');
 
       console.log(`[Shopping] search merchant=${storeName} query="${args.query}"`);
 
@@ -154,7 +236,6 @@ export function createShoppingTools(
 
       // 1. Real browser navigation & adaptive search when browserService is available
       if (browserService) {
-        const canonicalUrl = resolved?.canonicalUrl || 'https://www.swiggy.com/instamart';
         try {
           // If user has an authorized session, inject session credentials into browser context
           if (handoffMgr && _context.user?.id) {
@@ -272,21 +353,39 @@ export function createShoppingTools(
         }
       }
 
-      // 2. If no browser products yet, execute bounded web search (capped at 4s to never consume 10s tool budget)
+      // 2. If no browser products yet, execute bounded web search
       if (products.length === 0) {
         try {
-          const searchTerms = `site:${resolved?.canonicalUrl.replace('https://', '').replace('www.', '') || 'blinkit.com'} ${args.query}`;
-          const searchPromise = searchProvider.search(searchTerms, 5);
-          const timeoutPromise = new Promise<never>((_, reject) =>
-            setTimeout(() => reject(new Error('Search timeout')), 4000)
-          );
-          const results = await Promise.race([searchPromise, timeoutPromise]);
-          products = results.map((r) => ({
-            title: r.title,
-            store: storeName,
-            url: r.url,
-            snippet: r.snippet,
-          }));
+          const storeDomain = resolved
+            ? new URL(resolved.canonicalUrl).hostname.replace('www.', '')
+            : (storeName === 'Amazon' ? 'amazon.in' : 'blinkit.com');
+          const searchTerms = `site:${storeDomain} ${args.query}`;
+          const searchTimeoutMs = Math.min(_context.timeoutMs ?? 10_000, 5_000);
+          const results = await searchProvider.search(searchTerms, 5, {
+            signal: _context.abortSignal,
+            timeoutMs: searchTimeoutMs,
+          });
+          products = results.map((r) => {
+            let price: number | undefined = undefined;
+            const priceMatch = `${r.snippet} ${r.title}`.match(/(?:₹|Rs\.?|INR)\s*([\d,]+(?:\.\d{2})?)/i);
+            if (priceMatch && priceMatch[1]) {
+              const parsed = parseFloat(priceMatch[1].replace(/,/g, ''));
+              if (!isNaN(parsed)) price = parsed;
+            }
+            const packMatch =
+              `${r.title} ${r.snippet}`.match(/(\d+)\s*(?:[- ]?pack|pcs|piece|pieces|units?|count|set)\b/i) ||
+              `${r.title} ${r.snippet}`.match(/\b(?:pack of|set of)\s*(\d+)/i);
+            const packSize = packMatch ? parseInt(packMatch[1], 10) : undefined;
+            return {
+              title: r.title,
+              store: storeName,
+              price,
+              currency: price ? 'INR' : undefined,
+              url: r.url,
+              snippet: r.snippet,
+              packSize,
+            };
+          });
         } catch {
           // Bounded search timed out or encountered error; gracefully provide structured catalog item
         }
@@ -302,7 +401,7 @@ export function createShoppingTools(
           store: storeName,
           price: defaultPrice,
           currency: 'INR',
-          url: `${resolved?.canonicalUrl || 'https://www.amazon.in'}/s?k=${encodeURIComponent(args.query)}`,
+          url: `${canonicalUrl}/s?k=${encodeURIComponent(args.query)}`,
           snippet: `${args.query} available on ${storeName}`,
           packSize,
         });
@@ -451,7 +550,42 @@ export function createShoppingTools(
     ): Promise<ToolResult> => {
       const userId = context.user.id;
       console.log(`[Agent] verification_started step=shopping_cart target="${args.expectedItem || 'all_items'}"`);
-      const cart = userCarts.get(userId);
+      let cart = userCarts.get(userId);
+
+      // If in-memory cart is empty but browserService is active, verify and sync browser cart
+      if ((!cart || cart.items.length === 0) && browserService) {
+        try {
+          const browserCart = await browserService.verifyCart(
+            context.sessionId || userId,
+            args.expectedItem,
+            {
+              signal: context.abortSignal,
+              timeoutMs: context.timeoutMs,
+              taskId: context.taskId,
+              requestId: context.requestId,
+            }
+          );
+          if (browserCart.items.length > 0) {
+            cart = {
+              store: args.merchant || 'Amazon',
+              items: browserCart.items.map((bItem) => {
+                const inferredPackMatch = bItem.name.match(/(\d+)[ -]?(?:pack|set|count|pcs|piece)/i);
+                const pack = inferredPackMatch ? parseInt(inferredPackMatch[1], 10) : 1;
+                return {
+                  name: bItem.name,
+                  priceMinor: bItem.priceMinor || Math.round((browserCart.totalPriceMinor || 0) / browserCart.items.length),
+                  quantity: bItem.quantity || 1,
+                  store: args.merchant || 'Amazon',
+                  packSize: pack,
+                  totalUnits: pack * (bItem.quantity || 1),
+                };
+              }),
+              lastVerifiedAt: Date.now(),
+            };
+            userCarts.set(userId, cart);
+          }
+        } catch {}
+      }
 
       if (!cart || cart.items.length === 0) {
         return {

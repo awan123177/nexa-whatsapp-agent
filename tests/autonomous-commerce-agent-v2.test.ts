@@ -490,7 +490,7 @@ describe('NEXA Autonomous Account + Commerce Agent V2 Suite', () => {
     const logs = consoleSpy.mock.calls.map((c) => c.join(' '));
 
     // Verify merchant resolved
-    expect(logs.some((l) => l.includes('[Merchant] requested merchant="order a diet coke from blinkit."'))).toBe(true);
+    expect(logs.some((l) => l.includes('[Merchant] requested merchant="blinkit"'))).toBe(true);
     expect(logs.some((l) => l.includes('[Merchant] resolved merchant=Blinkit'))).toBe(true);
     expect(logs.some((l) => l.includes('[Merchant] canonical_url url=https://blinkit.com'))).toBe(true);
 

@@ -762,6 +762,7 @@ export class AgentOrchestrator {
         }
 
         currentStep++;
+        let stepHadToolFailure = false;
         console.log(`[Agent] step_started step=${currentStep}`);
 
       const thinkingLevel = resolveThinkingLevel(currentTurnContent, currentStep, input.thinkingLevel);
@@ -801,7 +802,7 @@ export class AgentOrchestrator {
 
       // Case A: Model returned plain text without calling any tools
       if (!aiResponse.toolCalls || aiResponse.toolCalls.length === 0) {
-        if (!latestExecutionToolFailed) {
+        if (!latestExecutionToolFailed && !stepHadToolFailure && !deadlineApproaching) {
           console.log(`[Agent] step_completed step=${currentStep}`);
         }
         finalReply = aiResponse.text;
@@ -855,7 +856,7 @@ export class AgentOrchestrator {
 
       const toolResultsForNextTurn: any[] = [];
       const functionResponseParts: any[] = [];
-      let stepHadToolFailure = false;
+      stepHadToolFailure = false;
 
       for (const tc of aiResponse.toolCalls) {
         if (stateMachine.isTerminal() || taskAbortController.signal.aborted) {
@@ -1041,8 +1042,30 @@ export class AgentOrchestrator {
           executedToolNames.push(tcName);
 
           if (result.success) {
-            latestExecutionToolFailed = false;
-            console.log(`[Agent] tool_success name=${tcName}`);
+            const isSearchTool = tcName === 'search_products' || tcName === 'web_search' || tcName === 'shopping_search';
+            const data = (result.data || {}) as Record<string, any>;
+            const isEmptySearchResult =
+              isSearchTool &&
+              Boolean(
+                data.empty === true ||
+                (Array.isArray(data.products) && data.products.length === 0) ||
+                (Array.isArray(data.results) && data.results.length === 0)
+              );
+
+            if (isEmptySearchResult) {
+              stepHadToolFailure = true;
+              console.log(`[Agent] step_incomplete step=${currentStep} tool=${tcName} reason="empty_search_results"`);
+              if (isCommerceTask) {
+                if (stateMachine.canTransitionTo('RECOVERING')) {
+                  stateMachine.transitionTo('RECOVERING');
+                }
+                console.log(`[Agent] plan_transition step=${currentStep} from=search to=browser_fallback reason="empty_search_results"`);
+              }
+            } else {
+              latestExecutionToolFailed = false;
+              console.log(`[Agent] tool_success name=${tcName}`);
+            }
+
             if (tcName.includes('verify')) {
               verifiedSuccess = true;
               console.log(`[Agent] verification_passed tool=${tcName}`);
@@ -1087,6 +1110,10 @@ export class AgentOrchestrator {
               stateMachine.transitionTo('RECOVERING');
             }
             console.log(`[Agent] recovery_started tool=${tcName} reason="${errMsg}"`);
+
+            if (isCommerceTask && (tcName === 'search_products' || tcName === 'web_search' || tcName === 'shopping_search')) {
+              console.log(`[Agent] plan_transition step=${currentStep} from=search to=browser_fallback reason="search_failed"`);
+            }
 
             toolResultsForNextTurn.push({
               toolCallId: tc.id,
@@ -1168,6 +1195,10 @@ export class AgentOrchestrator {
           }
           console.log(`[Agent] recovery_started tool=${tcName} reason="${errMsg}"`);
 
+          if (isCommerceTask && (tcName === 'search_products' || tcName === 'web_search' || tcName === 'shopping_search')) {
+            console.log(`[Agent] plan_transition step=${currentStep} from=search to=browser_fallback reason="search_exception"`);
+          }
+
           const errorPayload: Record<string, unknown> = isTimeout
             ? { success: false, errorType: 'TIMEOUT', error: errMsg, message: errMsg }
             : { success: false, error: errMsg };
@@ -1204,7 +1235,7 @@ export class AgentOrchestrator {
         });
       }
 
-      if (!stepHadToolFailure && !stateMachine.isTerminal() && !taskAbortController.signal.aborted) {
+      if (!stepHadToolFailure && !stateMachine.isTerminal() && !taskAbortController.signal.aborted && !deadlineApproaching) {
         console.log(`[Agent] step_completed step=${currentStep}`);
       }
     }

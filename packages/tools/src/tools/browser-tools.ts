@@ -258,7 +258,7 @@ export function createBrowserTools(
       context: ToolExecutionContext
     ): Promise<ToolResult> => {
       const sessionId = args.sessionId || context.user?.id || 'default';
-      const cart = await browserService.verifyCart(sessionId, args.expectedItem);
+      const cart = await browserService.verifyCart(sessionId, args.expectedItem, getActionOptions(context, args.sessionId));
       return {
         success: true,
         data: cart,
