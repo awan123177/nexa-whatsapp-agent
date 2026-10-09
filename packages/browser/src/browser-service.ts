@@ -64,6 +64,7 @@ export class PlaywrightBrowserService {
   private sessions: Map<string, BrowserSessionMetadata> = new Map();
   private activeSessionId: string = 'default';
   private sessionLocks: Map<string, Promise<void>> = new Map();
+  private inFlightNavigations: Map<string, { url: string; promise: Promise<BrowserOpenResult> }> = new Map();
   private terminalTasks: Set<string> = new Set();
 
   markTaskTerminal(taskId: string): void {
@@ -130,6 +131,10 @@ export class PlaywrightBrowserService {
         const result = await action();
 
         if (this.isTaskTerminal(taskId) || options?.signal?.aborted) {
+          if (result && typeof result === 'object' && (result as any).success === true) {
+            console.log(`[Browser] late_result_preserved action=${operationName} sessionId=${sessionId}`);
+            return result;
+          }
           console.log(`[Browser] late_result_discarded taskId=${taskId} operation=${operationName} reason="aborted_or_terminal_after_run"`);
           throw new ToolExecutionError(operationName, `Operation ${operationName} result discarded due to cancellation.`);
         }
@@ -433,23 +438,43 @@ export class PlaywrightBrowserService {
 
   async openPage(targetUrl: string, options?: BrowserOpenOptions): Promise<BrowserOpenResult> {
     const sessionId = options?.sessionId || this.activeSessionId || 'default';
-    try {
-      return await this.withSessionLock(sessionId, 'browser_open', options, async () => {
-        return this.internalOpenPage(targetUrl, sessionId, options);
-      });
-    } catch (err: any) {
-      const isTimeout =
-        options?.signal?.aborted ||
-        err.name === 'ToolTimeoutError' ||
-        err.name === 'TimeoutError' ||
-        (err.message && err.message.toLowerCase().includes('timeout')) ||
-        (err.message && err.message.toLowerCase().includes('abort'));
 
-      return {
-        success: false,
-        errorType: isTimeout ? 'TIMEOUT' : 'NAVIGATION_FAILED',
-        message: err.message || 'Browser navigation failed',
-      };
+    // Ensure one active navigation per browser session & deduplicate identical in-flight navigations
+    const inFlight = this.inFlightNavigations.get(sessionId);
+    if (inFlight && inFlight.url === targetUrl) {
+      console.log(`[Browser] navigation_deduped url="${sanitizeUrlForLogs(targetUrl)}" sessionId=${sessionId}`);
+      return inFlight.promise;
+    }
+
+    const navPromise: Promise<BrowserOpenResult> = (async (): Promise<BrowserOpenResult> => {
+      try {
+        return await this.withSessionLock(sessionId, 'browser_open', options, async () => {
+          return this.internalOpenPage(targetUrl, sessionId, options);
+        });
+      } catch (err: any) {
+        const isTimeout =
+          options?.signal?.aborted ||
+          err.name === 'ToolTimeoutError' ||
+          err.name === 'TimeoutError' ||
+          (err.message && err.message.toLowerCase().includes('timeout')) ||
+          (err.message && err.message.toLowerCase().includes('abort'));
+
+        return {
+          success: false,
+          errorType: isTimeout ? 'TIMEOUT' : 'NAVIGATION_FAILED',
+          message: err.message || 'Browser navigation failed',
+        };
+      }
+    })();
+
+    this.inFlightNavigations.set(sessionId, { url: targetUrl, promise: navPromise });
+    try {
+      return await navPromise;
+    } finally {
+      const current = this.inFlightNavigations.get(sessionId);
+      if (current && current.promise === navPromise) {
+        this.inFlightNavigations.delete(sessionId);
+      }
     }
   }
 
@@ -1158,8 +1183,12 @@ export class PlaywrightBrowserService {
       title: p.title,
       store: parsedUrl,
       price: p.rawPrice,
-      url: page.url(),
+      url: p.url || p.href || page.url(),
+      href: p.href || p.url || page.url(),
       snippet: p.price ? `${p.title} (${p.price})` : p.title,
+      asin: p.asin,
+      packSize: p.packSize,
+      selector: p.selector,
     }));
 
     const latency = Date.now() - start;
@@ -1238,6 +1267,12 @@ export class PlaywrightBrowserService {
 
   getPage(): Page | null {
     return this.page;
+  }
+
+  async stopPage(): Promise<void> {
+    if (this.page && !this.page.isClosed()) {
+      await this.page.evaluate(() => window.stop()).catch(() => {});
+    }
   }
 
   async takeScreenshot(options?: ScreenshotOptions): Promise<ScreenshotResult> {

@@ -266,12 +266,17 @@ export function createShoppingTools(
               }
             : undefined;
 
+          const isAmazon = storeName === 'Amazon';
+          const targetNavUrl = isAmazon && args.query
+            ? `https://www.amazon.in/s?k=${encodeURIComponent(args.query)}`
+            : canonicalUrl;
+
           const isAlreadyOnStore = currentUrl && hostname && currentUrl.includes(hostname);
-          if (!isAlreadyOnStore) {
-            console.log(`[Shopping] browser_navigation_start merchant=${storeName} url="${canonicalUrl}"`);
+          if (!isAlreadyOnStore || isAmazon) {
+            console.log(`[Shopping] browser_navigation_start merchant=${storeName} url="${targetNavUrl}"`);
             const openRes = browserOpts
-              ? await browserService.openPage(canonicalUrl, browserOpts)
-              : await browserService.openPage(canonicalUrl);
+              ? await browserService.openPage(targetNavUrl, browserOpts)
+              : await browserService.openPage(targetNavUrl);
             if (!openRes.success) {
               console.log(`[Shopping] browser_navigation_failed merchant=${storeName} error="${openRes.message}" error_type=${openRes.errorType}`);
 
@@ -284,7 +289,7 @@ export function createShoppingTools(
                 const handoff = await handoffMgr.initiateHandoff({
                   userId: _context.user.id,
                   merchant: storeName,
-                  canonicalUrl,
+                  canonicalUrl: targetNavUrl,
                   openResult: openRes,
                 });
                 userFacingMessage = handoff.userFacingMessage;
@@ -297,7 +302,7 @@ export function createShoppingTools(
                 data: {
                   handoffRequired: true,
                   merchant: storeName,
-                  canonicalUrl,
+                  canonicalUrl: targetNavUrl,
                   errorType: openRes.errorType,
                 },
               };
@@ -314,7 +319,7 @@ export function createShoppingTools(
                 const handoff = await handoffMgr.initiateHandoff({
                   userId: _context.user.id,
                   merchant: storeName,
-                  canonicalUrl,
+                  canonicalUrl: targetNavUrl,
                   authState: (pageState.authState as any) || 'BLOCKED',
                   failureReason: `Merchant presented verification challenge (${pageState.challengeType || 'CAPTCHA'})`,
                   errorType: pageState.challengeType ? 'CAPTCHA_REQUIRED' : 'BOT_BLOCKED',
@@ -329,24 +334,47 @@ export function createShoppingTools(
                 data: {
                   handoffRequired: true,
                   merchant: storeName,
-                  canonicalUrl,
+                  canonicalUrl: targetNavUrl,
                   authState: pageState.authState,
                 },
               };
             }
+
+            // Direct page observation for search results (e.g. Amazon cards)
+            const obs = await browserService.observePage(browserOpts?.sessionId).catch(() => null);
+            if (obs && Array.isArray(obs.products) && obs.products.length > 0) {
+              products = obs.products.map((p) => ({
+                title: p.title,
+                store: storeName,
+                price: p.rawPrice,
+                url: p.url || p.href || targetNavUrl,
+                href: p.href || p.url || targetNavUrl,
+                snippet: p.price ? `${p.title} (${p.price})` : p.title,
+                asin: p.asin,
+                packSize: p.packSize,
+                selector: p.selector,
+              }));
+              console.log(`[Shopping] direct_observation_products_found merchant=${storeName} count=${products.length}`);
+            }
           }
 
-          const browserRes = browserOpts
-            ? await browserService.adaptiveSearch(args.query, browserOpts.sessionId, browserOpts)
-            : await browserService.adaptiveSearch(args.query);
-          if (browserRes.success && browserRes.products.length > 0) {
-            products = browserRes.products.map((p) => ({
-              title: p.title,
-              store: storeName,
-              price: p.price,
-              url: p.url,
-              snippet: p.snippet,
-            }));
+          if (products.length === 0) {
+            const browserRes = browserOpts
+              ? await browserService.adaptiveSearch(args.query, browserOpts.sessionId, browserOpts)
+              : await browserService.adaptiveSearch(args.query);
+            if (browserRes.success && browserRes.products.length > 0) {
+              products = browserRes.products.map((p) => ({
+                title: p.title,
+                store: storeName,
+                price: p.price,
+                url: p.url,
+                snippet: p.snippet,
+                asin: (p as any).asin,
+                packSize: (p as any).packSize,
+                href: (p as any).href || p.url,
+                selector: (p as any).selector,
+              }));
+            }
           }
         } catch (err: any) {
           console.log(`[Shopping] browser_search_fallback merchant=${storeName} reason="${err.message}"`);

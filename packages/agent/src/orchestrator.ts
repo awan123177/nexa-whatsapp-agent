@@ -111,9 +111,10 @@ export function resolveToolTimeout(toolName: string, defaultTimeout = DEFAULT_TO
     case 'shopping_checkout':
       return BROWSER_ACTION_TIMEOUT_MS; // 12000
     case 'web_search':
-    case 'shopping_search':
     case 'youtube_search':
       return WEB_SEARCH_TIMEOUT_MS; // 10000
+    case 'shopping_search':
+      return BROWSER_NAVIGATION_TIMEOUT_MS; // 15000
     case 'youtube_get_transcript':
     case 'youtube_analyze_video':
     case 'youtube_compare_reviews':
@@ -1068,6 +1069,41 @@ export class AgentOrchestrator {
               continue;
             }
           }
+
+          // 3. Browser Fallback & Active Session Interception (Priority Fix 3):
+          // If browser is already open on merchant or fallback is active, prevent generic web_search/search_products
+          if (tcName === 'search_products' || tcName === 'web_search') {
+            const currentActiveUrl = this.browserService?.getActiveUrl() || '';
+            const hasOpenMerchantPage =
+              Boolean(currentActiveUrl) &&
+              (currentActiveUrl.includes('amazon') ||
+                currentActiveUrl.includes('swiggy') ||
+                currentActiveUrl.includes('instamart') ||
+                currentActiveUrl.includes('blinkit'));
+
+            if (hasOpenMerchantPage || stateMachine.getState() === 'RECOVERING') {
+              console.log(
+                `[Agent] search_intercepted_for_open_session tool=${tcName} current_url="${currentActiveUrl}" action="use_browser_observe"`
+              );
+              const interceptMsg = currentActiveUrl
+                ? `Browser session is already active at ${currentActiveUrl}. Do not call generic search tools. Inspect the active page using browser_observe to extract product links, or navigate directly using browser_open.`
+                : `Browser fallback is active for ${resolvedMerchant?.name || 'the merchant'}. Do not retry web search. Open the merchant directly using browser_open and inspect items with browser_observe.`;
+              toolResultsForNextTurn.push({
+                toolCallId: tc.id,
+                name: tcName,
+                result: { blocked: true, reason: interceptMsg, currentUrl: currentActiveUrl },
+                isError: false,
+              });
+              functionResponseParts.push({
+                functionResponse: {
+                  name: tcName,
+                  response: { blocked: true, reason: interceptMsg, currentUrl: currentActiveUrl },
+                  id: tc.id,
+                },
+              });
+              continue;
+            }
+          }
         }
 
         // Check 3: Calculate tool-specific bounded timeout respecting total request deadline
@@ -1216,15 +1252,23 @@ export class AgentOrchestrator {
                         ((p.packSize && p.packSize >= 3) || (p.title && /3[- ]pack|pack of 3|set of 3/i.test(p.title))) &&
                         ((p.rawPrice && p.rawPrice <= 1500) || (p.price && p.price <= 1500))
                     ) || observedProducts[0];
-                  if (matched && !shoppingMachine.getSelectedProduct()) {
-                    shoppingMachine.setSelectedProduct({
-                      asin: matched.asin,
-                      title: matched.title,
-                      price: matched.rawPrice || matched.price,
-                      packSize: matched.packSize || 3,
-                      url: matched.url || matched.href,
-                      selector: matched.selector,
-                    });
+                  if (matched) {
+                    const isQual = shoppingMachine.isProductQualified(matched);
+                    console.log(
+                      `[ShoppingWorkflow] product_verified asin="${matched.asin || ''}" title="${matched.title}" price=${
+                        matched.rawPrice || matched.price || 0
+                      } pack_size=${matched.packSize || 1} qualified=${isQual}`
+                    );
+                    if (!shoppingMachine.getSelectedProduct()) {
+                      shoppingMachine.setSelectedProduct({
+                        asin: matched.asin,
+                        title: matched.title,
+                        price: matched.rawPrice || matched.price,
+                        packSize: matched.packSize || 3,
+                        url: matched.url || matched.href,
+                        selector: matched.selector,
+                      });
+                    }
                   }
                 }
               } else if (tcName === 'browser_open' || tcName === 'browser_click') {
@@ -1264,14 +1308,25 @@ export class AgentOrchestrator {
                 }
               } else if (tcName === 'browser_screenshot') {
                 const mediaId = (data.mediaId as string) || undefined;
-                shoppingMachine.setScreenshotDelivered(mediaId);
-                if (shoppingMachine.canAdvancePhaseTo('DELIVER_SCREENSHOT')) {
-                  shoppingMachine.advancePhase('DELIVER_SCREENSHOT', 'screenshot_delivered');
+                const delivered = Boolean(data.deliveredToWhatsApp);
+                if (delivered || mediaId) {
+                  shoppingMachine.setScreenshotDelivered(mediaId);
+                  if (shoppingMachine.canAdvancePhaseTo('DELIVER_SCREENSHOT')) {
+                    shoppingMachine.advancePhase('DELIVER_SCREENSHOT', 'screenshot_delivered');
+                  }
+                  if (shoppingMachine.canAdvancePhaseTo('COMPLETED')) {
+                    shoppingMachine.advancePhase('COMPLETED', 'transaction_free_workflow_completed');
+                  }
+                  console.log(
+                    `[ShoppingWorkflow] workflow_completed reason="cart_verified_and_screenshot_delivered" media_id="${
+                      mediaId || 'none'
+                    }"`
+                  );
+                } else {
+                  console.log(
+                    `[ShoppingWorkflow] screenshot_delivery_failed media_id="${mediaId || 'none'}" reason="not_delivered_to_whatsapp"`
+                  );
                 }
-                if (shoppingMachine.canAdvancePhaseTo('COMPLETED')) {
-                  shoppingMachine.advancePhase('COMPLETED', 'transaction_free_workflow_completed');
-                }
-                console.log('[ShoppingWorkflow] workflow_completed reason="cart_verified_and_screenshot_delivered"');
               }
               shoppingMachine.emitTelemetry();
             }
@@ -1346,7 +1401,7 @@ export class AgentOrchestrator {
             abortController.abort(err);
           }
           if (this.browserService) {
-            await this.browserService.cleanupPage().catch(() => {});
+            await this.browserService.stopPage().catch(() => {});
           }
 
           // Check if this was an intentional pause for user confirmation!
@@ -1464,8 +1519,9 @@ export class AgentOrchestrator {
     }
 
     if (deadlineApproaching) {
-      finalReply =
-        "I was unable to complete the request within the allocated time limit. Please try again or simplify your request.";
+      finalReply = isCommerceTask
+        ? "I was unable to complete the Amazon cart verification and screenshot within the time limit. Amazon India took too long to load and respond. Please try again in a moment."
+        : "I was unable to complete the request within the allocated time limit. Please try again or simplify your request.";
     } else if (!finalReply) {
       const networkToolNames = [
         'web_search',

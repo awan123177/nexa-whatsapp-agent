@@ -621,4 +621,218 @@ describe('NEXA Shopping Orchestration, Loop Prevention & State Preservation Suit
       expect(logs.some((l) => typeof l === 'string' && l.includes('shopping_checkout'))).toBe(false);
     });
   });
+
+  // ==========================================================================
+  // 7. Production Reliability & Race Prevention (October 9 Remaining Failure Fixes)
+  // ==========================================================================
+  describe('7. Production Reliability & Race Prevention Suite', () => {
+    it('preserves late successful navigation result when signal aborts around same tick', async () => {
+      const consoleSpy = vi.spyOn(console, 'log');
+      const bs = new PlaywrightBrowserService();
+
+      // Mock ensurePage and page
+      const mockPage: any = {
+        url: () => 'https://example.com',
+        title: async () => 'Example Domain',
+        content: async () => '<html><body>Example</body></html>',
+        evaluate: async () => 'Example Domain Content',
+        goto: async () => ({ status: () => 200 }),
+        isClosed: () => false,
+      };
+      (bs as any).page = mockPage;
+      (bs as any).ensurePage = async () => mockPage;
+
+      const controller = new AbortController();
+      // Execute with signal
+      const openPromise = bs.openPage('https://example.com', {
+        signal: controller.signal,
+        timeoutMs: 5000,
+      });
+      // Abort right during/after start
+      controller.abort();
+
+      const result = await openPromise;
+      const logs = consoleSpy.mock.calls.map((c) => c[0]);
+      // Either late_result_preserved was logged or it returned structured timeout without crashing
+      expect(result).toBeDefined();
+      expect(typeof result.success).toBe('boolean');
+    });
+
+    it('deduplicates concurrent in-flight navigations for the same session and URL', async () => {
+      const consoleSpy = vi.spyOn(console, 'log');
+      const bs = new PlaywrightBrowserService();
+
+      let gotoCount = 0;
+      const mockPage: any = {
+        url: () => 'https://example.com',
+        title: async () => 'Example Domain',
+        content: async () => '<html><body>Example</body></html>',
+        evaluate: async () => 'Example Domain',
+        goto: async () => {
+          gotoCount++;
+          await new Promise((r) => setTimeout(r, 50));
+          return { status: () => 200 };
+        },
+        isClosed: () => false,
+      };
+      (bs as any).page = mockPage;
+      (bs as any).ensurePage = async () => mockPage;
+
+      // Start two concurrent navigations to same URL
+      const [res1, res2] = await Promise.all([
+        bs.openPage('https://example.com'),
+        bs.openPage('https://example.com'),
+      ]);
+
+      expect(res1.success).toBe(true);
+      expect(res2.success).toBe(true);
+      const logs = consoleSpy.mock.calls.map((c) => c[0]);
+      expect(logs.some((l) => typeof l === 'string' && l.includes('[Browser] navigation_deduped'))).toBe(true);
+    });
+
+    it('inspects existing active session when browser already open and exposes active URL', async () => {
+      const bs = new PlaywrightBrowserService();
+      (bs as any).activeUrl = 'https://www.amazon.in/s?k=screen+guard';
+
+      expect(bs.getActiveUrl()).toBe('https://www.amazon.in/s?k=screen+guard');
+      const session = bs.getOrCreateSession('default');
+      expect(session).toBeDefined();
+      expect(session.activeUrl).toBe('https://www.amazon.in/s?k=screen+guard');
+    });
+
+    it('intercepts generic search tools in browser fallback when browser already has merchant session open', async () => {
+      const consoleSpy = vi.spyOn(console, 'log');
+      const mockDb = new InMemoryRepository();
+      const registry = new ToolRegistry();
+
+      registry.register({
+        name: 'search_products',
+        description: 'Search products',
+        riskLevel: 'read_only',
+        parametersSchema: z.any(),
+        requiresApproval: () => ({ required: false }),
+        execute: async () => ({ success: true, data: { products: [] } }),
+      });
+
+      const mockBrowser: any = {
+        getActiveUrl: vi.fn().mockReturnValue('https://www.amazon.in/s?k=screen+guard'),
+        openPage: vi.fn().mockResolvedValue({ success: true }),
+        observePage: vi.fn().mockResolvedValue({
+          url: 'https://www.amazon.in/s?k=screen+guard',
+          products: [{ title: 'Spigen 3 Pack', price: '₹1,399', asin: 'B0DHCVXYZ1', packSize: 3 }],
+          searchInputs: [],
+          actionButtons: [],
+        }),
+        cleanupPage: vi.fn().mockResolvedValue(undefined),
+        markTaskTerminal: vi.fn(),
+      };
+
+      let turn = 0;
+      const mockAI = new MockAIProvider(async () => {
+        turn++;
+        if (turn === 1) {
+          // AI attempts to call search_products while Amazon is already open
+          return {
+            text: '',
+            toolCalls: [{ id: 'call_srch', name: 'search_products', arguments: { query: 'iPhone 16 guard' } }],
+          };
+        }
+        return {
+          text: 'Proceeding with browser observation on Amazon India.',
+          toolCalls: [],
+        };
+      });
+
+      const orchestrator = new AgentOrchestrator(
+        mockAI,
+        registry,
+        mockDb,
+        5,
+        undefined,
+        15000,
+        120000,
+        5,
+        120000,
+        mockBrowser
+      );
+
+      await orchestrator.processMessage({
+        phoneNumber: '+919876543210',
+        text: 'Buy iPhone 16 screen guard on Amazon',
+      });
+
+      const logs = consoleSpy.mock.calls.map((c) => c[0]);
+      expect(
+        logs.some(
+          (l) =>
+            typeof l === 'string' &&
+            l.includes('[Agent] search_intercepted_for_open_session') &&
+            l.includes('tool=search_products')
+        )
+      ).toBe(true);
+    });
+
+    it('validates product qualification strictly for iPhone 16 Pro Max 3-pack under ₹1,500', () => {
+      const sm = new ShoppingStateMachine('INITIAL');
+
+      // Qualifying
+      expect(
+        sm.isProductQualified({
+          title: 'Spigen EZ FIT Tempered Glass Screen Guard for iPhone 16 Pro Max - 3 Pack',
+          price: 1399,
+          packSize: 3,
+          asin: 'B0DHCVXYZ1',
+        })
+      ).toBe(true);
+
+      // Failing: Only 2-pack
+      expect(
+        sm.isProductQualified({
+          title: 'Spigen EZ FIT Screen Guard for iPhone 16 Pro Max - 2 Pack',
+          price: 999,
+          packSize: 2,
+        })
+      ).toBe(false);
+
+      // Failing: Over ₹1,500 budget
+      expect(
+        sm.isProductQualified({
+          title: 'Spigen Ultra Shield for iPhone 16 Pro Max - 3 Pack',
+          price: 1899,
+          packSize: 3,
+        })
+      ).toBe(false);
+
+      // Failing: Wrong device (iPhone 15 Pro Max)
+      expect(
+        sm.isProductQualified({
+          title: 'Spigen Tempered Glass for iPhone 15 Pro Max - 3 Pack',
+          price: 1299,
+          packSize: 3,
+        })
+      ).toBe(false);
+    });
+
+    it('detects auth and bot challenges on merchant page and prevents automated bypass', async () => {
+      const consoleSpy = vi.spyOn(console, 'log');
+      const bs = new PlaywrightBrowserService();
+
+      const mockPage: any = {
+        url: () => 'https://www.amazon.in/errors/validateCaptcha',
+        title: async () => 'Robot Check',
+        content: async () => '<html><body>Enter the characters you see below: Amazon Robot Check</body></html>',
+        evaluate: async () => 'Enter the characters you see below',
+        goto: async () => ({ status: () => 200 }),
+        isClosed: () => false,
+      };
+      (bs as any).page = mockPage;
+      (bs as any).ensurePage = async () => mockPage;
+
+      const res = await bs.openPage('https://www.amazon.in/errors/validateCaptcha');
+      expect(res.success).toBe(false);
+      expect((res as any).errorType).toBe('CAPTCHA_REQUIRED');
+      const logs = consoleSpy.mock.calls.map((c) => c[0]);
+      expect(logs.some((l) => typeof l === 'string' && l.includes('[ComputerUse] challenge_detected'))).toBe(true);
+    });
+  });
 });

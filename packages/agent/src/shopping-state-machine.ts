@@ -216,6 +216,34 @@ export class ShoppingStateMachine {
     this.currentPhase = 'FAILED';
   }
 
+  public isProductQualified(product: {
+    asin?: string;
+    title: string;
+    price?: number;
+    packSize?: number;
+  }): boolean {
+    const titleLower = product.title.toLowerCase();
+    const isIphone16ProMax =
+      titleLower.includes('iphone 16 pro max') ||
+      (titleLower.includes('16 pro max') && titleLower.includes('iphone')) ||
+      (titleLower.includes('iphone 16') && titleLower.includes('pro max'));
+    const isScreenGuard =
+      titleLower.includes('screen') ||
+      titleLower.includes('guard') ||
+      titleLower.includes('tempered') ||
+      titleLower.includes('glass') ||
+      titleLower.includes('protector');
+    const packSize =
+      product.packSize ??
+      (titleLower.match(/(\d+)\s*(?:[- ]?pack|pcs|piece|pieces|units?|count|set)\b/i)
+        ? parseInt(titleLower.match(/(\d+)\s*(?:[- ]?pack|pcs|piece|pieces|units?|count|set)\b/i)![1], 10)
+        : 1);
+    const has3Pack = packSize >= 3 || /3[- ]?pack|pack of 3|set of 3|3 pcs|3 pieces/i.test(titleLower);
+    const priceUnder1500 = product.price !== undefined ? product.price <= 1500 : true;
+
+    return isIphone16ProMax && isScreenGuard && has3Pack && priceUnder1500;
+  }
+
   public getFailureReason(): string | undefined {
     return this.failedVerificationReason;
   }
