@@ -358,23 +358,56 @@ export class SupabaseRepository implements IDatabaseRepository {
   }
 
   async saveMemory(data: Omit<Memory, 'id' | 'created_at' | 'updated_at'>): Promise<Memory> {
-    const { data: created, error } = await this.client
+    const payload: Record<string, unknown> = {
+      ...data,
+      updated_at: new Date().toISOString(),
+    };
+
+    let { data: created, error } = await this.client
       .from('memories')
-      .upsert(
-        {
-          ...data,
-          updated_at: new Date().toISOString(),
-        },
-        { onConflict: 'user_id, category, key' }
-      )
+      .upsert(payload, { onConflict: 'user_id, category, key' })
       .select()
       .single();
+
+    // Resilient fallback if PostgREST schema cache is missing 'confirmed' column (PGRST204)
+    if (
+      error &&
+      (error.code === 'PGRST204' || error.message?.includes('confirmed')) &&
+      (error.message?.includes('schema cache') || error.message?.includes('column'))
+    ) {
+      console.warn(
+        `[SupabaseRepository] 'confirmed' column missing from memories schema cache. Retrying upsert with metadata fallback.`
+      );
+      const fallbackPayload = { ...payload };
+      delete fallbackPayload.confirmed;
+      fallbackPayload.metadata = {
+        ...(typeof data.metadata === 'object' && data.metadata !== null ? data.metadata : {}),
+        confirmed: data.confirmed ?? true,
+      };
+
+      const fallbackResult = await this.client
+        .from('memories')
+        .upsert(fallbackPayload, { onConflict: 'user_id, category, key' })
+        .select()
+        .single();
+
+      created = fallbackResult.data;
+      error = fallbackResult.error;
+    }
 
     if (error || !created) {
       throw new Error(`Failed to save memory: ${error?.message}`);
     }
 
-    return created as Memory;
+    const row = created as any;
+    return {
+      ...row,
+      confirmed:
+        row.confirmed ??
+        row.metadata?.confirmed ??
+        (row.status === 'active' || Boolean(row.last_confirmed_at)) ??
+        true,
+    } as Memory;
   }
 
   async getUserMemories(userId: string, category?: string): Promise<Memory[]> {
@@ -388,7 +421,14 @@ export class SupabaseRepository implements IDatabaseRepository {
       throw new Error(`Failed to retrieve memories: ${error.message}`);
     }
 
-    return (data as Memory[]) || [];
+    return ((data as any[]) || []).map((row) => ({
+      ...row,
+      confirmed:
+        row.confirmed ??
+        row.metadata?.confirmed ??
+        (row.status === 'active' || Boolean(row.last_confirmed_at)) ??
+        true,
+    })) as Memory[];
   }
 
   async deleteMemory(id: string, userId: string): Promise<boolean> {

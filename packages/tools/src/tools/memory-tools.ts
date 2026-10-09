@@ -86,29 +86,47 @@ export function createMemoryTools(db: IDatabaseRepository): BaseTool[] {
       }
 
       // 2. Persist memory via MemoryService
-      const memory = await memoryService.saveMemory({
-        userId: context.user.id,
-        category: args.category,
-        key: args.key,
-        value: args.value,
-        confidence: args.confidence,
-        source: args.source || 'USER_PROVIDED',
-        confirmed: true,
-        sourceMessageId: context.messageId || null,
-        metadata: {
-          savedViaChannel: context.sourceChannel,
-        },
-      });
+      try {
+        const memory = await memoryService.saveMemory({
+          userId: context.user.id,
+          category: args.category,
+          key: args.key,
+          value: args.value,
+          confidence: args.confidence,
+          source: args.source || 'USER_PROVIDED',
+          confirmed: true,
+          sourceMessageId: context.messageId || null,
+          metadata: {
+            savedViaChannel: context.sourceChannel,
+          },
+        });
 
-      return {
-        success: true,
-        data: {
-          id: memory.id,
-          key: memory.key,
-          value: memory.value,
-        },
-        userFacingMessage: `I've remembered that for you (${args.key}: "${args.value}").`,
-      };
+        return {
+          success: true,
+          data: {
+            id: memory.id,
+            key: memory.key,
+            value: memory.value,
+          },
+          userFacingMessage: `I've remembered that for you (${args.key}: "${args.value}").`,
+        };
+      } catch (err: any) {
+        if (err instanceof SecurityViolationError) {
+          throw err;
+        }
+        console.error(`[Memory] save_memory failed: ${err.message}`);
+        return {
+          success: false,
+          error: err.message,
+          data: {
+            success: false,
+            errorType: 'DATABASE_ERROR',
+            retriable: false,
+            message: err.message,
+          },
+          userFacingMessage: `I encountered an issue saving your preference to memory right now.`,
+        };
+      }
     },
   };
 

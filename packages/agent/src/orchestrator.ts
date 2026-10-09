@@ -656,26 +656,35 @@ export class AgentOrchestrator {
       toolDeclarations = allDeclarations.filter(
         (t) => t.name.startsWith('wallet_') || t.name === 'approval_action' || t.name.startsWith('memory_')
       );
+    } else if (intent === 'OTHER') {
+      toolDeclarations = allDeclarations.filter(
+        (t) =>
+          !t.name.startsWith('shopping_') &&
+          !t.name.startsWith('wallet_') &&
+          !t.name.startsWith('book_') &&
+          !['search_products', 'compare_prices'].includes(t.name)
+      );
     } else {
       toolDeclarations = allDeclarations;
     }
 
     // Exact Merchant Resolution & Commerce Task Routing
-    // Hard rule: If intent is conversational, control, YouTube research, or multimodal analysis, MerchantResolver MUST NOT run
-    const isNonCommerce =
-      isControlOrConversation ||
-      intent === 'YOUTUBE_RESEARCH' ||
-      intent === 'MULTIMODAL_ANALYSIS';
+    // Hard rule: MerchantResolver MUST ONLY run for actual shopping or commerce tasks.
+    // It must NEVER run for CONVERSATION, RESEARCH, OTHER, IDENTITY, CONTROLS, EMAIL, REMINDER, CALENDAR, WALLET, YOUTUBE, or MULTIMODAL requests.
+    const isMerchantEligibleIntent =
+      intent === 'SHOPPING' ||
+      (intent === 'TRAVEL' && /\b(?:makemytrip|booking|mmt|flight|hotel)\b/i.test(input.text || '')) ||
+      (intent === 'BROWSER_AUTOMATION' && /\b(?:instamart|blinkit|zepto|amazon|flipkart|swiggy|makemytrip|booking)\b/i.test(input.text || ''));
 
-    const resolvedMerchant =
-      !isNonCommerce ? merchantResolver.resolve(input.text || '') : null;
+    const resolvedMerchant = isMerchantEligibleIntent
+      ? merchantResolver.resolve(input.text || '')
+      : null;
     if (resolvedMerchant) {
       console.log(`[Agent] merchant_resolved merchant=${resolvedMerchant.name} canonical_url=${resolvedMerchant.canonicalUrl}`);
     }
 
     const isCommerceTask =
-      !isNonCommerce &&
-      !['RESEARCH', 'TRAVEL', 'EMAIL', 'CALENDAR', 'REMINDER', 'WALLET', 'BROWSER_AUTOMATION', 'YOUTUBE_RESEARCH', 'MULTIMODAL_ANALYSIS'].includes(intent) &&
+      isMerchantEligibleIntent &&
       (intent === 'SHOPPING' ||
         Boolean(resolvedMerchant) ||
         (isContinue && hasPreviousUnfinishedCommerce));
@@ -844,6 +853,7 @@ export class AgentOrchestrator {
 
       const toolResultsForNextTurn: any[] = [];
       const functionResponseParts: any[] = [];
+      let stepHadToolFailure = false;
 
       for (const tc of aiResponse.toolCalls) {
         if (stateMachine.isTerminal() || taskAbortController.signal.aborted) {
@@ -1035,6 +1045,7 @@ export class AgentOrchestrator {
           } else {
             // Tool returned structured failure
             latestExecutionToolFailed = true;
+            stepHadToolFailure = true;
             const errMsg = result.error || 'Tool execution returned failure';
             const attempts = (toolFailures.get(tcName) || 0) + 1;
             toolFailures.set(tcName, attempts);
@@ -1103,6 +1114,7 @@ export class AgentOrchestrator {
           }
 
           latestExecutionToolFailed = true;
+          stepHadToolFailure = true;
           const errMsg = err.message || 'Tool execution failed';
           const attempts = (toolFailures.get(tcName) || 0) + 1;
           toolFailures.set(tcName, attempts);
@@ -1161,7 +1173,7 @@ export class AgentOrchestrator {
         });
       }
 
-      if (!stateMachine.isTerminal() && !taskAbortController.signal.aborted) {
+      if (!stepHadToolFailure && !stateMachine.isTerminal() && !taskAbortController.signal.aborted) {
         console.log(`[Agent] step_completed step=${currentStep}`);
       }
     }

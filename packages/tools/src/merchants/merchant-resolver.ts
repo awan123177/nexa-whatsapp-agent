@@ -94,6 +94,8 @@ export const SUPPORTED_MERCHANTS: ResolvedMerchant[] = [
 const CASUAL_GREETING_PATTERNS = [
   /^(?:hi|hello|hey|yo|greetings|good (?:morning|afternoon|evening|day)|howdy)(?:\s+(?:nexa|there|assistant|bot|ai))?[.!?]*$/i,
   /^(?:how are you|how's it going|what's up|sup|what can you do|who are you|who built you|who made you|help|capabilities)[.!?]*$/i,
+  /^(?:what is my name|what's my name|who am i|what do you remember about me|what do you remember|what are my preferences)[.!?]*$/i,
+  /^(?:nexa|hey nexa|hello nexa)[.!?]*$/i,
   /^(?:thank you|thanks|bye|goodbye|see you|ok|okay|cool|nice)[.!?]*$/i,
 ];
 
