@@ -147,17 +147,26 @@ export function createShoppingTools(
           if (!isAlreadyOnStore) {
             console.log(`[Shopping] browser_navigation_start merchant=${storeName} url="${canonicalUrl}"`);
             const openRes = await browserService.openPage(canonicalUrl);
-            if (openRes.success) {
-              await browserService.waitForPageReady();
-              const pageState = await browserService.inspectPageState();
-              if (pageState.challengeDetected) {
-                console.log(`[Shopping] bot_challenge_detected merchant=${storeName} type="${pageState.challengeType}"`);
-                return {
-                  success: false,
-                  error: `Merchant ${storeName} requires human verification (${pageState.challengeType || 'CAPTCHA'}).`,
-                  userFacingMessage: `${storeName} presented a verification check. Please solve it in your browser or try again shortly.`,
-                };
-              }
+            if (!openRes.success) {
+              console.log(`[Shopping] browser_navigation_failed merchant=${storeName} error="${openRes.message}" error_type=${openRes.errorType}`);
+              return {
+                success: false,
+                error: `Unable to open ${storeName}: ${openRes.message}`,
+                userFacingMessage: openRes.errorType === 'BOT_BLOCKED' || (openRes as any).status === 429
+                  ? `${storeName} is currently presenting bot protection or rate limits (HTTP ${ (openRes as any).status || 429 }). Please try again shortly.`
+                  : `I couldn't open ${storeName} right now: ${openRes.message}`,
+              };
+            }
+
+            await browserService.waitForPageReady();
+            const pageState = await browserService.inspectPageState();
+            if (pageState.challengeDetected || pageState.authState === 'BLOCKED') {
+              console.log(`[Shopping] bot_challenge_detected merchant=${storeName} type="${pageState.challengeType || 'CAPTCHA'}"`);
+              return {
+                success: false,
+                error: `Merchant ${storeName} requires human verification (${pageState.challengeType || 'CAPTCHA'}).`,
+                userFacingMessage: `${storeName} presented a verification check. Please solve it in your browser or try again shortly.`,
+              };
             }
           }
 
@@ -580,7 +589,16 @@ export function createShoppingTools(
             `*What will happen after approval*: Your order will be placed with ${storeName} and payment confirmed.\n\n` +
             `Reply *Yes* or tap *Approve* to confirm this purchase.`,
           'shopping_checkout',
-          { ...args, store: storeName, amount: amountMinor / 100, itemSummary, deliveryAddress },
+          {
+            ...args,
+            store: storeName,
+            merchant: storeName,
+            amount: amountMinor / 100,
+            itemSummary,
+            deliveryAddress,
+            currency: 'INR',
+            items: cart?.items ? cart.items.map((i) => ({ name: i.name, quantity: i.quantity, priceMinor: i.priceMinor })) : [],
+          },
           'high'
         );
       }
@@ -612,22 +630,94 @@ export function createShoppingTools(
           );
         }
 
-        // Verify merchant matches
+        // 1. Verify user binding
+        if (latestApproval.user_id !== context.user.id) {
+          console.log(`[Shopping] checkout_blocked reason="user_mismatch"`);
+          throw new Error('Approval belongs to a different authenticated user.');
+        }
+
+        // 2. Verify conversation binding
+        if (conversationId && latestApproval.conversation_id !== conversationId) {
+          console.log(`[Shopping] checkout_blocked reason="conversation_mismatch"`);
+          throw new Error('Approval belongs to a different conversation.');
+        }
+
         const appArgs = (latestApproval.arguments || {}) as Record<string, any>;
+
+        // 3. Verify merchant matches
         const approvedStore = (appArgs.store || appArgs.merchant || '').toLowerCase();
         if (approvedStore && approvedStore !== storeName.toLowerCase()) {
           console.log(`[Shopping] checkout_blocked reason="store_mismatch" expected="${approvedStore}" actual="${storeName}"`);
           throw new Error(`Approval was for merchant "${approvedStore}", but checkout was attempted for "${storeName}".`);
         }
 
-        // Mark consumed so it cannot be reused!
-        if (latestApproval.metadata) {
-          latestApproval.metadata.consumed = true;
-          latestApproval.metadata.consumed_at = new Date().toISOString();
-        } else {
-          latestApproval.metadata = { consumed: true, consumed_at: new Date().toISOString() };
+        // 4. Verify total amount binding (allow max 1 paise rounding tolerance)
+        if (appArgs.amount !== undefined) {
+          const approvedAmountMinor = parseToMinorUnits(appArgs.amount);
+          if (Math.abs(approvedAmountMinor - amountMinor) > 1) {
+            console.log(`[Shopping] checkout_blocked reason="amount_mismatch" expected=${approvedAmountMinor} actual=${amountMinor}`);
+            throw new ApprovalRequiredError(
+              `Order total changed from ${formatMinorUnits(approvedAmountMinor, 'INR')} to ${formattedAmount}. Please confirm the updated total.`,
+              'shopping_checkout',
+              { ...args, store: storeName, amount: amountMinor / 100, itemSummary, deliveryAddress },
+              'high'
+            );
+          }
         }
-        await db.updateApprovalStatus(latestApproval.id, 'approved', new Date().toISOString()).catch(() => {});
+
+        // 5. Verify delivery address binding
+        if (appArgs.deliveryAddress && deliveryAddress) {
+          const normApproved = appArgs.deliveryAddress.trim().toLowerCase();
+          const normCurrent = deliveryAddress.trim().toLowerCase();
+          if (normApproved !== normCurrent) {
+            console.log(`[Shopping] checkout_blocked reason="address_mismatch"`);
+            throw new ApprovalRequiredError(
+              `Delivery address was updated from "${appArgs.deliveryAddress}" to "${deliveryAddress}". Please confirm again.`,
+              'shopping_checkout',
+              { ...args, store: storeName, amount: amountMinor / 100, itemSummary, deliveryAddress },
+              'high'
+            );
+          }
+        }
+
+        // 6. Verify exact cart contents and quantities
+        if (appArgs.items && Array.isArray(appArgs.items) && cart?.items && cart.items.length > 0) {
+          const itemsMatch =
+            appArgs.items.length === cart.items.length &&
+            appArgs.items.every((appItem: any) => {
+              const match = cart.items.find(
+                (ci) => ci.name.toLowerCase() === (appItem.name || '').toLowerCase()
+              );
+              return match && match.quantity === appItem.quantity;
+            });
+
+          if (!itemsMatch) {
+            console.log(`[Shopping] checkout_blocked reason="cart_contents_mismatch"`);
+            throw new ApprovalRequiredError(
+              `Cart contents or quantities have changed since approval. Please confirm again.`,
+              'shopping_checkout',
+              {
+                ...args,
+                store: storeName,
+                amount: amountMinor / 100,
+                itemSummary,
+                deliveryAddress,
+                items: cart.items.map((i) => ({ name: i.name, quantity: i.quantity, priceMinor: i.priceMinor })),
+              },
+              'high'
+            );
+          }
+        }
+
+        // 7. Mark consumed atomically in DB so it cannot be reused (race-safe)
+        const updatedMetadata = {
+          ...(latestApproval.metadata || {}),
+          consumed: true,
+          consumed_at: new Date().toISOString(),
+          consumed_for_user: context.user.id,
+        };
+        latestApproval.metadata = updatedMetadata;
+        await db.updateApprovalStatus(latestApproval.id, 'approved', new Date().toISOString(), updatedMetadata).catch(() => {});
       }
 
       console.log(`[Agent] execution_started action=shopping_checkout merchant=${storeName}`);

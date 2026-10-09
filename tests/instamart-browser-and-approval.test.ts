@@ -599,4 +599,187 @@ describe('NEXA Instamart Browser Execution, Approvals & Safety Hardening Suite',
       expect(path).toEqual(['TIER_3_BROWSER_AUTOMATION', 'TIER_4_USER_ASSISTED']);
     });
   });
+
+  // ==========================================================================
+  // BUG 8 — Strict Approval Transaction Binding
+  // ==========================================================================
+  describe('BUG 8: Strict Approval Transaction Binding', () => {
+    it('fails if checkout user does not match approved user', async () => {
+      const userA = await db.findOrCreateUserByPhone('+919876543201', 'User A');
+      const userB = await db.findOrCreateUserByPhone('+919876543202', 'User B');
+      const conv = await db.getOrCreateActiveConversation(userA.id);
+
+      await db.createApproval({
+        conversation_id: conv.id,
+        user_id: userA.id,
+        tool_name: 'shopping_checkout',
+        arguments: { store: 'Swiggy Instamart', amount: 40 },
+        summary: 'Order for User A',
+        impact_level: 'high',
+        status: 'approved',
+        expires_at: new Date(Date.now() + 60000).toISOString(),
+        metadata: {},
+      });
+
+      // User B attempts to execute checkout with User A's approval
+      const res = await toolRegistry.executeTool(
+        'shopping_checkout',
+        { store: 'Swiggy Instamart', amount: 40 },
+        { user: userB, conversation: conv, messageId: 'msg_b', isUserConfirmed: true }
+      );
+      expect(res.success).toBe(false);
+      expect(res.error).toContain('different authenticated user');
+    });
+
+    it('rejects approval if order total has changed since approval', async () => {
+      const user = await db.findOrCreateUserByPhone('+919876543203', 'User C');
+      const conv = await db.getOrCreateActiveConversation(user.id);
+
+      await db.createApproval({
+        conversation_id: conv.id,
+        user_id: user.id,
+        tool_name: 'shopping_checkout',
+        arguments: { store: 'Swiggy Instamart', amount: 40 }, // Approved for 40
+        summary: 'Order for 40',
+        impact_level: 'high',
+        status: 'approved',
+        expires_at: new Date(Date.now() + 60000).toISOString(),
+        metadata: {},
+      });
+
+      // Checkout attempted with amount 65 (price changed)
+      await expect(
+        toolRegistry.executeTool(
+          'shopping_checkout',
+          { store: 'Swiggy Instamart', amount: 65 },
+          { user, conversation: conv, messageId: 'msg_c', isUserConfirmed: true }
+        )
+      ).rejects.toThrow(ApprovalRequiredError);
+    });
+
+    it('rejects approval if delivery address changed since approval', async () => {
+      const user = await db.findOrCreateUserByPhone('+919876543204', 'User D');
+      const conv = await db.getOrCreateActiveConversation(user.id);
+
+      await db.createApproval({
+        conversation_id: conv.id,
+        user_id: user.id,
+        tool_name: 'shopping_checkout',
+        arguments: {
+          store: 'Swiggy Instamart',
+          amount: 40,
+          deliveryAddress: 'Home Address, Mumbai',
+        },
+        summary: 'Order for Home',
+        impact_level: 'high',
+        status: 'approved',
+        expires_at: new Date(Date.now() + 60000).toISOString(),
+        metadata: {},
+      });
+
+      // Checkout attempted with Office address
+      await expect(
+        toolRegistry.executeTool(
+          'shopping_checkout',
+          {
+            store: 'Swiggy Instamart',
+            amount: 40,
+            deliveryAddress: 'Office Address, Nariman Point, Mumbai',
+          },
+          { user, conversation: conv, messageId: 'msg_d', isUserConfirmed: true }
+        )
+      ).rejects.toThrow(ApprovalRequiredError);
+    });
+
+    it('rejects approval if cart items or quantities were modified', async () => {
+      const user = await db.findOrCreateUserByPhone('+919876543205', 'User E');
+      const conv = await db.getOrCreateActiveConversation(user.id);
+
+      // Add item to cart
+      await toolRegistry.executeTool(
+        'shopping_add_to_cart',
+        { productName: 'Diet Coke', price: 40, quantity: 1, store: 'Swiggy Instamart' },
+        { user, conversation: conv, messageId: 'msg_e1' }
+      );
+
+      // Approval approved for 1x Diet Coke
+      await db.createApproval({
+        conversation_id: conv.id,
+        user_id: user.id,
+        tool_name: 'shopping_checkout',
+        arguments: {
+          store: 'Swiggy Instamart',
+          amount: 40,
+          items: [{ name: 'Diet Coke', quantity: 1 }],
+        },
+        summary: 'Order for 1 Diet Coke',
+        impact_level: 'high',
+        status: 'approved',
+        expires_at: new Date(Date.now() + 60000).toISOString(),
+        metadata: {},
+      });
+
+      // Modify cart: add another Diet Coke (now quantity is 2)
+      await toolRegistry.executeTool(
+        'shopping_add_to_cart',
+        { productName: 'Diet Coke', price: 40, quantity: 1, store: 'Swiggy Instamart' },
+        { user, conversation: conv, messageId: 'msg_e2' }
+      );
+
+      // Attempt checkout: should reject because cart now has 2 items while approval was for 1
+      await expect(
+        toolRegistry.executeTool(
+          'shopping_checkout',
+          { store: 'Swiggy Instamart', amount: 80 },
+          { user, conversation: conv, messageId: 'msg_e3', isUserConfirmed: true }
+        )
+      ).rejects.toThrow(ApprovalRequiredError);
+    });
+  });
+
+  // ==========================================================================
+  // BUG 9 — Real Failure Handling & HTTP 429 Protection
+  // ==========================================================================
+  describe('BUG 9: Real Failure Handling & HTTP 429 Protection', () => {
+    it('HTTP 429 is treated as navigation failure and cannot succeed', async () => {
+      const service = new PlaywrightBrowserService();
+      vi.spyOn(service as any, 'ensurePage').mockResolvedValue({
+        goto: vi.fn().mockResolvedValue({
+          status: () => 429,
+        }),
+        url: () => 'https://www.swiggy.com/instamart',
+        title: vi.fn().mockResolvedValue('Rate Limited'),
+        content: vi.fn().mockResolvedValue('Too Many Requests'),
+        evaluate: vi.fn().mockResolvedValue('Too Many Requests'),
+        waitForLoadState: vi.fn().mockResolvedValue(undefined),
+      });
+
+      const res = await service.openPage('https://www.swiggy.com/instamart');
+      expect(res.success).toBe(false);
+      expect((res as any).errorType).toBe('BOT_BLOCKED');
+      expect((res as any).message).toContain('HTTP 429');
+    });
+
+    it('shopping_search halts cleanly when browser open fails with HTTP 429', async () => {
+      vi.spyOn(browserService, 'openPage').mockResolvedValue({
+        success: false,
+        errorType: 'BOT_BLOCKED',
+        status: 429,
+        message: 'Website rate limit or bot protection encountered (HTTP 429 Too Many Requests).',
+      });
+
+      const user = await db.findOrCreateUserByPhone('+919876543206');
+      const conv = await db.getOrCreateActiveConversation(user.id);
+
+      const res = await toolRegistry.executeTool(
+        'shopping_search',
+        { query: 'Diet Coke', merchant: 'Swiggy Instamart' },
+        { user, conversation: conv, messageId: 'msg_429' }
+      );
+
+      expect(res.success).toBe(false);
+      expect(res.error).toContain('HTTP 429');
+      expect(res.userFacingMessage).toContain('rate limits');
+    });
+  });
 });

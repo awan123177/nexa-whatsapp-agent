@@ -275,7 +275,8 @@ export class InMemoryRepository implements IDatabaseRepository {
   async updateApprovalStatus(
     approvalId: string,
     status: ApprovalStatus,
-    respondedAt?: string
+    respondedAt?: string,
+    metadata?: Record<string, unknown>
   ): Promise<Approval> {
     const approval = this.approvals.get(approvalId);
     if (!approval) {
@@ -283,6 +284,9 @@ export class InMemoryRepository implements IDatabaseRepository {
     }
     approval.status = status;
     approval.responded_at = respondedAt || new Date().toISOString();
+    if (metadata) {
+      approval.metadata = { ...(approval.metadata || {}), ...metadata };
+    }
     return approval;
   }
 

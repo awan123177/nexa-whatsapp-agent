@@ -23,6 +23,7 @@ export type BrowserOpenFailure = {
   success: false;
   errorType: 'TIMEOUT' | 'NAVIGATION_FAILED' | 'BOT_BLOCKED' | 'CAPTCHA_REQUIRED' | 'SECURITY_BLOCKED' | 'INVALID_URL' | 'AUTH_REQUIRED' | 'BLOCKED';
   message: string;
+  status?: number;
   authState?: AuthState;
 };
 

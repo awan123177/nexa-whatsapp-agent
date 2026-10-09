@@ -41,7 +41,12 @@ export interface IDatabaseRepository {
   createApproval(data: Omit<Approval, 'id' | 'requested_at'>): Promise<Approval>;
   getPendingApproval(conversationId: string): Promise<Approval | null>;
   getLatestApproval(conversationId: string): Promise<Approval | null>;
-  updateApprovalStatus(approvalId: string, status: ApprovalStatus, respondedAt?: string): Promise<Approval>;
+  updateApprovalStatus(
+    approvalId: string,
+    status: ApprovalStatus,
+    respondedAt?: string,
+    metadata?: Record<string, unknown>
+  ): Promise<Approval>;
 
   // Memories
   saveMemory(data: Omit<Memory, 'id' | 'created_at' | 'updated_at'>): Promise<Memory>;

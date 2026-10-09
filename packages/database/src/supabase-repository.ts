@@ -333,14 +333,19 @@ export class SupabaseRepository implements IDatabaseRepository {
   async updateApprovalStatus(
     approvalId: string,
     status: ApprovalStatus,
-    respondedAt?: string
+    respondedAt?: string,
+    metadata?: Record<string, unknown>
   ): Promise<Approval> {
+    const updatePayload: Record<string, unknown> = {
+      status,
+      responded_at: respondedAt || new Date().toISOString(),
+    };
+    if (metadata) {
+      updatePayload.metadata = metadata;
+    }
     const { data, error } = await this.client
       .from('approvals')
-      .update({
-        status,
-        responded_at: respondedAt || new Date().toISOString(),
-      })
+      .update(updatePayload)
       .eq('id', approvalId)
       .select()
       .single();

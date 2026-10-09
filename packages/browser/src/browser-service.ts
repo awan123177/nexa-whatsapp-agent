@@ -427,6 +427,30 @@ export class PlaywrightBrowserService {
       const contentSnippet = text.slice(0, 2500).replace(/\s+/g, ' ').trim();
       const latency = Date.now() - startNav;
       const status = response?.status() || 200;
+
+      // Hard rule: HTTP 429 (Too Many Requests), 403 Forbidden, or 5xx cannot be reported as navigation success
+      if (status === 429 || status === 403 || (status >= 500 && status < 600)) {
+        const errType = status === 429 ? 'BOT_BLOCKED' : 'NAVIGATION_FAILED';
+        console.log(`[Browser] open_failed latency_ms=${latency} error_type=${errType} status=${status}`);
+        session.pageState = 'challenged';
+        this.recordAction(sessionId, {
+          action: 'navigate',
+          target: targetUrl,
+          timestamp: Date.now(),
+          success: false,
+          error: `HTTP ${status}`,
+        });
+        return {
+          success: false,
+          errorType: errType,
+          status,
+          message: status === 429
+            ? `Website rate limit or bot protection encountered (HTTP 429 Too Many Requests).`
+            : `Website returned error status HTTP ${status}.`,
+          authState: status === 429 ? 'BLOCKED' : 'ERROR',
+        };
+      }
+
       console.log(`[Browser] open_success latency_ms=${latency} status=${status}`);
       console.log(`[ComputerUse] page_state_changed state=idle url="${this.activeUrl}"`);
       session.pageState = 'idle';
