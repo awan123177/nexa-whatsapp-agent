@@ -12,6 +12,9 @@ import { createMemoryTools } from './tools/memory-tools.js';
 import { createApprovalTool } from './tools/approval-tool.js';
 import { createWalletTools } from './tools/wallet-tools.js';
 import { WalletService } from './wallet/wallet-service.js';
+import { YouTubeService } from './tools/youtube-service.js';
+import { createYouTubeTools } from './tools/youtube-tools.js';
+import { createMultimodalTools } from './tools/multimodal-tools.js';
 
 export function createDefaultToolRegistry(options: {
   db: IDatabaseRepository;
@@ -19,6 +22,7 @@ export function createDefaultToolRegistry(options: {
   oauthService?: GoogleOAuthService;
   whatsappClient?: any;
   walletService?: WalletService;
+  youtubeService?: YouTubeService;
 }): ToolRegistry {
   const registry = new ToolRegistry({ db: options.db });
   const searchProvider = new DuckDuckGoSearchProvider();
@@ -67,6 +71,17 @@ export function createDefaultToolRegistry(options: {
   const walletService = options.walletService || new WalletService(options.db);
   for (const walletTool of createWalletTools(walletService)) {
     registry.register(walletTool);
+  }
+
+  // 10. YouTube Intelligence Engine
+  const youtubeService = options.youtubeService || new YouTubeService({ searchProvider });
+  for (const ytTool of createYouTubeTools(youtubeService)) {
+    registry.register(ytTool);
+  }
+
+  // 11. Universal Multimodal Understanding
+  for (const mmTool of createMultimodalTools()) {
+    registry.register(mmTool);
   }
 
   return registry;

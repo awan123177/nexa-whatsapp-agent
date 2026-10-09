@@ -63,6 +63,19 @@ const BROWSER_PATTERNS = [
   /^https?:\/\//i,
 ];
 
+// YouTube Intelligence patterns
+const YOUTUBE_PATTERNS = [
+  /\b(?:youtube|yt video|watch video|video review|video comparison|watch on youtube|youtube video|youtube review|video tutorial|unboxing video)\b/i,
+  /\b(?:on youtube|from youtube|youtube link|youtube\.com|youtu\.be)\b/i,
+  /\b(?:search youtube|find videos?|watch on yt|look on youtube|videos? comparing|video explaining|videos? testing|video demonstrating)\b/i,
+];
+
+// Multimodal patterns
+const MULTIMODAL_PATTERNS = [
+  /\b(?:analyze this (?:photo|image|picture|video|audio|document|pdf)|what is in this (?:photo|image|picture)|transcribe (?:this|the) (?:audio|voice)|read this (?:pdf|document|file)|summarize this (?:pdf|document)|extract text from (?:image|photo|pdf|document))\b/i,
+  /\b(?:describe this (?:image|photo|picture)|ocr|look at this (?:image|photo))\b/i,
+];
+
 // Reminder patterns
 const REMINDER_PATTERNS = [
   /\b(?:remind me to|set a reminder|create a reminder|reminder for|remind me)\b/i,
@@ -122,6 +135,16 @@ export function classifyMessageIntent(
     if (!SHOPPING_PATTERNS.some((p) => p.test(clean)) && !TRAVEL_PATTERNS.some((p) => p.test(clean))) {
       return 'CONVERSATION';
     }
+  }
+
+  // 1b. YouTube Research intent
+  if (YOUTUBE_PATTERNS.some((p) => p.test(clean))) {
+    return 'YOUTUBE_RESEARCH';
+  }
+
+  // 1c. Multimodal Understanding intent
+  if (MULTIMODAL_PATTERNS.some((p) => p.test(clean))) {
+    return 'MULTIMODAL_ANALYSIS';
   }
 
   // 2. Shopping intent

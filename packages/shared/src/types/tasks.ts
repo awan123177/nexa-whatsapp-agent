@@ -54,6 +54,8 @@ export type ShoppingStepState =
 export type MessageIntent =
   | 'CONVERSATION'
   | 'RESEARCH'
+  | 'YOUTUBE_RESEARCH'
+  | 'MULTIMODAL_ANALYSIS'
   | 'BROWSER_AUTOMATION'
   | 'SHOPPING'
   | 'TRAVEL'

@@ -111,7 +111,15 @@ export function resolveToolTimeout(toolName: string, defaultTimeout = DEFAULT_TO
       return BROWSER_ACTION_TIMEOUT_MS; // 12000
     case 'web_search':
     case 'shopping_search':
+    case 'youtube_search':
       return WEB_SEARCH_TIMEOUT_MS; // 10000
+    case 'youtube_get_transcript':
+    case 'youtube_analyze_video':
+    case 'youtube_compare_reviews':
+    case 'youtube_research_report':
+    case 'multimodal_analyze_media':
+    case 'document_extract_text':
+      return 15000;
     default:
       return defaultTimeout;
   }
@@ -593,8 +601,16 @@ export class AgentOrchestrator {
     if (isControlOrConversation) {
       // Pure conversation / capabilities / greetings / controls: NO tools provided so Gemini cannot call shopping_search
       toolDeclarations = [];
+    } else if (intent === 'YOUTUBE_RESEARCH') {
+      toolDeclarations = allDeclarations.filter(
+        (t) => t.name.startsWith('youtube_') || t.name === 'web_search' || t.name.startsWith('memory_')
+      );
+    } else if (intent === 'MULTIMODAL_ANALYSIS') {
+      toolDeclarations = allDeclarations.filter(
+        (t) => t.name.startsWith('multimodal_') || t.name.startsWith('document_') || t.name === 'web_search' || t.name.startsWith('memory_')
+      );
     } else if (intent === 'RESEARCH') {
-      // Web search and browser tools only; no commerce, booking, or financial tools
+      // Web search, youtube search, and browser tools only; no commerce, booking, or financial tools
       toolDeclarations = allDeclarations.filter(
         (t) =>
           !t.name.startsWith('shopping_') &&
@@ -645,16 +661,21 @@ export class AgentOrchestrator {
     }
 
     // Exact Merchant Resolution & Commerce Task Routing
-    // Hard rule: If intent is conversational or control, MerchantResolver MUST NOT run
+    // Hard rule: If intent is conversational, control, YouTube research, or multimodal analysis, MerchantResolver MUST NOT run
+    const isNonCommerce =
+      isControlOrConversation ||
+      intent === 'YOUTUBE_RESEARCH' ||
+      intent === 'MULTIMODAL_ANALYSIS';
+
     const resolvedMerchant =
-      !isControlOrConversation ? merchantResolver.resolve(input.text || '') : null;
+      !isNonCommerce ? merchantResolver.resolve(input.text || '') : null;
     if (resolvedMerchant) {
       console.log(`[Agent] merchant_resolved merchant=${resolvedMerchant.name} canonical_url=${resolvedMerchant.canonicalUrl}`);
     }
 
     const isCommerceTask =
-      !isControlOrConversation &&
-      !['RESEARCH', 'TRAVEL', 'EMAIL', 'CALENDAR', 'REMINDER', 'WALLET', 'BROWSER_AUTOMATION'].includes(intent) &&
+      !isNonCommerce &&
+      !['RESEARCH', 'TRAVEL', 'EMAIL', 'CALENDAR', 'REMINDER', 'WALLET', 'BROWSER_AUTOMATION', 'YOUTUBE_RESEARCH', 'MULTIMODAL_ANALYSIS'].includes(intent) &&
       (intent === 'SHOPPING' ||
         Boolean(resolvedMerchant) ||
         (isContinue && hasPreviousUnfinishedCommerce));
@@ -665,6 +686,12 @@ export class AgentOrchestrator {
     if (isCommerceTask) {
       effectiveMaxSteps = Math.max(this.maxSteps, this.commerceMaxSteps);
       effectiveDeadlineMs = Math.max(this.totalDeadlineMs, this.commerceDeadlineMs);
+    } else if (intent === 'YOUTUBE_RESEARCH') {
+      effectiveMaxSteps = 8;
+      effectiveDeadlineMs = Math.max(this.totalDeadlineMs, 25000);
+    } else if (intent === 'MULTIMODAL_ANALYSIS') {
+      effectiveMaxSteps = 5;
+      effectiveDeadlineMs = Math.max(this.totalDeadlineMs, 20000);
     } else if (intent === 'RESEARCH' || intent === 'BROWSER_AUTOMATION') {
       effectiveMaxSteps = 10;
       effectiveDeadlineMs =

@@ -7,5 +7,7 @@ export * from './types/browser.js';
 export * from './types/merchants.js';
 export * from './types/tasks.js';
 export * from './types/capabilities.js';
+export * from './types/youtube.js';
+export * from './types/multimodal.js';
 export * from './errors/index.js';
 export * from './config/index.js';
