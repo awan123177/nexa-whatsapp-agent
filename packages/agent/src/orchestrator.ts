@@ -476,7 +476,9 @@ export class AgentOrchestrator {
     }
 
     // Exact Merchant Resolution & Commerce Task Routing
-    const resolvedMerchant = merchantResolver.resolve(input.text || '');
+    // Hard rule: If intent === 'CONVERSATION', MerchantResolver MUST NOT run
+    const resolvedMerchant =
+      intent !== 'CONVERSATION' ? merchantResolver.resolve(input.text || '') : null;
     if (resolvedMerchant) {
       console.log(`[Agent] merchant_resolved merchant=${resolvedMerchant.name} canonical_url=${resolvedMerchant.canonicalUrl}`);
     }

@@ -605,4 +605,214 @@ describe('NEXA Final Gemini Reliability & Fast-Path Suite', () => {
       expect(result.replyText).toContain('Swiggy Instamart');
     });
   });
+
+  // =========================================================================
+  // 12. CONVERSATION Intent & Merchant Isolation Suite (Phase 1 & Phase 4)
+  // =========================================================================
+  describe('12. CONVERSATION Intent & Merchant Isolation Suite', () => {
+    const greetingPhrases = [
+      'hello nexa',
+      'hello',
+      'hey',
+      'how are you',
+      'what can you do',
+      'who built you',
+    ];
+
+    for (const text of greetingPhrases) {
+      it(`evaluates "${text}" as CONVERSATION with merchant=null, zero commerce tools, and no merchant resolver call`, async () => {
+        const logs: string[] = [];
+        const consoleSpy = vi.spyOn(console, 'log').mockImplementation((...args) => {
+          logs.push(args.join(' '));
+        });
+
+        const db = new InMemoryRepository();
+        const toolRegistry = createDefaultToolRegistry({ db });
+        let toolsPassedToGemini: any[] = [];
+
+        const mockGenerate = vi.fn().mockImplementation(async (params) => {
+          toolsPassedToGemini = params.config?.tools?.[0]?.functionDeclarations || [];
+          return { text: 'Hello! I am NEXA, your personal AI assistant.' };
+        });
+
+        const provider = new GeminiProvider({
+          apiKey: dummyApiKey,
+          generateContentFn: mockGenerate,
+        });
+
+        const orchestrator = new AgentOrchestrator(provider, toolRegistry, db);
+        const result = await orchestrator.processMessage({
+          phoneNumber: '+919999900021',
+          name: 'GreetingUser',
+          preferredName: 'GreetingUser',
+          nameConfirmed: true,
+          text,
+          channel: 'whatsapp',
+        });
+
+        consoleSpy.mockRestore();
+
+        // 1. Verify intent is CONVERSATION
+        expect(logs.some((l) => l.includes('[Context] request_intent_classified intent=CONVERSATION'))).toBe(true);
+
+        // 2. Merchant layer must NOT log requested merchant
+        expect(logs.some((l) => l.includes('[Merchant] requested merchant='))).toBe(false);
+
+        // 3. Zero commerce tools
+        expect(toolsPassedToGemini).toEqual([]);
+        expect(result.replyText).toContain('NEXA');
+      });
+    }
+
+    it('stale commerce history + "hello nexa" does not resume task and does not run merchant resolver', async () => {
+      const logs: string[] = [];
+      const consoleSpy = vi.spyOn(console, 'log').mockImplementation((...args) => {
+        logs.push(args.join(' '));
+      });
+
+      const db = new InMemoryRepository();
+      const user = await db.findOrCreateUserByPhone('+919999900022', 'PriorUser');
+      user.preferred_name = 'PriorUser';
+      user.name_confirmed = true;
+      const conversation = await db.getOrCreateActiveConversation(user.id, 'whatsapp');
+
+      await db.saveMessage({
+        conversation_id: conversation.id,
+        sender_type: 'user',
+        content: 'Order a Diet Coke from Blinkit',
+      });
+
+      const toolRegistry = createDefaultToolRegistry({ db });
+      let toolsPassedToGemini: any[] = [];
+
+      const mockGenerate = vi.fn().mockImplementation(async (params) => {
+        toolsPassedToGemini = params.config?.tools?.[0]?.functionDeclarations || [];
+        return { text: 'Hello PriorUser! What can I help you with today?' };
+      });
+
+      const provider = new GeminiProvider({
+        apiKey: dummyApiKey,
+        generateContentFn: mockGenerate,
+      });
+
+      const orchestrator = new AgentOrchestrator(provider, toolRegistry, db);
+      const result = await orchestrator.processMessage({
+        phoneNumber: '+919999900022',
+        name: 'PriorUser',
+        preferredName: 'PriorUser',
+        nameConfirmed: true,
+        text: 'hello nexa',
+        channel: 'whatsapp',
+      });
+
+      consoleSpy.mockRestore();
+
+      expect(logs.some((l) => l.includes('[Context] previous_task_not_resumed reason="no_explicit_continuation"'))).toBe(true);
+      expect(logs.some((l) => l.includes('[Context] request_intent_classified intent=CONVERSATION'))).toBe(true);
+      expect(logs.some((l) => l.includes('[Merchant] requested merchant='))).toBe(false);
+      expect(toolsPassedToGemini).toEqual([]);
+      expect(result.replyText).toContain('Hello PriorUser');
+    });
+  });
+
+  // =========================================================================
+  // 13. Conversational Message 503 Resilient Fallback (Phase 2 & Phase 4)
+  // =========================================================================
+  describe('13. Conversational Message 503 Resilient Fallback', () => {
+    it('conversational request with primary 503 falls back to fallback model and succeeds', async () => {
+      const logs: string[] = [];
+      const consoleSpy = vi.spyOn(console, 'log').mockImplementation((...args) => {
+        logs.push(args.join(' '));
+      });
+
+      const db = new InMemoryRepository();
+      const toolRegistry = createDefaultToolRegistry({ db });
+      const modelsCalled: string[] = [];
+
+      const mockGenerate = vi.fn().mockImplementation(async (params) => {
+        modelsCalled.push(params.model);
+        if (params.model === 'gemini-3.7-flash') {
+          const err: any = new Error('503 Service Unavailable: High demand on model');
+          err.status = 503;
+          throw err;
+        }
+        if (params.model === 'gemini-3.6-flash') {
+          return { text: 'Hello! I can help you with search, bookings, and more.' };
+        }
+        throw new Error('Unexpected model');
+      });
+
+      const provider = new GeminiProvider({
+        apiKey: dummyApiKey,
+        defaultModel: 'gemini-3.7-flash',
+        fallbackModel: 'gemini-3.6-flash',
+        primaryMaxRetries: 1,
+        fallbackMaxRetries: 1,
+        generateContentFn: mockGenerate,
+        sleepFn: async () => {},
+      });
+
+      const orchestrator = new AgentOrchestrator(provider, toolRegistry, db);
+      const result = await orchestrator.processMessage({
+        phoneNumber: '+919999900023',
+        name: 'FallbackUser',
+        preferredName: 'FallbackUser',
+        nameConfirmed: true,
+        text: 'Hello NEXA, what can you do?',
+        channel: 'whatsapp',
+      });
+
+      consoleSpy.mockRestore();
+
+      expect(modelsCalled).toContain('gemini-3.7-flash');
+      expect(modelsCalled).toContain('gemini-3.6-flash');
+      expect(logs.some((l) => l.includes('[Gemini] fallback_model_switch') && l.includes('to=gemini-3.6-flash'))).toBe(true);
+      expect(logs.some((l) => l.includes('[Merchant] requested merchant='))).toBe(false);
+      expect(result.replyText).toContain('search, bookings');
+    });
+
+    it('conversational request when all models return 503 transitions to model_failed and never logs task_completed', async () => {
+      const logs: string[] = [];
+      const consoleSpy = vi.spyOn(console, 'log').mockImplementation((...args) => {
+        logs.push(args.join(' '));
+      });
+
+      const db = new InMemoryRepository();
+      const toolRegistry = createDefaultToolRegistry({ db });
+
+      const mockGenerate = vi.fn().mockImplementation(async (params) => {
+        const err: any = new Error(`503 Service Unavailable on ${params.model}`);
+        err.status = 503;
+        throw err;
+      });
+
+      const provider = new GeminiProvider({
+        apiKey: dummyApiKey,
+        defaultModel: 'gemini-3.7-flash',
+        fallbackModel: 'gemini-3.6-flash',
+        primaryMaxRetries: 1,
+        fallbackMaxRetries: 1,
+        generateContentFn: mockGenerate,
+        sleepFn: async () => {},
+      });
+
+      const orchestrator = new AgentOrchestrator(provider, toolRegistry, db);
+      const result = await orchestrator.processMessage({
+        phoneNumber: '+919999900024',
+        name: 'AllFailUser',
+        preferredName: 'AllFailUser',
+        nameConfirmed: true,
+        text: 'Hello NEXA, what can you do?',
+        channel: 'whatsapp',
+      });
+
+      consoleSpy.mockRestore();
+
+      expect(logs.some((l) => l.includes('[Gemini] all_attempts_failed'))).toBe(true);
+      expect(logs.some((l) => l.includes('[Agent] task_failed reason="model_failed"'))).toBe(true);
+      expect(logs.some((l) => l.includes('[Agent] task_completed'))).toBe(false);
+      expect(logs.some((l) => l.includes('[Merchant] requested merchant='))).toBe(false);
+      expect(result.replyText).toContain('high load');
+    });
+  });
 });

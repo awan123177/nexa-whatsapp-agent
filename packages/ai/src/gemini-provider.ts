@@ -506,7 +506,7 @@ export class GeminiProvider implements AIProvider {
     const overallDeadlineMs = options.overallDeadlineMs ?? this.overallDeadlineMs;
 
     const modelsToTry = [primaryModel];
-    if (!isSimpleChat && fallbackModel && fallbackModel !== primaryModel) {
+    if (fallbackModel && fallbackModel !== primaryModel) {
       modelsToTry.push(fallbackModel);
     }
 
@@ -559,9 +559,8 @@ export class GeminiProvider implements AIProvider {
       const currentModel = modelsToTry[mIdx];
       const isFallbackModel = mIdx > 0;
       const isLastModel = mIdx === modelsToTry.length - 1;
-      let maxRetries = isSimpleChat
-        ? 0
-        : (currentModel === primaryModel ? this.primaryMaxRetries : this.fallbackMaxRetries);
+      let maxRetries =
+        currentModel === primaryModel ? this.primaryMaxRetries : this.fallbackMaxRetries;
 
       // Prevent agent from spending the entire task deadline on model retries
       const elapsedBeforeModel = Date.now() - overallStartTime;

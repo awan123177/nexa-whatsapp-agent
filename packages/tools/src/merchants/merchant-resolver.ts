@@ -91,6 +91,18 @@ export const SUPPORTED_MERCHANTS: ResolvedMerchant[] = [
   },
 ];
 
+const CASUAL_GREETING_PATTERNS = [
+  /^(?:hi|hello|hey|yo|greetings|good (?:morning|afternoon|evening|day)|howdy)(?:\s+(?:nexa|there|assistant|bot|ai))?[.!?]*$/i,
+  /^(?:how are you|how's it going|what's up|sup|what can you do|who are you|who built you|who made you|help|capabilities)[.!?]*$/i,
+  /^(?:thank you|thanks|bye|goodbye|see you|ok|okay|cool|nice)[.!?]*$/i,
+];
+
+export function isCasualGreetingOrConversational(input: string): boolean {
+  if (!input) return true;
+  const clean = input.trim().toLowerCase();
+  return CASUAL_GREETING_PATTERNS.some((p) => p.test(clean));
+}
+
 export class MerchantResolver {
   private merchants: ResolvedMerchant[];
 
@@ -105,6 +117,11 @@ export class MerchantResolver {
   public resolve(input: string): ResolvedMerchant | null {
     if (!input || typeof input !== 'string') return null;
     const cleanInput = input.trim().toLowerCase();
+
+    // Hard rule: Casual words like "hello", "hey", "hi", "hello nexa", etc. are never merchants
+    if (isCasualGreetingOrConversational(cleanInput)) {
+      return null;
+    }
 
     console.log(`[Merchant] requested merchant="${cleanInput}"`);
 
