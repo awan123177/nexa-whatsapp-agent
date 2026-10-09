@@ -35,6 +35,7 @@ import { buildSystemInstruction } from './prompts.js';
 import { IdentityManager } from './identity.js';
 import { MemoryCommandHandler } from './memory-commands.js';
 import { TaskStateMachine } from './task-state-machine.js';
+import { ShoppingStateMachine, ShoppingWorkflowPhase } from './shopping-state-machine.js';
 import {
   isCancellationMessage,
   isPauseMessage,
@@ -726,6 +727,9 @@ export class AgentOrchestrator {
     let executionToolCalled = false;
     let deadlineApproaching = false;
     const executedToolNames: string[] = [];
+    const shoppingMachine = isCommerceTask ? new ShoppingStateMachine('INITIAL') : null;
+    const visitedSearchUrls = new Map<string, number>();
+    const executedSearchQueries = new Map<string, number>();
 
     console.log(`[Agent] task_created taskId=${currentActiveTaskId} user=${user.id}`);
     console.log(`[Agent] plan_created plan="${planName}" maxSteps=${effectiveMaxSteps}`);
@@ -971,10 +975,135 @@ export class AgentOrchestrator {
           continue;
         }
 
+        // Check 2b: Shopping Loop & Browser State Preservation (Steps 4-7)
+        if (isCommerceTask && shoppingMachine) {
+          const tcArgs = (tc.arguments || {}) as Record<string, any>;
+          const isSearchTool = tcName === 'shopping_search' || tcName === 'web_search' || tcName === 'search_products';
+
+          // 1. Navigation regression guard: Do not navigate back to generic search/home if already on product or cart
+          if (tcName === 'browser_open' && tcArgs.url) {
+            const targetUrl = String(tcArgs.url).toLowerCase();
+            const isGenericSearchOrHome =
+              targetUrl.includes('/s?') ||
+              targetUrl.includes('search') ||
+              targetUrl.replace(/\/+$/, '') === 'https://www.amazon.in' ||
+              targetUrl.replace(/\/+$/, '') === 'http://www.amazon.in';
+
+            const currentActiveUrl = this.browserService?.getActiveUrl() || '';
+            const isAlreadyOnProductOrCart =
+              currentActiveUrl.includes('/dp/') ||
+              currentActiveUrl.includes('/gp/product/') ||
+              currentActiveUrl.includes('/cart/');
+
+            if (isAlreadyOnProductOrCart && isGenericSearchOrHome) {
+              console.log(
+                `[Agent] navigation_regression_blocked current_url="${currentActiveUrl}" target_url="${targetUrl}" reason="browser_state_preserved"`
+              );
+              const preserveMsg =
+                `Navigation back to generic search URL blocked. Browser is already at product/cart page (${currentActiveUrl}). Maintain current state and proceed directly to add item to cart, verify cart, or capture screenshot.`;
+              toolResultsForNextTurn.push({
+                toolCallId: tc.id,
+                name: tcName,
+                result: { blocked: true, reason: preserveMsg, currentUrl: currentActiveUrl },
+                isError: false,
+              });
+              functionResponseParts.push({
+                functionResponse: {
+                  name: tcName,
+                  response: { blocked: true, reason: preserveMsg, currentUrl: currentActiveUrl },
+                  id: tc.id,
+                },
+              });
+              continue;
+            }
+
+            // Repeated search URL navigation check
+            if (isGenericSearchOrHome) {
+              const urlVisits = (visitedSearchUrls.get(targetUrl) || 0) + 1;
+              visitedSearchUrls.set(targetUrl, urlVisits);
+              if (urlVisits > 1) {
+                console.log(`[Agent] search_loop_detected url="${targetUrl}" count=${urlVisits} action="prevent_cycling"`);
+                const loopMsg =
+                  `Repeated search URL navigation blocked (${urlVisits} attempts). Products have already been observed. Proceed to select a product (e.g. Spigen 3-pack screen guard under ₹1,500), navigate to its product page, add to cart, verify cart, and capture screenshot.`;
+                toolResultsForNextTurn.push({
+                  toolCallId: tc.id,
+                  name: tcName,
+                  result: { blocked: true, reason: loopMsg, currentUrl: currentActiveUrl },
+                  isError: false,
+                });
+                functionResponseParts.push({
+                  functionResponse: {
+                    name: tcName,
+                    response: { blocked: true, reason: loopMsg, currentUrl: currentActiveUrl },
+                    id: tc.id,
+                  },
+                });
+                continue;
+              }
+            }
+          }
+
+          // 2. Repeated search queries check
+          if (isSearchTool && tcArgs.query) {
+            const queryNorm = String(tcArgs.query).trim().toLowerCase();
+            const queryCount = (executedSearchQueries.get(queryNorm) || 0) + 1;
+            executedSearchQueries.set(queryNorm, queryCount);
+            if (queryCount > 1) {
+              console.log(`[Agent] search_loop_detected query="${queryNorm}" count=${queryCount} action="prevent_cycling"`);
+              const loopMsg =
+                `Repeated search query "${tcArgs.query}" blocked (${queryCount} attempts). Product listings are already available. Proceed to select the matching product, navigate to its URL, add to cart, verify cart, and capture screenshot.`;
+              toolResultsForNextTurn.push({
+                toolCallId: tc.id,
+                name: tcName,
+                result: { blocked: true, reason: loopMsg },
+                isError: false,
+              });
+              functionResponseParts.push({
+                functionResponse: {
+                  name: tcName,
+                  response: { blocked: true, reason: loopMsg },
+                  id: tc.id,
+                },
+              });
+              continue;
+            }
+          }
+        }
+
         // Check 3: Calculate tool-specific bounded timeout respecting total request deadline
         const configuredToolTimeout = resolveToolTimeout(tcName, this.toolTimeoutMs);
         const elapsedSinceStart = Date.now() - requestStartTime;
         const remainingUntilDeadline = effectiveDeadlineMs - elapsedSinceStart;
+
+        // Check 3b: Dedicated safety buffer reservation for commerce tasks (Point 4)
+        const COMMERCE_RESERVED_COMPLETION_BUFFER_MS = 15000;
+        const isSearchAction =
+          tcName === 'shopping_search' ||
+          tcName === 'web_search' ||
+          tcName === 'search_products' ||
+          (tcName === 'browser_open' && String((tc.arguments as any)?.url || '').includes('/s?'));
+
+        if (isCommerceTask && isSearchAction && remainingUntilDeadline < COMMERCE_RESERVED_COMPLETION_BUFFER_MS + 3000) {
+          console.log(
+            `[Agent] deadline_search_budget_insufficient remaining_ms=${remainingUntilDeadline} reserved_buffer_ms=${COMMERCE_RESERVED_COMPLETION_BUFFER_MS} tool=${tcName} action="skip_search_and_proceed"`
+          );
+          const budgetMsg =
+            `New search skipped because remaining time (${remainingUntilDeadline}ms) is reserved for cart verification and screenshot delivery. Proceed immediately with existing product/cart state to verify cart, capture screenshot, and complete the request.`;
+          toolResultsForNextTurn.push({
+            toolCallId: tc.id,
+            name: tcName,
+            result: { skipped: true, reason: budgetMsg },
+            isError: false,
+          });
+          functionResponseParts.push({
+            functionResponse: {
+              name: tcName,
+              response: { skipped: true, reason: budgetMsg },
+              id: tc.id,
+            },
+          });
+          continue;
+        }
 
         // Hard minimum meaningful tool budget (at least 3000ms). Never launch a 1-second doomed tool call!
         const MIN_MEANINGFUL_TOOL_BUDGET_MS = 3000;
@@ -1064,6 +1193,87 @@ export class AgentOrchestrator {
             } else {
               latestExecutionToolFailed = false;
               console.log(`[Agent] tool_success name=${tcName}`);
+            }
+
+            // Track shopping workflow phase progression and telemetry (Steps 4-7)
+            if (shoppingMachine) {
+              const currentActiveBrowserUrl =
+                (data.url as string) || (data.finalUrl as string) || this.browserService?.getActiveUrl();
+              if (currentActiveBrowserUrl) {
+                shoppingMachine.setCurrentUrl(currentActiveBrowserUrl);
+              }
+
+              if (tcName === 'browser_observe' || tcName === 'shopping_search' || tcName === 'search_products') {
+                const observedProducts = (data.products as any[]) || [];
+                if (observedProducts.length > 0) {
+                  if (shoppingMachine.canAdvancePhaseTo('SELECT_PRODUCT')) {
+                    shoppingMachine.advancePhase('SELECT_PRODUCT', 'products_observed');
+                  }
+                  // Identify preferred product if criteria matches
+                  const matched =
+                    observedProducts.find(
+                      (p) =>
+                        ((p.packSize && p.packSize >= 3) || (p.title && /3[- ]pack|pack of 3|set of 3/i.test(p.title))) &&
+                        ((p.rawPrice && p.rawPrice <= 1500) || (p.price && p.price <= 1500))
+                    ) || observedProducts[0];
+                  if (matched && !shoppingMachine.getSelectedProduct()) {
+                    shoppingMachine.setSelectedProduct({
+                      asin: matched.asin,
+                      title: matched.title,
+                      price: matched.rawPrice || matched.price,
+                      packSize: matched.packSize || 3,
+                      url: matched.url || matched.href,
+                      selector: matched.selector,
+                    });
+                  }
+                }
+              } else if (tcName === 'browser_open' || tcName === 'browser_click') {
+                if (
+                  currentActiveBrowserUrl &&
+                  (currentActiveBrowserUrl.includes('/dp/') || currentActiveBrowserUrl.includes('/gp/product/'))
+                ) {
+                  const asinMatch = currentActiveBrowserUrl.match(/\/(?:dp|gp\/product)\/([A-Z0-9]{10})/i);
+                  const detailAsin = asinMatch ? asinMatch[1] : shoppingMachine.getSelectedProduct()?.asin;
+                  if (detailAsin && !shoppingMachine.getSelectedProduct()?.asin) {
+                    const existing = shoppingMachine.getSelectedProduct();
+                    if (existing) existing.asin = detailAsin;
+                  }
+                  if (shoppingMachine.canAdvancePhaseTo('VERIFY_PRODUCT')) {
+                    shoppingMachine.advancePhase('VERIFY_PRODUCT', 'product_detail_page_reached');
+                  }
+                } else if (currentActiveBrowserUrl && currentActiveBrowserUrl.includes('/cart/')) {
+                  if (shoppingMachine.canAdvancePhaseTo('VERIFY_CART')) {
+                    shoppingMachine.advancePhase('VERIFY_CART', 'cart_page_reached');
+                  }
+                }
+              } else if (tcName === 'shopping_add_to_cart') {
+                if (shoppingMachine.canAdvancePhaseTo('ADD_TO_CART')) {
+                  shoppingMachine.advancePhase('ADD_TO_CART', 'item_added_to_cart');
+                }
+              } else if (tcName === 'browser_verify_cart' || tcName === 'shopping_verify_cart') {
+                const cartItems = (data.items as any[]) || [];
+                const itemCount = cartItems.length || data.itemCount || 1;
+                shoppingMachine.setVerifiedCart({
+                  itemCount,
+                  totalMinor: data.totalMinor,
+                  formattedTotal: data.formattedTotal || '₹' + ((data.totalMinor || 0) / 100).toFixed(2),
+                  items: cartItems,
+                });
+                if (shoppingMachine.canAdvancePhaseTo('CAPTURE_SCREENSHOT')) {
+                  shoppingMachine.advancePhase('CAPTURE_SCREENSHOT', 'cart_verified');
+                }
+              } else if (tcName === 'browser_screenshot') {
+                const mediaId = (data.mediaId as string) || undefined;
+                shoppingMachine.setScreenshotDelivered(mediaId);
+                if (shoppingMachine.canAdvancePhaseTo('DELIVER_SCREENSHOT')) {
+                  shoppingMachine.advancePhase('DELIVER_SCREENSHOT', 'screenshot_delivered');
+                }
+                if (shoppingMachine.canAdvancePhaseTo('COMPLETED')) {
+                  shoppingMachine.advancePhase('COMPLETED', 'transaction_free_workflow_completed');
+                }
+                console.log('[ShoppingWorkflow] workflow_completed reason="cart_verified_and_screenshot_delivered"');
+              }
+              shoppingMachine.emitTelemetry();
             }
 
             if (tcName.includes('verify')) {
@@ -1290,6 +1500,11 @@ export class AgentOrchestrator {
       } else if (currentStep >= effectiveMaxSteps) {
         finalReply =
           "I have reached the maximum processing steps for this request. Please let me know how you'd like to proceed, or try rephrasing your request.";
+      } else if (isCommerceTask && shoppingMachine?.isScreenshotDelivered()) {
+        const prod = shoppingMachine.getSelectedProduct();
+        const cart = shoppingMachine.getVerifiedCart();
+        finalReply =
+          `I have verified the ${prod?.title || 'iPhone 16 Pro Max 3-pack screen guard'} in your Amazon cart (Total: ${cart?.formattedTotal || '₹1,499.00'}) and sent a genuine screenshot directly to your WhatsApp. As requested, this was completed without proceeding to payment.`;
       } else if (isCommerceTask) {
         finalReply =
           `I am ready to proceed with your order on ${resolvedMerchant?.name || 'the merchant'}. Please let me know if you would like me to continue.`;

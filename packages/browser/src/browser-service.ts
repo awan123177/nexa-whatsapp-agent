@@ -340,6 +340,16 @@ export class PlaywrightBrowserService {
         userAgent:
           'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36 NEXA/1.0',
       });
+      if (typeof (this.context as any).on === 'function') {
+        this.context.on('page', (newPage: Page) => {
+          console.log(`[BrowserService] new_tab_detected url="${newPage.url()}"`);
+          this.page = newPage;
+          if (typeof newPage.setDefaultTimeout === 'function') {
+            newPage.setDefaultTimeout(15_000);
+          }
+          this.activeUrl = newPage.url();
+        });
+      }
     }
 
     if (!this.page || this.page.isClosed()) {
@@ -690,7 +700,7 @@ export class PlaywrightBrowserService {
     selector: string,
     sessionId = 'default',
     options?: BrowserActionOptions
-  ): Promise<{ success: boolean; url: string; preventedDuplicate?: boolean }> {
+  ): Promise<{ success: boolean; url: string; preventedDuplicate?: boolean; stateChanged?: boolean; urlChanged?: boolean; isProductPage?: boolean }> {
     const effectiveSessionId = options?.sessionId || sessionId || this.activeSessionId || 'default';
     return this.withSessionLock(effectiveSessionId, 'browser_click', options, async () => {
       return this.internalClickElement(selector, effectiveSessionId, options);
@@ -701,18 +711,25 @@ export class PlaywrightBrowserService {
     selector: string,
     sessionId = 'default',
     options?: BrowserActionOptions
-  ): Promise<{ success: boolean; url: string; preventedDuplicate?: boolean }> {
+  ): Promise<{ success: boolean; url: string; preventedDuplicate?: boolean; stateChanged?: boolean; urlChanged?: boolean; isProductPage?: boolean }> {
     const session = this.getOrCreateSession(sessionId);
     const check = this.canExecuteAction(sessionId, 'click', selector);
     if (!check.allowed) {
       return { success: true, url: this.activeUrl || '', preventedDuplicate: true };
     }
     const page = await this.ensurePage();
+    const initialUrl = page.url();
     const timeoutMs = options?.timeoutMs ?? BROWSER_CLICK_TIMEOUT_MS;
     const clickStart = Date.now();
     try {
       console.log(`[ComputerUse] action_started type=click target="${selector}"`);
       console.log(`[ComputerUse] action type=click target="${selector}"`);
+
+      // Prepare listener for possible popup / new tab opened by click (e.g. target="_blank")
+      let popupPagePromise: Promise<Page | null> = Promise.resolve(null);
+      if (this.context && typeof (this.context as any).waitForEvent === 'function') {
+        popupPagePromise = (this.context as any).waitForEvent('page', { timeout: 3000 }).catch(() => null);
+      }
 
       let effectiveSelector = selector;
       try {
@@ -735,9 +752,35 @@ export class PlaywrightBrowserService {
         }
       }
 
-      await page.waitForLoadState('domcontentloaded').catch(() => {});
-      this.activeUrl = page.url();
+      // Check if a new popup/tab was opened
+      const popupPage = await popupPagePromise;
+      if (popupPage && typeof (popupPage as any).isClosed === 'function' && !popupPage.isClosed()) {
+        await popupPage.waitForLoadState('domcontentloaded').catch(() => {});
+        this.page = popupPage;
+        if (typeof this.page.setDefaultTimeout === 'function') {
+          this.page.setDefaultTimeout(15_000);
+        }
+        this.activeUrl = popupPage.url();
+        console.log(`[BrowserService] adopted_popup_tab url="${this.activeUrl}"`);
+      } else {
+        await (this.page || page).waitForLoadState('domcontentloaded').catch(() => {});
+        // Also check if any open tab in context navigated to a product detail page
+        if (this.context && typeof (this.context as any).pages === 'function') {
+          const allPages: Page[] = this.context.pages().filter((p) => !p.isClosed());
+          const productDetailPage = allPages.find((p) => p.url().includes('/dp/') || p.url().includes('/gp/product/'));
+          if (productDetailPage && productDetailPage !== (this.page || page)) {
+            this.page = productDetailPage;
+            console.log(`[BrowserService] switched_to_product_tab url="${productDetailPage.url()}"`);
+          }
+        }
+        this.activeUrl = (this.page || page).url();
+      }
+
       session.activeUrl = this.activeUrl;
+      const urlChanged = Boolean(this.activeUrl && this.activeUrl !== initialUrl);
+      const isProductPage = Boolean(this.activeUrl && (this.activeUrl.includes('/dp/') || this.activeUrl.includes('/gp/product/')));
+      const stateChanged = urlChanged || isProductPage;
+
       this.recordAction(sessionId, {
         action: 'click',
         target: effectiveSelector,
@@ -747,8 +790,8 @@ export class PlaywrightBrowserService {
 
       const latency = Date.now() - clickStart;
       console.log(`[ComputerUse] action_completed type=click target="${effectiveSelector}" latency_ms=${latency}`);
-      console.log(`[ComputerUse] state_verified type=click state_changed=true`);
-      return { success: true, url: this.activeUrl };
+      console.log(`[ComputerUse] state_verified type=click state_changed=${stateChanged} url_changed=${urlChanged} url="${this.activeUrl}"`);
+      return { success: true, url: this.activeUrl, stateChanged, urlChanged, isProductPage };
     } catch (err: any) {
       console.log(`[ComputerUse] action_failed type=click target="${selector}"`);
       this.recordAction(sessionId, {
@@ -760,6 +803,29 @@ export class PlaywrightBrowserService {
       });
       throw new ToolExecutionError('browser_click', `Failed to click '${selector}': ${err.message}`);
     }
+  }
+
+  public isProductDetailPage(): boolean {
+    if (!this.activeUrl) return false;
+    return this.activeUrl.includes('/dp/') || this.activeUrl.includes('/gp/product/');
+  }
+
+  public getOpenTabs(): string[] {
+    if (!this.context || typeof (this.context as any).pages !== 'function') return [];
+    return this.context.pages().filter((p) => !p.isClosed()).map((p) => p.url());
+  }
+
+  public adoptProductTab(): boolean {
+    if (!this.context || typeof (this.context as any).pages !== 'function') return false;
+    const pages = this.context.pages().filter((p) => !p.isClosed());
+    const productPage = pages.find((p) => p.url().includes('/dp/') || p.url().includes('/gp/product/'));
+    if (productPage) {
+      this.page = productPage;
+      this.activeUrl = productPage.url();
+      console.log(`[BrowserService] product_tab_adopted url="${this.activeUrl}"`);
+      return true;
+    }
+    return false;
   }
 
   async typeText(

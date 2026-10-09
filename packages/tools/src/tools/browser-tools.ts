@@ -204,6 +204,8 @@ export function createBrowserTools(
           deliveredToWhatsApp = true;
         }
 
+        console.log(`[ShoppingWorkflow] screenshot_captured media_id="${mediaId || 'none'}" delivered=${deliveredToWhatsApp}`);
+
         // Return clean result WITHOUT exposing any filesystem paths
         return {
           success: true,

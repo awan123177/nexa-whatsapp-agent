@@ -3,6 +3,7 @@ import {
   SemanticTargetType,
   ResolvedTarget,
   PageObservation,
+  PageObservationProduct,
   ShoppingProduct,
 } from '@nexa/shared';
 
@@ -38,13 +39,10 @@ export class ComputerUseResolver {
         confidence: number;
         role?: string;
       }>;
-      products: Array<{
-        title: string;
-        price?: string;
-        rawPrice?: number;
-        selector?: string;
-      }>;
+      products: PageObservationProduct[];
       cartSummary?: { itemCount: number; totalText?: string };
+      isProductDetailPage?: boolean;
+      currentAsin?: string;
     } = {
       textSummary: '',
       searchInputs: [],
@@ -202,30 +200,104 @@ export class ComputerUseResolver {
           }
 
           // 4. Discover Products on Page
-          const products: Array<{
-            title: string;
-            price?: string;
-            rawPrice?: number;
-            selector?: string;
-          }> = [];
+          const products: PageObservationProduct[] = [];
 
-          // Look for cards containing price symbols (₹, Rs, $) and product titles
-          const candidateCards = Array.from(document.querySelectorAll('[data-testid*="product"], [class*="product"], [class*="item"], div, li'));
+          // First check: Are we on a product detail page?
+          const productTitleEl = document.querySelector('#productTitle, h1.product-title, [data-testid="product-title"]');
+          const asinMatch = location.pathname.match(/\/(?:dp|gp\/product)\/([A-Z0-9]{10})/i);
+          const currentAsin = asinMatch ? asinMatch[1] : (document.querySelector('input[name="ASIN"], input#ASIN') as HTMLInputElement)?.value || undefined;
+          const isDetailPage = Boolean(
+            (productTitleEl && isVisible(productTitleEl)) ||
+            currentAsin ||
+            location.pathname.includes('/dp/') ||
+            location.pathname.includes('/gp/product/')
+          );
+
+          if (isDetailPage && productTitleEl) {
+            const titleText = (productTitleEl as HTMLElement).innerText.trim();
+            const priceEl = document.querySelector(
+              '.a-price .a-offscreen, #priceblock_ourprice, #priceblock_dealprice, #corePrice_feature_div .a-price-whole, .a-price-whole, [data-testid="price"]'
+            );
+            const priceText = priceEl ? (priceEl as HTMLElement).innerText.trim() : '';
+            const priceMatch = (priceText || bodyText).match(/(?:₹|rs\.?|\$)\s*([\d,]+(?:\.\d{2})?)/i);
+            const numericPrice = priceMatch ? parseFloat(priceMatch[1].replace(/,/g, '')) : undefined;
+            const packMatch =
+              titleText.match(/(\d+)\s*(?:[- ]?pack|pcs|piece|pieces|units?|count|set)\b/i) ||
+              titleText.match(/\b(?:pack of|set of)\s*(\d+)/i);
+            const packSize = packMatch ? parseInt(packMatch[1], 10) : 1;
+
+            products.push({
+              title: titleText,
+              price: priceMatch ? priceMatch[0] : (priceText || undefined),
+              rawPrice: numericPrice,
+              selector: '#add-to-cart-button',
+              url: location.href,
+              href: location.href,
+              asin: currentAsin,
+              packSize,
+            });
+          }
+
+          // Search result cards / product listings
+          const candidateCards = Array.from(
+            document.querySelectorAll(
+              '[data-component-type="s-search-result"], [data-asin]:not([data-asin=""]), [data-testid*="product"], [class*="product"], [class*="item"], div.s-result-item'
+            )
+          );
+
           for (const card of candidateCards) {
             if (!isVisible(card)) continue;
             const text = (card as HTMLElement).innerText || '';
             const priceMatch = text.match(/(?:₹|rs\.?|\$)\s*([\d,]+(?:\.\d{2})?)/i);
             if (priceMatch) {
-              // Try to find title
-              const headingEl = card.querySelector('h2, h3, h4, [class*="title"], [class*="name"]');
-              const titleText = headingEl ? (headingEl as HTMLElement).innerText.trim() : '';
-              if (titleText && titleText.length > 3 && titleText.length < 100) {
+              const cardAsin = card.getAttribute('data-asin') || card.closest('[data-asin]')?.getAttribute('data-asin') || undefined;
+              const headingEl = card.querySelector('h2 a, a.a-link-normal[href*="/dp/"], h2, h3, [class*="title"], [class*="name"]');
+              const linkEl =
+                (headingEl && headingEl.tagName.toLowerCase() === 'a' ? headingEl : null) ||
+                card.querySelector('a.a-link-normal[href*="/dp/"], h2 a, a[href*="/dp/"], a[href*="product"]') ||
+                headingEl?.closest('a') ||
+                card.querySelector('a');
+
+              let rawHref = linkEl?.getAttribute('href') || '';
+              let productUrl = '';
+              if (rawHref) {
+                try {
+                  productUrl = new URL(rawHref, document.baseURI).href;
+                } catch {
+                  productUrl = rawHref;
+                }
+              } else if (cardAsin) {
+                productUrl = `https://www.amazon.in/dp/${cardAsin}`;
+              }
+
+              const titleText = headingEl ? (headingEl as HTMLElement).innerText.trim() : (linkEl ? (linkEl as HTMLElement).innerText.trim() : '');
+              if (titleText && titleText.length > 3 && titleText.length < 250) {
                 const numericPrice = parseFloat(priceMatch[1].replace(/,/g, ''));
-                if (!products.some((p) => p.title === titleText)) {
+                if (!products.some((p) => p.title === titleText || (cardAsin && p.asin === cardAsin))) {
+                  const packMatch =
+                    titleText.match(/(\d+)\s*(?:[- ]?pack|pcs|piece|pieces|units?|count|set)\b/i) ||
+                    titleText.match(/\b(?:pack of|set of)\s*(\d+)/i) ||
+                    text.match(/(\d+)\s*(?:[- ]?pack|pcs|piece|pieces|units?|count|set)\b/i);
+                  const packSize = packMatch ? parseInt(packMatch[1], 10) : undefined;
+
+                  let selector = '';
+                  if (cardAsin) {
+                    selector = `[data-asin="${cardAsin}"] h2 a, [data-asin="${cardAsin}"] a.a-link-normal`;
+                  } else if (card.id) {
+                    selector = `#${card.id} a`;
+                  } else if (linkEl && linkEl.getAttribute('href')) {
+                    selector = `a[href*="${linkEl.getAttribute('href')!.slice(0, 30)}"]`;
+                  }
+
                   products.push({
                     title: titleText,
                     price: priceMatch[0],
                     rawPrice: isNaN(numericPrice) ? undefined : numericPrice,
+                    selector: selector || undefined,
+                    url: productUrl || undefined,
+                    href: productUrl || undefined,
+                    asin: cardAsin,
+                    packSize,
                   });
                 }
               }
@@ -250,6 +322,8 @@ export class ComputerUseResolver {
             actionButtons,
             products,
             cartSummary,
+            isProductDetailPage: isDetailPage,
+            currentAsin,
           };
         });
       } catch (err: any) {
@@ -290,6 +364,8 @@ export class ComputerUseResolver {
       actionButtons: actionsResolved,
       products: observationData.products,
       cartSummary: observationData.cartSummary,
+      isProductDetailPage: observationData.isProductDetailPage,
+      currentAsin: observationData.currentAsin,
     };
   }
 

@@ -125,17 +125,30 @@ export interface ResolvedTarget {
   matchedBy: 'id' | 'role' | 'placeholder' | 'aria' | 'text' | 'css' | 'heuristics' | 'coordinates' | 'name';
 }
 
+export interface PageObservationProduct {
+  title: string;
+  price?: string;
+  rawPrice?: number;
+  selector?: string;
+  url?: string;
+  href?: string;
+  asin?: string;
+  packSize?: number;
+}
+
 export interface PageObservation {
   url: string;
   title: string;
   textSummary: string;
   searchInputs: ResolvedTarget[];
   actionButtons: ResolvedTarget[];
-  products: Array<{ title: string; price?: string; rawPrice?: number; selector?: string }>;
+  products: PageObservationProduct[];
   cartSummary?: { itemCount: number; totalText?: string };
   authState?: AuthState;
   challengeDetected?: boolean;
   challengeType?: string;
+  isProductDetailPage?: boolean;
+  currentAsin?: string;
 }
 
 export interface ShoppingProduct {
@@ -147,4 +160,6 @@ export interface ShoppingProduct {
   snippet?: string;
   selector?: string;
   inStock?: boolean;
+  asin?: string;
+  packSize?: number;
 }
