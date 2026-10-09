@@ -1,7 +1,7 @@
 import { IDatabaseRepository } from '@nexa/database';
 import { PlaywrightBrowserService } from '@nexa/browser';
 import { ToolRegistry } from './registry.js';
-import { createWebSearchTool, DuckDuckGoSearchProvider } from './tools/web-search.js';
+import { createWebSearchTool, DuckDuckGoSearchProvider, SearchProvider } from './tools/web-search.js';
 import { createBrowserTools } from './tools/browser-tools.js';
 import { createTravelTools, LiveWebFlightProvider, LiveWebHotelProvider } from './tools/travel-tools.js';
 import { createShoppingTools } from './tools/shopping-tools.js';
@@ -23,9 +23,10 @@ export function createDefaultToolRegistry(options: {
   whatsappClient?: any;
   walletService?: WalletService;
   youtubeService?: YouTubeService;
+  searchProvider?: SearchProvider;
 }): ToolRegistry {
   const registry = new ToolRegistry({ db: options.db });
-  const searchProvider = new DuckDuckGoSearchProvider();
+  const searchProvider = options.searchProvider || new DuckDuckGoSearchProvider();
 
   // 1. Web Search
   registry.register(createWebSearchTool(searchProvider));

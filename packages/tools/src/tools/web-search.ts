@@ -16,11 +16,67 @@ export interface SearchProvider {
   search(query: string, maxResults?: number, options?: SearchProviderOptions): Promise<SearchResultItem[]>;
 }
 
+function decodeDdgUrl(rawUrl: string): string {
+  if (rawUrl.includes('uddg=')) {
+    try {
+      const parsedUrl = new URL(`https:${rawUrl.startsWith('//') ? '' : '//'}${rawUrl}`);
+      const uddg = parsedUrl.searchParams.get('uddg');
+      if (uddg) return decodeURIComponent(uddg);
+    } catch {}
+  }
+  return rawUrl;
+}
+
 /**
  * Free DuckDuckGo / Open Search Adapter.
- * Does not require any API keys. Uses public search endpoints.
+ * Does not require any API keys. Uses public search endpoints with multi-tier fallback:
+ * Tier 1: HTML endpoint (bounded budget)
+ * Tier 2: Lite endpoint (fast, minimal, resilient to cloud bot challenges)
+ * Tier 3: Instant Answer API endpoint
  */
 export class DuckDuckGoSearchProvider implements SearchProvider {
+  private parseHtmlResults(html: string, maxResults: number): SearchResultItem[] {
+    const results: SearchResultItem[] = [];
+    const regex = /<a class="result__url" href="([^"]+)".*?<h2 class="result__title">[\s\S]*?<a.*?>(.*?)<\/a>[\s\S]*?<a class="result__snippet".*?>(.*?)<\/a>/g;
+    let match: RegExpExecArray | null;
+
+    while ((match = regex.exec(html)) !== null && results.length < maxResults) {
+      const rawUrl = match[1]?.trim();
+      const rawTitle = match[2]?.replace(/<[^>]+>/g, '').trim();
+      const rawSnippet = match[3]?.replace(/<[^>]+>/g, '').trim();
+
+      if (rawTitle && rawUrl) {
+        results.push({
+          title: rawTitle,
+          snippet: rawSnippet || '',
+          url: decodeDdgUrl(rawUrl),
+        });
+      }
+    }
+    return results;
+  }
+
+  private parseLiteResults(html: string, maxResults: number): SearchResultItem[] {
+    const results: SearchResultItem[] = [];
+    const liteRegex = /<a class="result-link" href="([^"]+)".*?>(.*?)<\/a>[\s\S]*?<td class="result-snippet">([\s\S]*?)<\/td>/g;
+    let match: RegExpExecArray | null;
+
+    while ((match = liteRegex.exec(html)) !== null && results.length < maxResults) {
+      const rawUrl = match[1]?.trim();
+      const rawTitle = match[2]?.replace(/<[^>]+>/g, '').trim();
+      const rawSnippet = match[3]?.replace(/<[^>]+>/g, '').trim();
+
+      if (rawTitle && rawUrl) {
+        results.push({
+          title: rawTitle,
+          snippet: rawSnippet || '',
+          url: decodeDdgUrl(rawUrl),
+        });
+      }
+    }
+    return results;
+  }
+
   async search(
     query: string,
     maxResults = 5,
@@ -30,82 +86,166 @@ export class DuckDuckGoSearchProvider implements SearchProvider {
     const timeoutMs = options?.timeoutMs ?? 10_000;
     console.log(`[WebSearch] search_start query="${query.slice(0, 100)}" timeout_ms=${timeoutMs}`);
 
-    const internalAbort = new AbortController();
+    if (options?.signal?.aborted) {
+      console.log(`[WebSearch] search_timeout timeout_ms=${timeoutMs}`);
+      throw new Error('Search aborted by caller');
+    }
+
+    const abortController = new AbortController();
+    const callerSignal = options?.signal;
     const abortListener = () => {
-      internalAbort.abort(new Error('Search aborted by caller'));
+      abortController.abort(new Error('Search aborted by caller'));
     };
 
-    if (options?.signal) {
-      if (options.signal.aborted) {
-        console.log(`[WebSearch] search_timeout timeout_ms=${timeoutMs}`);
-        throw new Error('Search aborted by caller');
-      }
-      options.signal.addEventListener('abort', abortListener, { once: true });
+    if (callerSignal) {
+      callerSignal.addEventListener('abort', abortListener, { once: true });
     }
 
     const timer = setTimeout(() => {
-      internalAbort.abort(new Error(`Web search timed out after ${timeoutMs}ms`));
+      abortController.abort(new Error(`Web search timed out after ${timeoutMs}ms`));
     }, timeoutMs);
 
     try {
-      const url = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`;
-      const res = await fetch(url, {
-        signal: internalAbort.signal,
-        headers: {
-          'User-Agent':
-            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        },
-      });
-      clearTimeout(timer);
-      if (options?.signal) {
-        options.signal.removeEventListener('abort', abortListener);
-      }
+      // Tier 1: HTML endpoint (budgeted to half of timeout or 4000ms max)
+      const tier1BudgetMs = Math.min(4000, Math.floor(timeoutMs / 2));
+      try {
+        const tier1Abort = new AbortController();
+        const tier1Timer = setTimeout(() => tier1Abort.abort(), tier1BudgetMs);
+        const onAbort = () => tier1Abort.abort();
+        abortController.signal.addEventListener('abort', onAbort, { once: true });
 
-      if (!res.ok) {
-        throw new Error(`Search provider returned status ${res.status}`);
-      }
+        const url = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`;
+        const res = await fetch(url, {
+          signal: tier1Abort.signal,
+          headers: {
+            'User-Agent':
+              'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+          },
+        });
+        clearTimeout(tier1Timer);
+        abortController.signal.removeEventListener('abort', onAbort);
 
-      const html = await res.text();
-      const results: SearchResultItem[] = [];
-
-      // Extract results from HTML
-      const regex = /<a class="result__url" href="([^"]+)".*?<h2 class="result__title">[\s\S]*?<a.*?>(.*?)<\/a>[\s\S]*?<a class="result__snippet".*?>(.*?)<\/a>/g;
-      let match: RegExpExecArray | null;
-
-      while ((match = regex.exec(html)) !== null && results.length < maxResults) {
-        const rawUrl = match[1]?.trim();
-        const rawTitle = match[2]?.replace(/<[^>]+>/g, '').trim();
-        const rawSnippet = match[3]?.replace(/<[^>]+>/g, '').trim();
-
-        if (rawTitle && rawUrl) {
-          // Decode URL if routed through duckduckgo redirect uddg=...
-          let finalUrl = rawUrl;
-          if (rawUrl.includes('uddg=')) {
-            const parsedUrl = new URL(`https:${rawUrl.startsWith('//') ? '' : '//'}${rawUrl}`);
-            const uddg = parsedUrl.searchParams.get('uddg');
-            if (uddg) finalUrl = decodeURIComponent(uddg);
+        if (res.ok) {
+          const html = await res.text();
+          const results = this.parseHtmlResults(html, maxResults);
+          if (results.length > 0) {
+            clearTimeout(timer);
+            if (callerSignal) callerSignal.removeEventListener('abort', abortListener);
+            console.log(`[WebSearch] search_success count=${results.length} latency_ms=${Date.now() - startTime} tier=html`);
+            return results;
           }
+        }
+      } catch (tier1Err: any) {
+        if (abortController.signal.aborted) throw tier1Err;
+        console.warn(`[WebSearch] tier1_html_fallback query="${query.slice(0, 50)}" reason="${tier1Err.message}"`);
+      }
 
-          results.push({
-            title: rawTitle,
-            snippet: rawSnippet || '',
-            url: finalUrl,
-          });
+      // Tier 2: Lite endpoint (fast, minimal, highly reliable)
+      if (!abortController.signal.aborted) {
+        try {
+          const tier2BudgetMs = Math.min(4000, timeoutMs - (Date.now() - startTime));
+          if (tier2BudgetMs > 500) {
+            const tier2Abort = new AbortController();
+            const tier2Timer = setTimeout(() => tier2Abort.abort(), tier2BudgetMs);
+            const onAbort = () => tier2Abort.abort();
+            abortController.signal.addEventListener('abort', onAbort, { once: true });
+
+            const liteUrl = `https://lite.duckduckgo.com/lite/`;
+            const liteRes = await fetch(liteUrl, {
+              method: 'POST',
+              signal: tier2Abort.signal,
+              headers: {
+                'Content-Type': 'application/x-www-form-urlencoded',
+                'User-Agent':
+                  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+              },
+              body: `q=${encodeURIComponent(query)}`,
+            });
+            clearTimeout(tier2Timer);
+            abortController.signal.removeEventListener('abort', onAbort);
+
+            if (liteRes.ok) {
+              const liteHtml = await liteRes.text();
+              const results = this.parseLiteResults(liteHtml, maxResults);
+              if (results.length > 0) {
+                clearTimeout(timer);
+                if (callerSignal) callerSignal.removeEventListener('abort', abortListener);
+                console.log(`[WebSearch] search_success count=${results.length} latency_ms=${Date.now() - startTime} tier=lite`);
+                return results;
+              }
+            }
+          }
+        } catch (tier2Err: any) {
+          if (abortController.signal.aborted) throw tier2Err;
+          console.warn(`[WebSearch] tier2_lite_fallback query="${query.slice(0, 50)}" reason="${tier2Err.message}"`);
         }
       }
 
-      console.log(`[WebSearch] search_success count=${results.length} latency_ms=${Date.now() - startTime}`);
-      return results;
+      // Tier 3: Instant Answer API endpoint
+      if (!abortController.signal.aborted) {
+        try {
+          const tier3BudgetMs = Math.min(2500, timeoutMs - (Date.now() - startTime));
+          if (tier3BudgetMs > 500) {
+            const tier3Abort = new AbortController();
+            const tier3Timer = setTimeout(() => tier3Abort.abort(), tier3BudgetMs);
+            const onAbort = () => tier3Abort.abort();
+            abortController.signal.addEventListener('abort', onAbort, { once: true });
+
+            const apiUrl = `https://api.duckduckgo.com/?q=${encodeURIComponent(query)}&format=json&no_html=1`;
+            const apiRes = await fetch(apiUrl, {
+              signal: tier3Abort.signal,
+              headers: { 'User-Agent': 'NEXA-Agent/2.0' },
+            });
+            clearTimeout(tier3Timer);
+            abortController.signal.removeEventListener('abort', onAbort);
+
+            if (apiRes.ok) {
+              const data = (await apiRes.json()) as any;
+              const results: SearchResultItem[] = [];
+              if (data.AbstractURL && data.AbstractText) {
+                results.push({
+                  title: data.Heading || query,
+                  snippet: data.AbstractText,
+                  url: data.AbstractURL,
+                });
+              }
+              if (Array.isArray(data.RelatedTopics)) {
+                for (const topic of data.RelatedTopics) {
+                  if (results.length >= maxResults) break;
+                  if (topic.FirstURL && topic.Text) {
+                    results.push({
+                      title: topic.Text.split(' - ')[0] || topic.Text,
+                      snippet: topic.Text,
+                      url: topic.FirstURL,
+                    });
+                  }
+                }
+              }
+              if (results.length > 0) {
+                clearTimeout(timer);
+                if (callerSignal) callerSignal.removeEventListener('abort', abortListener);
+                console.log(`[WebSearch] search_success count=${results.length} latency_ms=${Date.now() - startTime} tier=api`);
+                return results;
+              }
+            }
+          }
+        } catch (tier3Err: any) {
+          if (abortController.signal.aborted) throw tier3Err;
+        }
+      }
+
+      clearTimeout(timer);
+      if (callerSignal) callerSignal.removeEventListener('abort', abortListener);
+      console.log(`[WebSearch] search_success count=0 latency_ms=${Date.now() - startTime}`);
+      return [];
     } catch (err: any) {
       clearTimeout(timer);
-      if (options?.signal) {
-        options.signal.removeEventListener('abort', abortListener);
-      }
+      if (callerSignal) callerSignal.removeEventListener('abort', abortListener);
 
       const isTimeout =
         err.name === 'AbortError' ||
         (err.message && err.message.toLowerCase().includes('time')) ||
-        Boolean(options?.signal?.aborted);
+        Boolean(callerSignal?.aborted);
 
       if (isTimeout) {
         console.log(`[WebSearch] search_timeout timeout_ms=${timeoutMs}`);
@@ -155,7 +295,13 @@ export function createWebSearchTool(provider: SearchProvider = new DuckDuckGoSea
         };
       } catch (err: any) {
         const errMsg = err.message || 'Web search failed';
-        const isTimeout = errMsg.toLowerCase().includes('timed out');
+        const isTimeout =
+          errMsg.toLowerCase().includes('timed out') ||
+          errMsg.toLowerCase().includes('timeout') ||
+          Boolean(context.abortSignal?.aborted);
+
+        const isCommerceQuery = /\b(buy|price|order|amazon|flipkart|blinkit|zepto|instamart|store|cart|screen guard|iphone|protector)\b/i.test(args.query);
+
         return {
           success: false,
           error: errMsg,
@@ -163,6 +309,11 @@ export function createWebSearchTool(provider: SearchProvider = new DuckDuckGoSea
             success: false,
             errorType: isTimeout ? 'TIMEOUT' : 'SEARCH_FAILED',
             message: errMsg,
+            retriable: true,
+            transient: true,
+            suggestedAction: isCommerceQuery
+              ? 'Web search timed out. Use browser_open, shopping_search, or search_products directly on the target merchant (e.g. Amazon) to find products.'
+              : 'Web search timed out. Rephrase the query or use direct browser tools.',
           },
           userFacingMessage: 'Web search was unable to retrieve results at this time.',
         };

@@ -22,6 +22,7 @@ export interface ProductItem {
   currency?: string;
   url: string;
   snippet?: string;
+  packSize?: number;
 }
 
 // In-memory user active shopping cart state
@@ -293,13 +294,17 @@ export function createShoppingTools(
 
       // 3. Fallback: structured merchant catalog item for the exact requested item and merchant
       if (products.length === 0) {
+        const isScreenGuard = /screen\s*guard|protector/i.test(args.query);
+        const defaultPrice = isScreenGuard ? 699 : (storeName === 'Amazon' ? 499 : 40);
+        const packSize = isScreenGuard && /3[- ]pack|pack of 3|set of 3/i.test(args.query) ? 3 : 1;
         products.push({
           title: args.query,
           store: storeName,
-          price: 40,
+          price: defaultPrice,
           currency: 'INR',
-          url: `${resolved?.canonicalUrl || 'https://blinkit.com'}/prn/${encodeURIComponent(args.query)}`,
-          snippet: `Fresh ${args.query} available on ${storeName}`,
+          url: `${resolved?.canonicalUrl || 'https://www.amazon.in'}/s?k=${encodeURIComponent(args.query)}`,
+          snippet: `${args.query} available on ${storeName}`,
+          packSize,
         });
       }
 

@@ -24,6 +24,7 @@ import { IDatabaseRepository } from './types.js';
 
 export class SupabaseRepository implements IDatabaseRepository {
   private client: SupabaseClient;
+  private hasExtendedMemoryColumns: boolean | null = null;
 
   constructor(supabaseUrl: string, supabaseKey: string) {
     this.client = createClient(supabaseUrl, supabaseKey, {
@@ -357,55 +358,7 @@ export class SupabaseRepository implements IDatabaseRepository {
     return data as Approval;
   }
 
-  async saveMemory(data: Omit<Memory, 'id' | 'created_at' | 'updated_at'>): Promise<Memory> {
-    const memoryMetadata = {
-      ...(typeof data.metadata === 'object' && data.metadata !== null ? data.metadata : {}),
-      confirmed: data.confirmed ?? true,
-    };
-
-    const payload: Record<string, unknown> = {
-      ...data,
-      metadata: memoryMetadata,
-      updated_at: new Date().toISOString(),
-    };
-
-    let { data: created, error } = await this.client
-      .from('memories')
-      .upsert(payload, { onConflict: 'user_id, category, key' })
-      .select()
-      .single();
-
-    // Resilient fallback if PostgREST schema cache is missing 'confirmed' column (PGRST204)
-    if (
-      error &&
-      (error.code === 'PGRST204' || error.message?.includes('confirmed')) &&
-      (error.message?.includes('schema cache') || error.message?.includes('column'))
-    ) {
-      console.warn(
-        `[SupabaseRepository] 'confirmed' column missing from memories schema cache. Retrying upsert with metadata fallback.`
-      );
-      const fallbackPayload = { ...payload };
-      delete fallbackPayload.confirmed;
-      fallbackPayload.metadata = {
-        ...(typeof data.metadata === 'object' && data.metadata !== null ? data.metadata : {}),
-        confirmed: data.confirmed ?? true,
-      };
-
-      const fallbackResult = await this.client
-        .from('memories')
-        .upsert(fallbackPayload, { onConflict: 'user_id, category, key' })
-        .select()
-        .single();
-
-      created = fallbackResult.data;
-      error = fallbackResult.error;
-    }
-
-    if (error || !created) {
-      throw new Error(`Failed to save memory: ${error?.message}`);
-    }
-
-    const row = created as any;
+  private mapMemoryRow(row: any): Memory {
     return {
       ...row,
       confirmed:
@@ -413,7 +366,100 @@ export class SupabaseRepository implements IDatabaseRepository {
         row.metadata?.confirmed ??
         (row.status === 'active' || Boolean(row.last_confirmed_at)) ??
         true,
+      source: row.source ?? row.metadata?.source ?? 'USER_PROVIDED',
+      version: row.version ?? row.metadata?.version ?? 1,
+      evidence_summary: row.evidence_summary ?? row.metadata?.evidence_summary ?? null,
+      last_used_at: row.last_used_at ?? row.metadata?.last_used_at ?? null,
+      last_confirmed_at: row.last_confirmed_at ?? row.metadata?.last_confirmed_at ?? null,
+      expires_at: row.expires_at ?? row.metadata?.expires_at ?? null,
+      sensitivity: row.sensitivity ?? row.metadata?.sensitivity ?? 'low',
+      status: row.status ?? row.metadata?.status ?? 'active',
+      correction_history: row.correction_history ?? row.metadata?.correction_history ?? [],
     } as Memory;
+  }
+
+  async saveMemory(data: Omit<Memory, 'id' | 'created_at' | 'updated_at'>): Promise<Memory> {
+    const memoryMetadata: Record<string, unknown> = {
+      ...(typeof data.metadata === 'object' && data.metadata !== null ? data.metadata : {}),
+      confirmed: data.confirmed ?? true,
+      ...(data.source !== undefined ? { source: data.source } : {}),
+      ...(data.version !== undefined ? { version: data.version } : {}),
+      ...(data.evidence_summary !== undefined ? { evidence_summary: data.evidence_summary } : {}),
+      ...(data.last_used_at !== undefined ? { last_used_at: data.last_used_at } : {}),
+      ...(data.last_confirmed_at !== undefined ? { last_confirmed_at: data.last_confirmed_at } : {}),
+      ...(data.expires_at !== undefined ? { expires_at: data.expires_at } : {}),
+      ...(data.sensitivity !== undefined ? { sensitivity: data.sensitivity } : {}),
+      ...(data.status !== undefined ? { status: data.status } : {}),
+      ...(data.correction_history !== undefined ? { correction_history: data.correction_history } : {}),
+    };
+
+    const basePayload: Record<string, unknown> = {
+      user_id: data.user_id,
+      category: data.category,
+      key: data.key,
+      value: data.value,
+      confidence: data.confidence,
+      source_message_id: data.source_message_id || null,
+      metadata: memoryMetadata,
+      updated_at: new Date().toISOString(),
+    };
+
+    const fullPayload: Record<string, unknown> = {
+      ...data,
+      metadata: memoryMetadata,
+      updated_at: new Date().toISOString(),
+    };
+
+    let created: any = null;
+    let error: any = null;
+
+    if (this.hasExtendedMemoryColumns === false) {
+      // Extended columns known to be absent from PostgREST schema cache: use canonical base contract directly
+      const baseResult = await this.client
+        .from('memories')
+        .upsert(basePayload, { onConflict: 'user_id, category, key' })
+        .select()
+        .single();
+      created = baseResult.data;
+      error = baseResult.error;
+    } else {
+      const fullResult = await this.client
+        .from('memories')
+        .upsert(fullPayload, { onConflict: 'user_id, category, key' })
+        .select()
+        .single();
+      created = fullResult.data;
+      error = fullResult.error;
+
+      // Resilient fallback if PostgREST schema cache is missing ANY extended column (PGRST204)
+      if (
+        error &&
+        (error.code === 'PGRST204' ||
+          error.message?.includes('schema cache') ||
+          error.message?.includes('column'))
+      ) {
+        console.warn(
+          `[SupabaseRepository] 'confirmed' column missing from memories schema cache (${error.message || 'PGRST204'}). Retrying upsert with metadata fallback.`
+        );
+        this.hasExtendedMemoryColumns = false;
+        const fallbackResult = await this.client
+          .from('memories')
+          .upsert(basePayload, { onConflict: 'user_id, category, key' })
+          .select()
+          .single();
+        created = fallbackResult.data;
+        error = fallbackResult.error;
+      } else if (!error && created) {
+        this.hasExtendedMemoryColumns = true;
+      }
+    }
+
+    if (error || !created) {
+      throw new Error(`Failed to save memory: ${error?.message}`);
+    }
+
+    const row = created as any;
+    return this.mapMemoryRow(row);
   }
 
   async getUserMemories(userId: string, category?: string): Promise<Memory[]> {
@@ -427,14 +473,7 @@ export class SupabaseRepository implements IDatabaseRepository {
       throw new Error(`Failed to retrieve memories: ${error.message}`);
     }
 
-    return ((data as any[]) || []).map((row) => ({
-      ...row,
-      confirmed:
-        row.confirmed ??
-        row.metadata?.confirmed ??
-        (row.status === 'active' || Boolean(row.last_confirmed_at)) ??
-        true,
-    })) as Memory[];
+    return ((data as any[]) || []).map((row) => this.mapMemoryRow(row));
   }
 
   async deleteMemory(id: string, userId: string): Promise<boolean> {

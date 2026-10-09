@@ -930,7 +930,10 @@ export class AgentOrchestrator {
         // Check 1: Tool disabled for this session due to repeated failures (2 or more)
         if (disabledTools.has(tcName)) {
           console.log(`[Agent] tool_disabled name=${tcName} reason="max retries exceeded"`);
-          const disabledMsg = `Tool ${tcName} is unavailable for this request due to repeated failures. Please continue without it using available knowledge or explain the situation to the user.`;
+          const disabledMsg =
+            tcName === 'web_search' && isCommerceTask
+              ? `Tool web_search is unavailable due to repeated timeouts. Do not abort. Instead, proceed directly to ${resolvedMerchant?.name || 'the merchant'} using browser_open, shopping_search, or other browser tools.`
+              : `Tool ${tcName} is unavailable for this request due to repeated failures. Please continue without it using available knowledge or explain the situation to the user.`;
           toolResultsForNextTurn.push({
             toolCallId: tc.id,
             name: tcName,
@@ -1234,8 +1237,15 @@ export class AgentOrchestrator {
         'take_screenshot',
       ];
 
+      // A genuine network outage occurs only if the latest execution failed due to a network tool,
+      // and NO subsequent network/browser tool succeeded in making progress.
+      const hasSuccessfulNetworkAction = executedToolNames.some(
+        (name) => networkToolNames.includes(name) && !disabledTools.has(name)
+      );
+
       const hadNetworkToolFailures =
-        Array.from(disabledTools).some((name) => networkToolNames.includes(name)) ||
+        !hasSuccessfulNetworkAction &&
+        (latestExecutionToolFailed || Array.from(disabledTools).some((name) => networkToolNames.includes(name))) &&
         Array.from(toolFailures.entries()).some(
           ([name, count]) => count > 0 && networkToolNames.includes(name)
         );
