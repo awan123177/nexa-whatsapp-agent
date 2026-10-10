@@ -28,6 +28,7 @@ export interface ToolResult<T = unknown> {
   success: boolean;
   data?: T;
   error?: string;
+  errorType?: string;
   userFacingMessage?: string;
   requiresFollowUp?: boolean;
   metadata?: Record<string, unknown>;

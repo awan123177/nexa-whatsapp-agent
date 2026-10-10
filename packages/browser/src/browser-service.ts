@@ -191,7 +191,17 @@ export class PlaywrightBrowserService {
 
   canExecuteAction(sessionId: string, actionType: string, target?: string): { allowed: boolean; reason?: string } {
     const session = this.sessions.get(sessionId);
-    if (!session || !target) return { allowed: true };
+    if (!session) return { allowed: true };
+
+    if (session.challengeDetected || session.pageState === 'challenged' || session.authState === 'BLOCKED') {
+      console.log(`[ComputerUse] action_blocked_by_challenge action=${actionType} challenge="${session.challengeType || 'BOT_BLOCKED'}"`);
+      return {
+        allowed: false,
+        reason: `Automated action "${actionType}" blocked: session is restricted by human verification challenge (${session.challengeType || 'BOT_BLOCKED'}). Automated bypass or evasion is prohibited.`,
+      };
+    }
+
+    if (!target) return { allowed: true };
 
     // Prevent duplicate clicking on cart / buy / submit actions within last 10 seconds
     const isConsequential =
@@ -557,10 +567,13 @@ export class PlaywrightBrowserService {
       if (botCheck.detected) {
         const latency = Date.now() - startNav;
         console.log(`[Browser] open_failed latency_ms=${latency} error_type=BOT_BLOCKED`);
-        const isBlock = botCheck.type?.toLowerCase().includes('challenge') || botCheck.type?.toLowerCase().includes('blocked');
+        const isBlock =
+          botCheck.type?.toLowerCase().includes('challenge') ||
+          botCheck.type?.toLowerCase().includes('blocked');
         session.pageState = 'challenged';
         session.challengeDetected = true;
         session.challengeType = botCheck.type;
+        session.authState = isBlock ? 'BLOCKED' : 'CAPTCHA_REQUIRED';
         this.recordAction(sessionId, {
           action: 'navigate',
           target: targetUrl,
@@ -573,6 +586,8 @@ export class PlaywrightBrowserService {
           errorType: isBlock ? 'BOT_BLOCKED' : 'CAPTCHA_REQUIRED',
           message: `Automated access restricted by ${botCheck.type}: ${botCheck.message}`,
           authState: isBlock ? 'BLOCKED' : 'CAPTCHA_REQUIRED',
+          challengeDetected: true,
+          challengeType: botCheck.type,
         };
       }
 
@@ -1116,11 +1131,26 @@ export class PlaywrightBrowserService {
     const botCheck = detectCaptchaOrBotBlock(bodyHtml);
     const authCheck = detectAuthenticationRequirement(bodyHtml, url);
 
+    if (botCheck.detected) {
+      session.challengeDetected = true;
+      session.challengeType = botCheck.type;
+      session.pageState = 'challenged';
+      session.authState = 'BLOCKED';
+    } else if (session.challengeDetected) {
+      console.log(`[ComputerUse] challenge_resolved previous_challenge="${session.challengeType}"`);
+      session.challengeDetected = false;
+      session.challengeType = undefined;
+      session.pageState = 'idle';
+      if (session.authState === 'BLOCKED') {
+        session.authState = authCheck.state;
+      }
+    }
+
     return {
       url,
       title,
       text,
-      authState: authCheck.state,
+      authState: botCheck.detected ? 'BLOCKED' : authCheck.state,
       cartState: session.cartState,
       challengeDetected: botCheck.detected,
       challengeType: botCheck.type,

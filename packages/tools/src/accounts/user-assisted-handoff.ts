@@ -91,48 +91,89 @@ export function isNavigationBlockedOrAuthRequired(result: BrowserOpenResult | {
 }
 
 /**
+ * Determines whether the cloud browser environment supports interactive remote human access.
+ * Returns false for headless container environments (e.g. Render) without an interactive streaming tunnel.
+ */
+export function isRemoteInteractiveSessionSupported(): boolean {
+  return Boolean(process.env.REMOTE_BROWSER_INTERACTIVE_URL);
+}
+
+/**
  * Formulates a friendly, honest, and actionable WhatsApp handoff message.
  */
 export function generateHandoffMessage(
   merchant: string,
   directUrl: string,
   authState: AuthState,
-  details?: { errorType?: string; reason?: string; status?: number }
+  details?: { errorType?: string; reason?: string; status?: number; challengeType?: string }
 ): string {
   const cleanMerchant = merchant.trim();
   const isAuthRequired = authState === 'AUTH_REQUIRED';
 
   const reasonText = (details?.reason || '').toLowerCase();
-  const isRateLimit = details?.status === 429 || details?.errorType === 'RATE_LIMITED' || reasonText.includes('429') || reasonText.includes('rate limit');
-  const isVerification = authState === 'CAPTCHA_REQUIRED' || details?.errorType === 'CAPTCHA_REQUIRED' || reasonText.includes('verification') || reasonText.includes('challenge') || reasonText.includes('captcha');
+  const isRateLimit =
+    details?.status === 429 ||
+    details?.errorType === 'RATE_LIMITED' ||
+    reasonText.includes('429') ||
+    reasonText.includes('rate limit');
+  const challengeType =
+    details?.challengeType ||
+    (reasonText.includes('robot check')
+      ? 'Amazon Robot Check'
+      : reasonText.includes('captcha')
+      ? 'CAPTCHA'
+      : 'Human Verification Challenge');
 
   if (isAuthRequired) {
     return [
       `🔐 *Sign-in required for ${cleanMerchant}*`,
       ``,
-      `${cleanMerchant} requires an active account session to view your cart or place orders.`,
+      `${cleanMerchant} requires you to sign in to your account to view your cart or place orders.`,
       ``,
       `*Options to proceed:*`,
       `1️⃣ *Direct Order:* Open ${cleanMerchant} directly on your device: ${directUrl}`,
-      `2️⃣ *Authorized Session:* Connect your account session in NEXA settings, then reply *"resume"* to pick right back up.`,
+      `2️⃣ *Authorized Session:* Connect your authorized session in NEXA settings, then reply *"resume"*.`,
+      ``,
+      `⚠️ *Security Note:* NEXA will never ask for your passwords, OTPs, or authentication secrets in WhatsApp.`,
+    ].join('\n');
+  }
+
+  const remoteInteractive = isRemoteInteractiveSessionSupported();
+
+  if (remoteInteractive) {
+    return [
+      `🛡️ *${cleanMerchant} Human Verification Required*`,
+      ``,
+      `${cleanMerchant} presented a verification check (${challengeType}).`,
+      ``,
+      `Please complete the verification using your secure session link:`,
+      `${process.env.REMOTE_BROWSER_INTERACTIVE_URL}`,
+      ``,
+      `Once you have solved the challenge, reply *"resume"* and I will verify the page before continuing.`,
+      ``,
+      `⚠️ *Security Note:* NEXA will never ask for your password or OTP.`,
     ].join('\n');
   }
 
   const causePhrase = isRateLimit
     ? `is presenting bot protection or rate limits`
-    : isVerification
-    ? `presented a verification check or security challenge`
-    : `automated security check restricted access`;
+    : `presented an automated verification check (${challengeType})`;
 
-  // Anti-bot / Edge Firewall / Connection Reset Block
+  // When remote browser session cannot be exposed for human interaction (Render cloud container)
   return [
-    `🛡️ *${cleanMerchant} Security Notice*`,
+    `🛡️ *${cleanMerchant} Human Verification Required*`,
     ``,
-    `${cleanMerchant} ${causePhrase} from my cloud browser.`,
+    `${cleanMerchant} ${causePhrase} from my cloud browser session.`,
     ``,
-    `*How we can get this done:*`,
+    `*Session Limitation:*`,
+    `Because NEXA runs in an isolated cloud environment, this specific browser session cannot be exposed for interactive human solving, and automated tools cannot bypass or solve bot challenges. Solving the check on your personal device will not clear the separate cloud session.`,
+    ``,
+    `*How we can proceed:*`,
     `1️⃣ *Direct Order (Fastest):* Open ${cleanMerchant} on your phone to complete your order directly: ${directUrl}`,
     `2️⃣ *Authorized Session:* If you have connected your authorized session with NEXA, reply *"resume"* and I'll use your authenticated session.`,
+    `3️⃣ *Manual Check & Share Link:* Open ${cleanMerchant} on your device (${directUrl}), find your preferred product, and share the product link or details (title, pack size, price) here. I will evaluate the specifications, reviews, and value for you.`,
+    ``,
+    `⚠️ *Security Notice:* Automated cart continuation is currently halted. NEXA will never ask for your Amazon password, OTP, or credentials over WhatsApp.`,
   ].join('\n');
 }
 

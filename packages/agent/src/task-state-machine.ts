@@ -75,8 +75,13 @@ export class TaskStateMachine {
     return (
       this.currentState === 'COMPLETED' ||
       this.currentState === 'FAILED' ||
-      this.currentState === 'CANCELLED'
+      this.currentState === 'CANCELLED' ||
+      this.currentState === 'BLOCKED'
     );
+  }
+
+  public isBlocked(): boolean {
+    return this.currentState === 'BLOCKED';
   }
 
   public transitionTo(nextState: TaskState): void {

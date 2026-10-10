@@ -25,6 +25,8 @@ export type BrowserOpenFailure = {
   message: string;
   status?: number;
   authState?: AuthState;
+  challengeDetected?: boolean;
+  challengeType?: string;
 };
 
 export type BrowserOpenResult = BrowserOpenSuccess | BrowserOpenFailure;

@@ -29,7 +29,7 @@ import {
   ActiveRequestContext,
 } from '@nexa/shared';
 import { IDatabaseRepository, MemoryService } from '@nexa/database';
-import { ToolRegistry, merchantResolver, clearUserCart, UserAssistedHandoffManager } from '@nexa/tools';
+import { ToolRegistry, merchantResolver, clearUserCart, UserAssistedHandoffManager, generateHandoffMessage } from '@nexa/tools';
 import { PlaywrightBrowserService } from '@nexa/browser';
 import { buildSystemInstruction } from './prompts.js';
 import { IdentityManager } from './identity.js';
@@ -399,6 +399,21 @@ export class AgentOrchestrator {
         console.log(`[Handoff] resume_approved user=${user.id} merchant=${pendingHandoff.merchant} cookies_count=${readiness.cookiesCount}`);
         if (this.browserService) {
           await this.handoffManager.applySessionToBrowser(this.browserService, user.id, pendingHandoff.merchant);
+          const pageState = await this.browserService.inspectPageState();
+          if (pageState.challengeDetected || pageState.authState === 'BLOCKED') {
+            console.log(`[Handoff] resume_rejected_challenge_persists merchant=${pendingHandoff.merchant} challenge="${pageState.challengeType || 'CAPTCHA'}"`);
+            const reply = `I checked ${pendingHandoff.merchant}, but the verification challenge (${pageState.challengeType || 'CAPTCHA'}) is still active on the cloud browser. Automated browsing cannot proceed until this challenge is cleared.`;
+            await this.db.saveMessage({
+              conversation_id: conversation.id,
+              sender_type: 'assistant',
+              content: reply,
+            });
+            return {
+              replyText: reply,
+              conversationId: conversation.id,
+              stepsCount: 0,
+            };
+          }
         }
         await this.handoffManager.clearPendingHandoff(user.id, pendingHandoff.merchant);
         intent = 'SHOPPING';
@@ -1374,6 +1389,111 @@ export class AgentOrchestrator {
             latestExecutionToolFailed = true;
             stepHadToolFailure = true;
             const errMsg = result.error || 'Tool execution returned failure';
+            const rawErrorType = (result as any).errorType || (result.data as any)?.errorType;
+            const sessionMetadata =
+              typeof (this.browserService as any)?.getSessionMetadata === 'function'
+                ? (this.browserService as any).getSessionMetadata()
+                : undefined;
+            const isBotChallenge =
+              rawErrorType === 'BOT_BLOCKED' ||
+              rawErrorType === 'CAPTCHA_REQUIRED' ||
+              rawErrorType === 'BLOCKED' ||
+              (result.data as any)?.challengeDetected === true ||
+              errMsg.toLowerCase().includes('robot check') ||
+              errMsg.toLowerCase().includes('human verification') ||
+              errMsg.toLowerCase().includes('bot protection') ||
+              errMsg.toLowerCase().includes('captcha') ||
+              Boolean(sessionMetadata?.challengeDetected);
+
+            if (isBotChallenge) {
+              const challengeType =
+                sessionMetadata?.challengeType ||
+                (result.data as any)?.challengeType ||
+                (errMsg.toLowerCase().includes('robot check')
+                  ? 'Amazon Robot Check'
+                  : 'CAPTCHA');
+
+              console.log(`[Agent] task_blocked reason="bot_challenge_detected" tool=${tcName} challenge="${challengeType}"`);
+              console.log(`[Agent] automated_retries_suppressed merchant="${resolvedMerchant?.name || (isCommerceTask ? 'Amazon India' : 'Web')}"`);
+
+              if (stateMachine.canTransitionTo('BLOCKED')) {
+                stateMachine.transitionTo('BLOCKED');
+              }
+              if (shoppingMachine && shoppingMachine.canAdvancePhaseTo('FAILED', 'bot_challenge_detected')) {
+                shoppingMachine.advancePhase('FAILED', 'bot_challenge_detected');
+              }
+
+              // Suppress further automated navigation, search, clicking, and retries for this session
+              const browserToolNames = [
+                'browser_open',
+                'browser_read',
+                'browser_click',
+                'browser_type',
+                'browser_scroll',
+                'browser_wait',
+                'browser_screenshot',
+                'browser_observe',
+                'shopping_search',
+                'search_products',
+                'web_search',
+              ];
+              browserToolNames.forEach((t) => disabledTools.add(t));
+
+              if (this.browserService && currentActiveTaskId) {
+                this.browserService.markTaskTerminal(currentActiveTaskId);
+              }
+
+              // Initiate secure handoff
+              const handoff = await this.handoffManager.initiateHandoff({
+                userId: user.id,
+                merchant: resolvedMerchant?.name || (isCommerceTask ? 'Amazon India' : 'Web'),
+                canonicalUrl: (result.data as any)?.canonicalUrl || this.browserService?.getActiveUrl() || 'https://www.amazon.in',
+                targetUrl: this.browserService?.getActiveUrl() || 'https://www.amazon.in',
+                errorType: 'BOT_BLOCKED',
+                authState: 'BLOCKED',
+                failureReason: errMsg,
+                openResult: result.data as any,
+              });
+
+              finalReply = handoff.userFacingMessage;
+
+              toolResultsForNextTurn.push({
+                toolCallId: tc.id,
+                name: tcName,
+                result: { error: errMsg, details: result.data, errorType: 'BOT_BLOCKED' },
+                isError: true,
+              });
+
+              functionResponseParts.push({
+                functionResponse: {
+                  name: tcName,
+                  response: { error: errMsg, details: result.data, errorType: 'BOT_BLOCKED' },
+                  id: tc.id,
+                },
+              });
+
+              // Cancel remaining tool calls in this turn preserving 1:1 Gemini pairing
+              const currentIdx = aiResponse.toolCalls.indexOf(tc);
+              for (let j = currentIdx + 1; j < aiResponse.toolCalls.length; j++) {
+                const remTc = aiResponse.toolCalls[j];
+                const remMsg = `Tool execution cancelled: access challenge blocked automated execution.`;
+                toolResultsForNextTurn.push({
+                  toolCallId: remTc.id,
+                  name: remTc.name,
+                  result: { error: remMsg, cancelled: true },
+                  isError: true,
+                });
+                functionResponseParts.push({
+                  functionResponse: {
+                    name: remTc.name,
+                    response: { error: remMsg, cancelled: true },
+                    id: remTc.id,
+                  },
+                });
+              }
+              break;
+            }
+
             const attempts = (toolFailures.get(tcName) || 0) + 1;
             toolFailures.set(tcName, attempts);
             failedSignatures.add(signature);
@@ -1414,8 +1534,8 @@ export class AgentOrchestrator {
           if (!abortController.signal.aborted) {
             abortController.abort(err);
           }
-          if (this.browserService) {
-            await this.browserService.stopPage().catch(() => {});
+          if (this.browserService && typeof (this.browserService as any).stopPage === 'function') {
+            await (this.browserService as any).stopPage().catch(() => {});
           }
 
           // Check if this was an intentional pause for user confirmation!
@@ -1444,6 +1564,102 @@ export class AgentOrchestrator {
           latestExecutionToolFailed = true;
           stepHadToolFailure = true;
           const errMsg = err.message || 'Tool execution failed';
+          const sessionMetadata =
+            typeof (this.browserService as any)?.getSessionMetadata === 'function'
+              ? (this.browserService as any).getSessionMetadata()
+              : undefined;
+          const isBotChallenge =
+            errMsg.toLowerCase().includes('robot check') ||
+            errMsg.toLowerCase().includes('human verification') ||
+            errMsg.toLowerCase().includes('bot protection') ||
+            errMsg.toLowerCase().includes('captcha') ||
+            (err as any)?.errorType === 'BOT_BLOCKED' ||
+            Boolean(sessionMetadata?.challengeDetected);
+
+          if (isBotChallenge) {
+            const challengeType =
+              sessionMetadata?.challengeType ||
+              (errMsg.toLowerCase().includes('robot check')
+                ? 'Amazon Robot Check'
+                : 'CAPTCHA');
+
+            console.log(`[Agent] task_blocked reason="bot_challenge_detected" tool=${tcName} challenge="${challengeType}"`);
+            console.log(`[Agent] automated_retries_suppressed merchant="${resolvedMerchant?.name || (isCommerceTask ? 'Amazon India' : 'Web')}"`);
+
+            if (stateMachine.canTransitionTo('BLOCKED')) {
+              stateMachine.transitionTo('BLOCKED');
+            }
+            if (shoppingMachine && shoppingMachine.canAdvancePhaseTo('FAILED', 'bot_challenge_detected')) {
+              shoppingMachine.advancePhase('FAILED', 'bot_challenge_detected');
+            }
+
+            const browserToolNames = [
+              'browser_open',
+              'browser_read',
+              'browser_click',
+              'browser_type',
+              'browser_scroll',
+              'browser_wait',
+              'browser_screenshot',
+              'browser_observe',
+              'shopping_search',
+              'search_products',
+              'web_search',
+            ];
+            browserToolNames.forEach((t) => disabledTools.add(t));
+
+            if (this.browserService && currentActiveTaskId) {
+              this.browserService.markTaskTerminal(currentActiveTaskId);
+            }
+
+            const handoff = await this.handoffManager.initiateHandoff({
+              userId: user.id,
+              merchant: resolvedMerchant?.name || (isCommerceTask ? 'Amazon India' : 'Web'),
+              canonicalUrl: this.browserService?.getActiveUrl() || 'https://www.amazon.in',
+              targetUrl: this.browserService?.getActiveUrl() || 'https://www.amazon.in',
+              errorType: 'BOT_BLOCKED',
+              authState: 'BLOCKED',
+              failureReason: errMsg,
+            });
+
+            finalReply = handoff.userFacingMessage;
+
+            const errorPayload = { success: false, errorType: 'BOT_BLOCKED', error: errMsg };
+            toolResultsForNextTurn.push({
+              toolCallId: tc.id,
+              name: tcName,
+              result: errorPayload,
+              isError: true,
+            });
+            functionResponseParts.push({
+              functionResponse: {
+                name: tcName,
+                response: errorPayload,
+                id: tc.id,
+              },
+            });
+
+            const currentIdx = aiResponse.toolCalls.indexOf(tc);
+            for (let j = currentIdx + 1; j < aiResponse.toolCalls.length; j++) {
+              const remTc = aiResponse.toolCalls[j];
+              const remMsg = `Tool execution cancelled: access challenge blocked automated execution.`;
+              toolResultsForNextTurn.push({
+                toolCallId: remTc.id,
+                name: remTc.name,
+                result: { error: remMsg, cancelled: true },
+                isError: true,
+              });
+              functionResponseParts.push({
+                functionResponse: {
+                  name: remTc.name,
+                  response: { error: remMsg, cancelled: true },
+                  id: remTc.id,
+                },
+              });
+            }
+            break;
+          }
+
           const attempts = (toolFailures.get(tcName) || 0) + 1;
           toolFailures.set(tcName, attempts);
           failedSignatures.add(signature);
@@ -1535,6 +1751,10 @@ export class AgentOrchestrator {
       if (!stepHadToolFailure && !stateMachine.isTerminal() && !taskAbortController.signal.aborted && !deadlineApproaching) {
         console.log(`[Agent] step_completed step=${currentStep}`);
       }
+
+      if (stateMachine.isTerminal() || stateMachine.getState() === 'BLOCKED') {
+        break;
+      }
     }
   } finally {
     if (AgentOrchestrator.activeRunningTasks.get(conversation.id)?.taskId === currentActiveTaskId) {
@@ -1555,14 +1775,26 @@ export class AgentOrchestrator {
         ? "I was unable to complete the Amazon cart verification and screenshot within the time limit. Amazon India took too long to load and respond. Please try again in a moment."
         : "I was unable to complete the request within the allocated time limit. Please try again or simplify your request.";
     } else if (!finalReply) {
-      const session = this.browserService?.getSessionMetadata();
+      const session =
+        typeof (this.browserService as any)?.getSessionMetadata === 'function'
+          ? (this.browserService as any).getSessionMetadata()
+          : undefined;
       const isAuthRequired = session?.authState === 'AUTH_REQUIRED';
       const isBotBlocked = session?.authState === 'BLOCKED' || Boolean(session?.challengeDetected);
 
       if (isAuthRequired) {
         finalReply = `Amazon India requires you to sign in to your account. Please sign in to Amazon directly in your browser, and let me know once you have logged in so I can continue adding the screen guard to your cart.`;
       } else if (isBotBlocked) {
-        finalReply = `Amazon India is requesting a security verification (${session?.challengeType || 'CAPTCHA'}). Please complete the verification in your browser so I can continue.`;
+        finalReply = generateHandoffMessage(
+          resolvedMerchant?.name || (isCommerceTask ? 'Amazon India' : 'Web'),
+          this.browserService?.getActiveUrl() || 'https://www.amazon.in',
+          'BLOCKED',
+          {
+            errorType: 'BOT_BLOCKED',
+            reason: session?.challengeType || 'Amazon Robot Check',
+            challengeType: session?.challengeType || 'Amazon Robot Check',
+          }
+        );
       } else {
         const networkToolNames = [
           'web_search',

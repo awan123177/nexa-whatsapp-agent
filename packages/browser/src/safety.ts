@@ -195,7 +195,11 @@ export function detectCaptchaOrBotBlock(pageContent: string): {
     contentLower.includes('type the characters you see in this image') ||
     contentLower.includes('sorry, we just need to make sure you\'re not a robot') ||
     contentLower.includes('validatecaptcha') ||
-    contentLower.includes('amazon.com/errors/validatecaptcha')
+    contentLower.includes('amazon.com/errors/validatecaptcha') ||
+    contentLower.includes('amazon.in/errors/validatecaptcha') ||
+    contentLower.includes('errors/validatecaptcha') ||
+    contentLower.includes('<title>robot check</title>') ||
+    (contentLower.includes('robot check') && contentLower.includes('amazon'))
   ) {
     console.log('[ComputerUse] challenge_detected type="Amazon Robot Check"');
     return {

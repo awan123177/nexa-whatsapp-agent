@@ -37,6 +37,7 @@ export function createBrowserTools(
         return {
           success: false,
           error: result.message,
+          errorType: result.errorType,
           data: result,
           userFacingMessage: `Unable to open page: ${result.message}`,
         };
