@@ -755,6 +755,18 @@ export class PlaywrightBrowserService {
     const session = this.getOrCreateSession(sessionId);
     const check = this.canExecuteAction(sessionId, 'click', selector);
     if (!check.allowed) {
+      if (
+        session.challengeDetected ||
+        session.pageState === 'challenged' ||
+        session.authState === 'BLOCKED' ||
+        check.reason?.toLowerCase().includes('challenge') ||
+        check.reason?.toLowerCase().includes('blocked')
+      ) {
+        throw new ToolExecutionError(
+          'browser_click',
+          check.reason || 'Automated action blocked by human verification challenge'
+        );
+      }
       return { success: true, url: this.activeUrl || '', preventedDuplicate: true };
     }
     const page = await this.ensurePage();
@@ -887,6 +899,13 @@ export class PlaywrightBrowserService {
     options?: BrowserActionOptions
   ): Promise<{ success: boolean; recovered?: boolean }> {
     const session = this.getOrCreateSession(sessionId);
+    const check = this.canExecuteAction(sessionId, 'type', selector);
+    if (!check.allowed) {
+      throw new ToolExecutionError(
+        'browser_type',
+        check.reason || 'Automated action blocked by human verification challenge'
+      );
+    }
     const page = await this.ensurePage();
     const timeoutMs = options?.timeoutMs ?? BROWSER_TYPE_TIMEOUT_MS;
     const typeStart = Date.now();
@@ -997,6 +1016,13 @@ export class PlaywrightBrowserService {
     sessionId = 'default',
     options?: BrowserActionOptions
   ): Promise<{ success: boolean }> {
+    const check = this.canExecuteAction(sessionId, 'press', key);
+    if (!check.allowed) {
+      throw new ToolExecutionError(
+        'browser_press',
+        check.reason || 'Automated action blocked by human verification challenge'
+      );
+    }
     const page = await this.ensurePage();
     const timeoutMs = options?.timeoutMs ?? BROWSER_ACTION_TIMEOUT_MS;
     try {
@@ -1041,6 +1067,13 @@ export class PlaywrightBrowserService {
     sessionId = 'default',
     options?: BrowserActionOptions
   ): Promise<{ success: boolean }> {
+    const check = this.canExecuteAction(sessionId, 'select', selector);
+    if (!check.allowed) {
+      throw new ToolExecutionError(
+        'browser_select',
+        check.reason || 'Automated action blocked by human verification challenge'
+      );
+    }
     const page = await this.ensurePage();
     const timeoutMs = options?.timeoutMs ?? BROWSER_ACTION_TIMEOUT_MS;
     try {
@@ -1248,9 +1281,16 @@ export class PlaywrightBrowserService {
   private async internalScrollPage(
     direction: 'up' | 'down',
     amount = 500,
-    _sessionId = 'default',
+    sessionId = 'default',
     _options?: BrowserActionOptions
   ): Promise<{ scrolled: boolean }> {
+    const check = this.canExecuteAction(sessionId, 'scroll');
+    if (!check.allowed) {
+      throw new ToolExecutionError(
+        'browser_scroll',
+        check.reason || 'Automated action blocked by human verification challenge'
+      );
+    }
     const page = await this.ensurePage();
     try {
       const scrollY = direction === 'down' ? amount : -amount;

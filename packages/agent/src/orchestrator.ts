@@ -76,6 +76,66 @@ export interface AgentProcessOutput {
   stepsCount: number;
 }
 
+export interface FriendlyFailureOptions {
+  userTitle?: string;
+  problem: string;
+  notCompletedState: string;
+  nextStep: string;
+  prefix?: string;
+}
+
+/**
+ * Formats a friendly, constructive failure response following the 4-part structure:
+ * 1. Briefly acknowledge problem politely (addressing user as Boss / title when confirmed).
+ * 2. Plain-language explanation of what failed.
+ * 3. Clear statement of what has and has not been completed.
+ * 4. Practical next step.
+ */
+export function formatFriendlyFailureResponse(options: FriendlyFailureOptions): string {
+  const salutation = options.userTitle ? `Sorry, ${options.userTitle} — ` : 'Sorry — ';
+  const base = options.prefix || salutation;
+  const problemClean = options.problem.replace(/[.!?]+$/, '');
+  const notCompletedClean = options.notCompletedState.replace(/[.!?]+$/, '');
+  const nextStepClean = options.nextStep.trim();
+
+  return `${base}${problemClean}. ${notCompletedClean}. ${nextStepClean}`;
+}
+
+/**
+ * Ensures the assistant never sends duplicate greetings back-to-back or repeats
+ * identical failure explanations across turns.
+ */
+export function deduplicateAssistantResponse(reply: string, recentHistory: any[] = []): string {
+  if (!reply) return reply;
+  const lastAssistantMsg = [...recentHistory]
+    .reverse()
+    .find((m) => m.sender_type === 'assistant');
+
+  if (!lastAssistantMsg || !lastAssistantMsg.content) return reply;
+
+  const prev = lastAssistantMsg.content.trim().toLowerCase();
+  const current = reply.trim().toLowerCase();
+
+  // If the reply is identical to the previous assistant turn, vary phrasing
+  if (prev === current) {
+    if (reply.startsWith('Sorry')) {
+      return reply.replace(/^Sorry(?:,\s*[^—–-]+)?\s*[—–-]\s*/i, 'As mentioned earlier, ');
+    }
+    return `Just to confirm: ${reply}`;
+  }
+
+  // Prevent back-to-back duplicate greetings
+  const startsWithGreeting = /^(?:hey(?: there)?!*|hello!*|hi(?: there)?!*)\s*/i;
+  if (startsWithGreeting.test(reply) && startsWithGreeting.test(lastAssistantMsg.content)) {
+    const stripped = reply.replace(startsWithGreeting, '').trim();
+    if (stripped) {
+      return stripped.charAt(0).toUpperCase() + stripped.slice(1);
+    }
+  }
+
+  return reply;
+}
+
 /**
  * Resolves tool-specific timeout in milliseconds.
  * browser_open: 15s (15000ms)
@@ -244,6 +304,13 @@ export class AgentOrchestrator {
 
     // 2. Identify or create User and Active Conversation
     let user = await this.db.findOrCreateUserByPhone(input.phoneNumber, input.name);
+    if (input.preferredTitle) {
+      user = await this.db.updateUser(user.id, {
+        preferred_title: input.preferredTitle,
+        title_confirmed: input.titleConfirmed ?? true,
+        title_source: input.titleSource ?? 'USER_PROVIDED',
+      });
+    }
     const conversation = await this.db.getOrCreateActiveConversation(user.id, channel);
 
     // 3. Persist incoming user message
@@ -570,6 +637,30 @@ export class AgentOrchestrator {
     // 7. Build Context for Agent Reasoning Loop with Intent-Relevant Memories
     const memoryService = new MemoryService(this.db);
     const memories = await memoryService.getRelevantMemories(user.id, input.text || '');
+    const titleMem = memories?.find((m) => m.key === 'preferred_title' || m.key === 'title');
+    const avoidTitleMem = memories?.find((m) => m.key === 'avoid_title');
+    const isTitleAvoided = Boolean(
+      avoidTitleMem &&
+      (avoidTitleMem.value?.toLowerCase() === 'boss' ||
+        avoidTitleMem.value?.toLowerCase() === user.preferred_title?.toLowerCase() ||
+        avoidTitleMem.value?.toLowerCase() === (user.preferences?.preferred_title as string)?.toLowerCase())
+    );
+
+    let userTitle: string | undefined = undefined;
+    if (!isTitleAvoided) {
+      if (user.preferred_title) {
+        userTitle = user.preferred_title;
+      } else if (user.preferences?.preferred_title) {
+        userTitle = String(user.preferences.preferred_title);
+      } else if (titleMem?.value) {
+        userTitle = titleMem.value;
+      } else if (user.title_confirmed) {
+        userTitle = 'Boss';
+      }
+    }
+
+    const failedNavigationUrls = new Map<string, { status: number; error: string; merchant?: string }>();
+
     const systemInstruction = buildSystemInstruction(user, memories);
     const messages: AIMessage[] = rawHistory.map((m) => ({
       role: m.sender_type === 'user' ? 'user' : 'assistant',
@@ -965,6 +1056,8 @@ export class AgentOrchestrator {
         // Check 1: Tool disabled for this session due to repeated failures (2 or more)
         if (disabledTools.has(tcName)) {
           console.log(`[Agent] tool_disabled name=${tcName} reason="max retries exceeded"`);
+          stepHadToolFailure = true;
+          latestExecutionToolFailed = true;
           const disabledMsg =
             tcName === 'web_search' && isCommerceTask
               ? `Tool web_search is unavailable due to repeated timeouts. Do not abort. Instead, proceed directly to ${resolvedMerchant?.name || 'the merchant'} using browser_open, shopping_search, or other browser tools.`
@@ -972,13 +1065,41 @@ export class AgentOrchestrator {
           toolResultsForNextTurn.push({
             toolCallId: tc.id,
             name: tcName,
-            result: { error: disabledMsg },
+            result: { error: disabledMsg, disabled: true },
             isError: true,
           });
           functionResponseParts.push({
             functionResponse: {
               name: tcName,
-              response: { error: disabledMsg },
+              response: { error: disabledMsg, disabled: true },
+              id: tc.id,
+            },
+          });
+          continue;
+        }
+
+        // Check 1b: Dependent browser actions blocked when browser_open is disabled and no page is open
+        const isDependentBrowserAction =
+          tcName.startsWith('browser_') || tcName === 'shopping_search';
+        if (
+          isDependentBrowserAction &&
+          disabledTools.has('browser_open') &&
+          !this.browserService?.getActiveUrl()
+        ) {
+          console.log(`[Agent] dependent_browser_action_blocked tool=${tcName} reason="browser_open_disabled_and_no_page_open"`);
+          stepHadToolFailure = true;
+          latestExecutionToolFailed = true;
+          const noPageMsg = `Browser actions are unavailable because browser_open is disabled and no page is currently open. Do not call browser tools. Please conclude and explain the situation politely to the user.`;
+          toolResultsForNextTurn.push({
+            toolCallId: tc.id,
+            name: tcName,
+            result: { error: noPageMsg, disabled: true },
+            isError: true,
+          });
+          functionResponseParts.push({
+            functionResponse: {
+              name: tcName,
+              response: { error: noPageMsg, disabled: true },
               id: tc.id,
             },
           });
@@ -988,17 +1109,19 @@ export class AgentOrchestrator {
         // Check 2: Duplicate tool call with identical arguments that already failed
         if (failedSignatures.has(signature)) {
           console.log(`[Agent] duplicate_tool_blocked name=${tcName}`);
+          stepHadToolFailure = true;
+          latestExecutionToolFailed = true;
           const duplicateMsg = `Duplicate tool call to ${tcName} with identical arguments blocked because it already failed.`;
           toolResultsForNextTurn.push({
             toolCallId: tc.id,
             name: tcName,
-            result: { error: duplicateMsg },
+            result: { error: duplicateMsg, blocked: true },
             isError: true,
           });
           functionResponseParts.push({
             functionResponse: {
               name: tcName,
-              response: { error: duplicateMsg },
+              response: { error: duplicateMsg, blocked: true },
               id: tc.id,
             },
           });
@@ -1010,8 +1133,31 @@ export class AgentOrchestrator {
           const tcArgs = (tc.arguments || {}) as Record<string, any>;
           const isSearchTool = tcName === 'shopping_search' || tcName === 'web_search' || tcName === 'search_products';
 
-          // 1. Navigation regression guard: Do not navigate back to generic search/home if already on product or cart
+          // 1. Navigation regression guard & failed navigation URLs block
           if (tcName === 'browser_open' && tcArgs.url) {
+            const rawTargetUrl = String(tcArgs.url).trim();
+            const normalizedTargetUrl = rawTargetUrl.toLowerCase().split('#')[0];
+            if (failedNavigationUrls.has(normalizedTargetUrl)) {
+              const failedInfo = failedNavigationUrls.get(normalizedTargetUrl)!;
+              console.log(`[Agent] navigation_to_failed_url_blocked url="${rawTargetUrl}" status=${failedInfo.status}`);
+              stepHadToolFailure = true;
+              latestExecutionToolFailed = true;
+              const blockMsg = `Navigation to ${rawTargetUrl} blocked because this product page previously failed with HTTP ${failedInfo.status}. Do not retry this URL. Choose an alternative candidate product listing or explain to the user that the product page could not be loaded.`;
+              toolResultsForNextTurn.push({
+                toolCallId: tc.id,
+                name: tcName,
+                result: { error: blockMsg, blocked: true, status: failedInfo.status },
+                isError: true,
+              });
+              functionResponseParts.push({
+                functionResponse: {
+                  name: tcName,
+                  response: { error: blockMsg, blocked: true, status: failedInfo.status },
+                  id: tc.id,
+                },
+              });
+              continue;
+            }
             const targetUrl = String(tcArgs.url).toLowerCase();
             const isGenericSearchOrHome =
               targetUrl.includes('/s?') ||
@@ -1514,17 +1660,48 @@ export class AgentOrchestrator {
               console.log(`[Agent] plan_transition step=${currentStep} from=search to=browser_fallback reason="search_failed"`);
             }
 
+            if (tcName === 'browser_open' && tc.arguments?.url) {
+              const rawTargetUrl = String(tc.arguments.url).trim();
+              const normalizedTargetUrl = rawTargetUrl.toLowerCase().split('#')[0];
+              const navStatus = (result.data as any)?.status || (result as any)?.status || 500;
+              failedNavigationUrls.set(normalizedTargetUrl, {
+                status: navStatus,
+                error: errMsg,
+                merchant: resolvedMerchant?.name || (rawTargetUrl.includes('flipkart') ? 'Flipkart' : rawTargetUrl.includes('amazon') ? 'Amazon India' : undefined),
+              });
+              if (navStatus >= 500 && navStatus < 600) {
+                console.log(`[Agent] product_page_http_500 url="${rawTargetUrl}" status=${navStatus} merchant="${resolvedMerchant?.name || (rawTargetUrl.includes('flipkart') ? 'Flipkart' : 'merchant')}"`);
+              }
+            }
+
+            const is5xx =
+              tcName === 'browser_open' &&
+              (((result.data as any)?.status && (result.data as any).status >= 500 && (result.data as any).status < 600) ||
+               ((result as any)?.status && (result as any).status >= 500 && (result as any).status < 600) ||
+               errMsg.includes('HTTP 500') ||
+               errMsg.includes('HTTP 502') ||
+               errMsg.includes('HTTP 503'));
+
+            const toolFailurePayload = is5xx
+              ? {
+                  error: `Product page at ${tc.arguments?.url} returned HTTP ${(result.data as any)?.status || 500} (Server Error). This specific product page is down. Do NOT retry this exact URL. Select an alternative product candidate from search results, or explain that the product page could not be verified.`,
+                  status: (result.data as any)?.status || 500,
+                  unavailableUrl: tc.arguments?.url,
+                  details: result.data,
+                }
+              : { error: errMsg, details: result.data };
+
             toolResultsForNextTurn.push({
               toolCallId: tc.id,
               name: tcName,
-              result: { error: errMsg, details: result.data },
+              result: toolFailurePayload,
               isError: true,
             });
 
             functionResponseParts.push({
               functionResponse: {
                 name: tcName,
-                response: { error: errMsg, details: result.data },
+                response: toolFailurePayload,
                 id: tc.id,
               },
             });
@@ -1685,8 +1862,34 @@ export class AgentOrchestrator {
             console.log(`[Agent] plan_transition step=${currentStep} from=search to=browser_fallback reason="search_exception"`);
           }
 
+          if (tcName === 'browser_open' && tc.arguments?.url) {
+            const rawTargetUrl = String(tc.arguments.url).trim();
+            const normalizedTargetUrl = rawTargetUrl.toLowerCase().split('#')[0];
+            const statusMatch = errMsg.match(/HTTP\s*(\d{3})/i);
+            const status = statusMatch ? parseInt(statusMatch[1], 10) : 500;
+            failedNavigationUrls.set(normalizedTargetUrl, {
+              status,
+              error: errMsg,
+              merchant: resolvedMerchant?.name || (rawTargetUrl.includes('flipkart') ? 'Flipkart' : rawTargetUrl.includes('amazon') ? 'Amazon India' : undefined),
+            });
+            if (status >= 500 && status < 600) {
+              console.log(`[Agent] product_page_http_500 url="${rawTargetUrl}" status=${status} merchant="${resolvedMerchant?.name || (rawTargetUrl.includes('flipkart') ? 'Flipkart' : 'merchant')}"`);
+            }
+          }
+
+          const is5xx =
+            tcName === 'browser_open' &&
+            (errMsg.includes('HTTP 500') || errMsg.includes('HTTP 502') || errMsg.includes('HTTP 503') || errMsg.includes('HTTP 5'));
+
           const errorPayload: Record<string, unknown> = isTimeout
             ? { success: false, errorType: 'TIMEOUT', error: errMsg, message: errMsg }
+            : is5xx
+            ? {
+                success: false,
+                error: `Product page at ${tc.arguments?.url} returned a server error (${errMsg}). This specific product page is down. Do NOT retry this exact URL. Select an alternative product candidate from search results, or explain to the user that the product page is unavailable.`,
+                status: 500,
+                unavailableUrl: tc.arguments?.url,
+              }
             : { success: false, error: errMsg };
 
           toolResultsForNextTurn.push({
@@ -1770,10 +1973,27 @@ export class AgentOrchestrator {
       console.log(`[Agent] task_failed reason="max_steps_reached" steps=${currentStep}`);
     }
 
+    const hasHttp500Failure = Array.from(failedNavigationUrls.values()).some(
+      (f) => f.status >= 500 && f.status < 600
+    );
+
     if (deadlineApproaching) {
-      finalReply = isCommerceTask
-        ? "I was unable to complete the Amazon cart verification and screenshot within the time limit. Amazon India took too long to load and respond. Please try again in a moment."
-        : "I was unable to complete the request within the allocated time limit. Please try again or simplify your request.";
+      if (isCommerceTask) {
+        const merchantName = resolvedMerchant?.name || 'Amazon India';
+        finalReply = formatFriendlyFailureResponse({
+          userTitle,
+          problem: `${merchantName} took too long to load and respond`,
+          notCompletedState: "I haven't verified a product or added anything to your cart",
+          nextStep: "You can share another product link, or we can try again in a moment.",
+        });
+      } else {
+        finalReply = formatFriendlyFailureResponse({
+          userTitle,
+          problem: "I was unable to complete the request within the allocated time limit",
+          notCompletedState: "I haven't completed the task",
+          nextStep: "Please try again or simplify your request.",
+        });
+      }
     } else if (!finalReply) {
       const session =
         typeof (this.browserService as any)?.getSessionMetadata === 'function'
@@ -1820,32 +2040,96 @@ export class AgentOrchestrator {
             ([name, count]) => count > 0 && networkToolNames.includes(name)
           );
 
-        if (hadNetworkToolFailures) {
-          finalReply =
-            "I'm currently unable to access the web or online services due to a temporary network issue. Please try again in a moment or let me know if there's anything else I can assist with.";
+        if (hasHttp500Failure) {
+          const failedEntry = Array.from(failedNavigationUrls.values()).find(
+            (f) => f.status >= 500 && f.status < 600
+          );
+          const merchantName =
+            failedEntry?.merchant ||
+            resolvedMerchant?.name ||
+            (isCommerceTask ? 'Flipkart' : 'the website');
+          finalReply = formatFriendlyFailureResponse({
+            userTitle,
+            problem: `${merchantName} isn't loading the product pages correctly right now`,
+            notCompletedState: "I haven't verified a product or added anything to your cart",
+            nextStep: "You can share another product link, or we can try again later.",
+          });
+        } else if (hadNetworkToolFailures) {
+          finalReply = formatFriendlyFailureResponse({
+            userTitle,
+            problem: "I'm currently unable to access the web or online services due to a temporary network issue",
+            notCompletedState: "I haven't completed your request",
+            nextStep: "Please try again in a moment or let me know if there's anything else I can assist with.",
+          });
         } else if (latestExecutionToolFailed) {
-          finalReply =
-            "I encountered an issue executing the requested action. The action could not be completed safely. Please try again or let me know how you would like to proceed.";
+          if (isCommerceTask) {
+            const prod = shoppingMachine?.getSelectedProduct();
+            const merchantName = resolvedMerchant?.name || 'Amazon';
+            if (prod) {
+              finalReply = formatFriendlyFailureResponse({
+                userTitle,
+                problem: `I found "${prod.title}", but wasn't able to add it to your ${merchantName} cart`,
+                notCompletedState: "I haven't added anything to your cart",
+                nextStep: `Please check ${merchantName} directly or we can try another option.`,
+              });
+            } else {
+              finalReply = formatFriendlyFailureResponse({
+                userTitle,
+                problem: `${merchantName} couldn't complete the product verification`,
+                notCompletedState: "I haven't verified a product or added anything to your cart",
+                nextStep: "You can share another product link, or we can try again later.",
+              });
+            }
+          } else {
+            finalReply = formatFriendlyFailureResponse({
+              userTitle,
+              problem: "I encountered an issue executing the requested action",
+              notCompletedState: "the action could not be completed safely",
+              nextStep: "Please try again or let me know how you would like to proceed.",
+            });
+          }
         } else if (currentStep >= effectiveMaxSteps) {
-          finalReply =
-            "I have reached the maximum processing steps for this request. Please let me know how you'd like to proceed, or try rephrasing your request.";
+          finalReply = formatFriendlyFailureResponse({
+            userTitle,
+            problem: "I reached the maximum processing steps for this request",
+            notCompletedState: isCommerceTask ? "I haven't completed your cart or order" : "the task could not be fully completed",
+            nextStep: "Please try rephrasing your request or share a direct link.",
+          });
         } else if (isCommerceTask && shoppingMachine?.isScreenshotDelivered()) {
           const prod = shoppingMachine.getSelectedProduct();
           const cart = shoppingMachine.getVerifiedCart();
+          const titlePrefix = userTitle ? `Sure, ${userTitle}. ` : '';
           finalReply =
-            `I have verified the ${prod?.title || 'iPhone 16 Pro Max 3-pack screen guard'} in your Amazon cart (Total: ${cart?.formattedTotal || '₹1,499.00'}) and sent a genuine screenshot directly to your WhatsApp. As requested, this was completed without proceeding to payment.`;
+            `${titlePrefix}I have verified the ${prod?.title || 'iPhone 16 Pro Max 3-pack screen guard'} in your Amazon cart (Total: ${cart?.formattedTotal || '₹1,499.00'}) and sent a genuine screenshot directly to your WhatsApp. As requested, this was completed without proceeding to payment.`;
         } else if (isCommerceTask) {
           const prod = shoppingMachine?.getSelectedProduct();
+          const merchantName = resolvedMerchant?.name || 'Amazon';
           if (prod && shoppingMachine?.getVerifiedCart()) {
-            finalReply = `I verified ${prod.title} in your Amazon cart, but was unable to capture and deliver the screenshot to WhatsApp. Please view your cart directly on Amazon.`;
+            finalReply = formatFriendlyFailureResponse({
+              userTitle,
+              problem: `I verified ${prod.title} in your ${merchantName} cart, but was unable to deliver the screenshot to WhatsApp`,
+              notCompletedState: "the screenshot was not delivered",
+              nextStep: `Please view your cart directly on ${merchantName}.`,
+            });
           } else if (prod) {
-            finalReply = `I found qualifying product "${prod.title}", but was unable to complete adding it to your Amazon cart. Please check Amazon directly or try again.`;
+            finalReply = formatFriendlyFailureResponse({
+              userTitle,
+              problem: `I found qualifying product "${prod.title}", but was unable to complete adding it to your ${merchantName} cart`,
+              notCompletedState: "I haven't added anything to your cart",
+              nextStep: `Please check ${merchantName} directly or try again.`,
+            });
           } else {
-            finalReply = `I was unable to complete finding and verifying the qualifying iPhone 16 Pro Max 3-pack screen guard under ₹1,500 on Amazon India. Please try again in a moment.`;
+            finalReply = formatFriendlyFailureResponse({
+              userTitle,
+              problem: `I was unable to find and verify the qualifying screen guard on ${merchantName}`,
+              notCompletedState: "I haven't verified a product or added anything to your cart",
+              nextStep: "You can share another product link, or we can try again later.",
+            });
           }
         } else {
+          const titlePrefix = userTitle ? `Sure, ${userTitle}. ` : '';
           finalReply =
-            "I have gathered the information for your request. Let me know if you would like me to take any further action!";
+            `${titlePrefix}I have gathered the information for your request. Let me know if you would like me to take any further action!`;
         }
       }
     }
@@ -1860,14 +2144,33 @@ export class AgentOrchestrator {
       if (mentionsScreenshotSent && !screenshotDelivered) {
         console.log(`[Agent] unverified_screenshot_claim_prevented`);
         if (cartVerified) {
-          finalReply = `I verified the item in your Amazon cart, but was unable to deliver the screenshot to WhatsApp. Please view your Amazon cart directly.`;
+          finalReply = formatFriendlyFailureResponse({
+            userTitle,
+            problem: "I verified the item in your Amazon cart, but was unable to deliver the screenshot to WhatsApp",
+            notCompletedState: "the screenshot was not delivered",
+            nextStep: "Please view your Amazon cart directly.",
+          });
         } else {
-          finalReply = `I was unable to complete adding the screen guard to your cart or deliver a screenshot. Please check Amazon directly.`;
+          finalReply = formatFriendlyFailureResponse({
+            userTitle,
+            problem: "I was unable to complete adding the screen guard to your cart or deliver a screenshot",
+            notCompletedState: "I haven't added anything to your cart",
+            nextStep: "Please check Amazon directly or share another link.",
+          });
         }
       } else if (mentionsCartVerified && !cartVerified) {
         console.log(`[Agent] unverified_cart_claim_prevented`);
-        finalReply = `I was unable to verify the item in your Amazon cart. Please try again.`;
+        finalReply = formatFriendlyFailureResponse({
+          userTitle,
+          problem: "I was unable to verify the item in your Amazon cart",
+          notCompletedState: "I haven't verified a product or added anything to your cart",
+          nextStep: "Please try again or share a direct product link.",
+        });
       }
+    }
+
+    if (finalReply) {
+      finalReply = deduplicateAssistantResponse(finalReply, rawHistory);
     }
 
     if (deadlineApproaching) {

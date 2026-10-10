@@ -78,6 +78,14 @@ export function createBrowserTools(
         args.sessionId || context.user?.id || 'default',
         getActionOptions(context, args.sessionId)
       );
+      if (data && !data.success) {
+        return {
+          success: false,
+          error: (data as any).error || 'Click failed',
+          errorType: (data as any).errorType,
+          data,
+        };
+      }
       return { success: true, data };
     },
   };
@@ -99,6 +107,14 @@ export function createBrowserTools(
         args.sessionId || context.user?.id || 'default',
         getActionOptions(context, args.sessionId)
       );
+      if (data && !data.success) {
+        return {
+          success: false,
+          error: (data as any).error || 'Type text failed',
+          errorType: (data as any).errorType,
+          data,
+        };
+      }
       return { success: true, data };
     },
   };
@@ -306,6 +322,14 @@ export function createBrowserTools(
     execute: async (args: { sessionId?: string }, context: ToolExecutionContext): Promise<ToolResult> => {
       const sessionId = args.sessionId || context.user?.id || 'default';
       const observation = await browserService.observePage(sessionId);
+      if (observation.challengeDetected || observation.authState === 'BLOCKED') {
+        return {
+          success: false,
+          error: `Observation blocked: human verification challenge detected (${observation.challengeType || 'BOT_BLOCKED'}).`,
+          errorType: 'BOT_BLOCKED',
+          data: observation,
+        };
+      }
       return {
         success: true,
         data: observation,
