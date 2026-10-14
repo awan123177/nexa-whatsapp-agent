@@ -516,6 +516,18 @@ export function createShoppingTools(
       context: ToolExecutionContext
     ): Promise<ToolResult> => {
       const userId = context.user.id;
+      if (browserService && (browserService.isChallengeActive() || (browserService as any).globalChallengeDetected)) {
+        console.log(`[Shopping] add_to_cart_blocked reason="challenge_active"`);
+        return {
+          success: false,
+          error: `Cannot add items to cart: merchant access is currently blocked by human verification challenge.`,
+          data: {
+            blocked: true,
+            challengeDetected: true,
+            authState: 'BLOCKED',
+          },
+        };
+      }
       const storeName = args.store || args.merchant || 'Blinkit';
       const priceMinor = parseToMinorUnits(args.price);
       let cart = userCarts.get(userId);

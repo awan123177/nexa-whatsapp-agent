@@ -379,4 +379,245 @@ describe('NEXA Personality, Conversation Handling & False Success Prevention Sui
       expect(result.replyText).not.toContain('item added');
     });
   });
+
+  describe('6. Production Log Regressions (October 2026)', () => {
+    it('Regression 1: browser_click blocked by Amazon Robot Check does NOT record tool_success or step_completed', async () => {
+      const db = new InMemoryRepository();
+      const registry = new ToolRegistry();
+      const logs: string[] = [];
+      const origLog = console.log;
+      console.log = vi.fn((...args: any[]) => {
+        logs.push(args.join(' '));
+        origLog(...args);
+      });
+
+      const browserService = new PlaywrightBrowserService();
+      // Set session to challenged / Amazon Robot Check
+      (browserService as any).sessions.set('user-sess', {
+        sessionId: 'user-sess',
+        pageState: 'challenged',
+        challengeDetected: true,
+        challengeType: 'Amazon Robot Check',
+        authState: 'BLOCKED',
+        actionHistory: [],
+      });
+
+      registry.register({
+        name: 'browser_click',
+        description: 'Click button',
+        riskLevel: 'medium_risk',
+        parametersSchema: z.object({ selector: z.string() }),
+        requiresApproval: () => ({ required: false }),
+        execute: async (args) => {
+          return browserService.clickElement(args.selector, 'user-sess');
+        },
+      });
+
+      let turn = 0;
+      const mockAI = new MockAIProvider(async () => {
+        turn++;
+        if (turn === 1) {
+          return {
+            text: '',
+            toolCalls: [
+              {
+                id: 'call_click_1',
+                name: 'browser_click',
+                arguments: { selector: '#add-to-cart-button' },
+              },
+            ],
+          };
+        }
+        return { text: 'Done', toolCalls: [] };
+      });
+
+      const orchestrator = new AgentOrchestrator(
+        mockAI,
+        registry,
+        db,
+        3,
+        undefined,
+        5000,
+        30000,
+        3,
+        30000,
+        browserService
+      );
+
+      const res = await orchestrator.processMessage({
+        phoneNumber: '+919876543201',
+        text: 'Click add to cart',
+        sessionId: 'user-sess',
+      });
+
+      console.log = origLog;
+
+      // 1. Tool execution must be logged as blocked or failed
+      expect(logs.some((l) => l.includes('action_blocked_by_challenge') || l.includes('tool_error'))).toBe(true);
+
+      // 2. MUST NOT log tool_success for browser_click
+      expect(logs.some((l) => l.includes('[Agent] tool_success name=browser_click'))).toBe(false);
+
+      // 3. MUST NOT log step_completed for step 1
+      expect(logs.some((l) => l.includes('[Agent] step_completed step=1'))).toBe(false);
+
+      // 4. Must not claim success in response
+      expect(res.replyText).not.toContain('cart verified');
+    });
+
+    it('Regression 2: browser_open disabled after max retries does NOT produce step_completed on subsequent call', async () => {
+      const db = new InMemoryRepository();
+      const registry = new ToolRegistry();
+      const logs: string[] = [];
+      const origLog = console.log;
+      console.log = vi.fn((...args: any[]) => {
+        logs.push(args.join(' '));
+        origLog(...args);
+      });
+
+      let openCount = 0;
+      registry.register({
+        name: 'browser_open',
+        description: 'Opens webpage',
+        riskLevel: 'read_only',
+        parametersSchema: z.object({ url: z.string() }),
+        requiresApproval: () => ({ required: false }),
+        execute: async () => {
+          openCount++;
+          return { success: false, error: 'Connection reset by peer' };
+        },
+      });
+
+      let turn = 0;
+      const mockAI = new MockAIProvider(async () => {
+        turn++;
+        if (turn <= 3) {
+          // Turns 1, 2, and 3: attempt browser_open with different URLs to trigger max retries and disabled tool
+          return {
+            text: '',
+            toolCalls: [
+              {
+                id: `call_open_${turn}`,
+                name: 'browser_open',
+                arguments: { url: `https://www.amazon.in/page_${turn}` },
+              },
+            ],
+          };
+        }
+        return { text: 'I cannot open the page.', toolCalls: [] };
+      });
+
+      const orchestrator = new AgentOrchestrator(
+        mockAI,
+        registry,
+        db,
+        5,
+        undefined,
+        5000,
+        30000,
+        5,
+        30000
+      );
+
+      await orchestrator.processMessage({
+        phoneNumber: '+919876543202',
+        text: 'Open Amazon page',
+      });
+
+      console.log = origLog;
+
+      // browser_open must be disabled after exceeding max retries
+      expect(logs.some((l) => l.includes('[Agent] tool_disabled name=browser_open'))).toBe(true);
+
+      // Step 3 (where tool is disabled) MUST NOT be marked step_completed
+      expect(logs.some((l) => l.includes('[Agent] step_completed step=3'))).toBe(false);
+      // Tool must NOT be marked tool_success
+      expect(logs.some((l) => l.includes('[Agent] tool_success name=browser_open'))).toBe(false);
+    });
+
+    it('Regression 3: Google reCAPTCHA triggers terminal handoff without retries or bypass and addresses Boss politely', async () => {
+      const db = new InMemoryRepository();
+      const user = await db.findOrCreateUserByPhone('+919876543203', 'Boss User');
+      await db.updateUser(user.id, {
+        preferences: { preferred_title: 'Boss' },
+      });
+
+      const registry = new ToolRegistry();
+      let navigationAttempts = 0;
+
+      registry.register({
+        name: 'browser_open',
+        description: 'Opens a webpage',
+        riskLevel: 'read_only',
+        parametersSchema: z.object({ url: z.string() }),
+        requiresApproval: () => ({ required: false }),
+        execute: async (args) => {
+          navigationAttempts++;
+          return {
+            success: false,
+            errorType: 'BOT_BLOCKED',
+            error: 'Automated access restricted by Google reCAPTCHA: human verification is required.',
+            data: {
+              success: false,
+              errorType: 'BOT_BLOCKED',
+              message: 'Automated access restricted by Google reCAPTCHA',
+              authState: 'BLOCKED',
+              challengeDetected: true,
+              challengeType: 'Google reCAPTCHA',
+              canonicalUrl: args.url,
+            },
+          };
+        },
+      });
+
+      let turns = 0;
+      const mockAI = new MockAIProvider(async () => {
+        turns++;
+        if (turns === 1) {
+          return {
+            text: '',
+            toolCalls: [
+              {
+                id: 'call_recaptcha',
+                name: 'browser_open',
+                arguments: { url: 'https://www.google.com/recaptcha/api2/demo' },
+              },
+            ],
+          };
+        }
+        // If Gemini is called again, retries were NOT suppressed
+        return { text: 'Retrying navigation...', toolCalls: [] };
+      });
+
+      const orchestrator = new AgentOrchestrator(
+        mockAI,
+        registry,
+        db,
+        5,
+        undefined,
+        5000,
+        30000,
+        5,
+        30000
+      );
+
+      const res = await orchestrator.processMessage({
+        phoneNumber: '+919876543203',
+        text: 'Search on Google',
+      });
+
+      // 1. Navigation called only once, no retries or bypass
+      expect(navigationAttempts).toBe(1);
+      expect(turns).toBe(1);
+
+      // 2. Message politely addresses user as Boss and explains challenge clearly
+      expect(res.replyText).toContain('Boss');
+      expect(res.replyText).toContain('Google reCAPTCHA');
+      expect(res.replyText).toContain('Human Verification Required');
+
+      // 3. Honest cloud session limitation explained
+      expect(res.replyText).toContain('Session Limitation');
+      expect(res.replyText).toContain('Direct Order');
+    });
+  });
 });

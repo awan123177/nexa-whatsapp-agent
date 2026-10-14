@@ -1381,9 +1381,18 @@ export class AgentOrchestrator {
 
           executedToolNames.push(tcName);
 
-          if (result.success) {
+          const data = (result.data || {}) as Record<string, any>;
+          const isResultBlocked =
+            (result as any).blocked === true ||
+            data.blocked === true ||
+            data.challengeDetected === true ||
+            data.authState === 'BLOCKED' ||
+            (result as any).errorType === 'BOT_BLOCKED' ||
+            (result as any).errorType === 'CAPTCHA_REQUIRED' ||
+            (result as any).errorType === 'BLOCKED';
+
+          if (result.success && !isResultBlocked) {
             const isSearchTool = tcName === 'search_products' || tcName === 'web_search' || tcName === 'shopping_search';
-            const data = (result.data || {}) as Record<string, any>;
             const isEmptySearchResult =
               isSearchTool &&
               Boolean(
@@ -1484,7 +1493,7 @@ export class AgentOrchestrator {
               } else if (tcName === 'browser_screenshot') {
                 const mediaId = (data.mediaId as string) || undefined;
                 const delivered = Boolean(data.deliveredToWhatsApp);
-                if (delivered || mediaId) {
+                if (delivered) {
                   shoppingMachine.setScreenshotDelivered(mediaId);
                   if (shoppingMachine.canAdvancePhaseTo('DELIVER_SCREENSHOT')) {
                     shoppingMachine.advancePhase('DELIVER_SCREENSHOT', 'screenshot_delivered');
@@ -1597,6 +1606,8 @@ export class AgentOrchestrator {
                 targetUrl: this.browserService?.getActiveUrl() || 'https://www.amazon.in',
                 errorType: 'BOT_BLOCKED',
                 authState: 'BLOCKED',
+                challengeType,
+                userTitle: (user.preferences as any)?.preferred_title || undefined,
                 failureReason: errMsg,
                 openResult: result.data as any,
               });
@@ -2013,6 +2024,7 @@ export class AgentOrchestrator {
             errorType: 'BOT_BLOCKED',
             reason: session?.challengeType || 'Amazon Robot Check',
             challengeType: session?.challengeType || 'Amazon Robot Check',
+            userTitle: (user.preferences as any)?.preferred_title || undefined,
           }
         );
       } else {
@@ -2179,28 +2191,32 @@ export class AgentOrchestrator {
       }
       // Already transitioned to FAILED and logged [Agent] task_failed reason="deadline_approaching"
     } else if (latestExecutionToolFailed) {
-      if (stateMachine.canTransitionTo('FAILED')) {
+      if (stateMachine.getState() !== 'BLOCKED' && stateMachine.canTransitionTo('FAILED')) {
         stateMachine.transitionTo('FAILED');
       }
       if (this.browserService && currentActiveTaskId) {
         this.browserService.markTaskTerminal(currentActiveTaskId);
       }
-      console.log(`[Agent] task_failed reason="action_execution_failed" steps=${currentStep}`);
+      if (stateMachine.getState() !== 'BLOCKED') {
+        console.log(`[Agent] task_failed reason="action_execution_failed" steps=${currentStep}`);
+      }
     } else if (modelFailed) {
-      if (stateMachine.canTransitionTo('FAILED')) {
+      if (stateMachine.getState() !== 'BLOCKED' && stateMachine.canTransitionTo('FAILED')) {
         stateMachine.transitionTo('FAILED');
       }
       if (this.browserService && currentActiveTaskId) {
         this.browserService.markTaskTerminal(currentActiveTaskId);
       }
     } else if (currentStep >= effectiveMaxSteps && !finalReply) {
-      if (stateMachine.canTransitionTo('FAILED')) {
+      if (stateMachine.getState() !== 'BLOCKED' && stateMachine.canTransitionTo('FAILED')) {
         stateMachine.transitionTo('FAILED');
       }
       if (this.browserService && currentActiveTaskId) {
         this.browserService.markTaskTerminal(currentActiveTaskId);
       }
-      console.log(`[Agent] task_failed reason="max_steps_reached" steps=${currentStep}`);
+      if (stateMachine.getState() !== 'BLOCKED') {
+        console.log(`[Agent] task_failed reason="max_steps_reached" steps=${currentStep}`);
+      }
     } else if (finalReply && !modelFailed && !latestExecutionToolFailed && !deadlineApproaching) {
       if (!stateMachine.isTerminal() && stateMachine.canTransitionTo('COMPLETED')) {
         stateMachine.transitionTo('COMPLETED');

@@ -66,6 +66,18 @@ export class PlaywrightBrowserService {
   private sessionLocks: Map<string, Promise<void>> = new Map();
   private inFlightNavigations: Map<string, { url: string; promise: Promise<BrowserOpenResult> }> = new Map();
   private terminalTasks: Set<string> = new Set();
+  public globalChallengeDetected: boolean = false;
+  public globalChallengeType: string | undefined = undefined;
+
+  isChallengeActive(): boolean {
+    if (this.globalChallengeDetected) return true;
+    for (const session of this.sessions.values()) {
+      if (session.challengeDetected || session.pageState === 'challenged' || session.authState === 'BLOCKED') {
+        return true;
+      }
+    }
+    return false;
+  }
 
   markTaskTerminal(taskId: string): void {
     if (!taskId) return;
@@ -131,7 +143,7 @@ export class PlaywrightBrowserService {
         const result = await action();
 
         if (this.isTaskTerminal(taskId) || options?.signal?.aborted) {
-          if (result && typeof result === 'object' && (result as any).success === true) {
+          if (result && typeof result === 'object' && (result as any).success === true && !this.isChallengeActive() && !(result as any).blocked && !(result as any).challengeDetected) {
             console.log(`[Browser] late_result_preserved action=${operationName} sessionId=${sessionId}`);
             return result;
           }
@@ -190,14 +202,20 @@ export class PlaywrightBrowserService {
   }
 
   canExecuteAction(sessionId: string, actionType: string, target?: string): { allowed: boolean; reason?: string } {
-    const session = this.sessions.get(sessionId);
-    if (!session) return { allowed: true };
+    const session = this.sessions.get(sessionId) || this.sessions.get(this.activeSessionId) || this.sessions.get('default');
+    const isChallenged =
+      this.globalChallengeDetected ||
+      session?.challengeDetected ||
+      session?.pageState === 'challenged' ||
+      session?.authState === 'BLOCKED' ||
+      this.isChallengeActive();
 
-    if (session.challengeDetected || session.pageState === 'challenged' || session.authState === 'BLOCKED') {
-      console.log(`[ComputerUse] action_blocked_by_challenge action=${actionType} challenge="${session.challengeType || 'BOT_BLOCKED'}"`);
+    if (isChallenged) {
+      const challengeType = this.globalChallengeType || session?.challengeType || 'Amazon Robot Check';
+      console.log(`[ComputerUse] action_blocked_by_challenge action=${actionType} challenge="${challengeType}"`);
       return {
         allowed: false,
-        reason: `Automated action "${actionType}" blocked: session is restricted by human verification challenge (${session.challengeType || 'BOT_BLOCKED'}). Automated bypass or evasion is prohibited.`,
+        reason: `Automated action "${actionType}" blocked: session is restricted by human verification challenge (${challengeType}). Automated bypass or evasion is prohibited.`,
       };
     }
 
@@ -208,7 +226,7 @@ export class PlaywrightBrowserService {
       actionType === 'click' &&
       /(cart|buy|order|checkout|pay|submit|add)/i.test(target);
 
-    if (isConsequential) {
+    if (isConsequential && session) {
       const recentAction = [...session.actionHistory]
         .reverse()
         .find((a) => a.action === 'click' && a.target === target && a.success);
@@ -566,14 +584,17 @@ export class PlaywrightBrowserService {
       const botCheck = detectCaptchaOrBotBlock(bodyHtml);
       if (botCheck.detected) {
         const latency = Date.now() - startNav;
-        console.log(`[Browser] open_failed latency_ms=${latency} error_type=BOT_BLOCKED`);
         const isBlock =
           botCheck.type?.toLowerCase().includes('challenge') ||
           botCheck.type?.toLowerCase().includes('blocked');
+        const errorType = isBlock ? 'BOT_BLOCKED' : 'CAPTCHA_REQUIRED';
+        console.log(`[Browser] open_failed latency_ms=${latency} error_type=${errorType}`);
+        this.globalChallengeDetected = true;
+        this.globalChallengeType = botCheck.type;
         session.pageState = 'challenged';
         session.challengeDetected = true;
         session.challengeType = botCheck.type;
-        session.authState = isBlock ? 'BLOCKED' : 'CAPTCHA_REQUIRED';
+        session.authState = 'BLOCKED';
         this.recordAction(sessionId, {
           action: 'navigate',
           target: targetUrl,
@@ -583,9 +604,9 @@ export class PlaywrightBrowserService {
         });
         return {
           success: false,
-          errorType: isBlock ? 'BOT_BLOCKED' : 'CAPTCHA_REQUIRED',
+          errorType,
           message: `Automated access restricted by ${botCheck.type}: ${botCheck.message}`,
-          authState: isBlock ? 'BLOCKED' : 'CAPTCHA_REQUIRED',
+          authState: 'BLOCKED',
           challengeDetected: true,
           challengeType: botCheck.type,
         };
@@ -755,19 +776,10 @@ export class PlaywrightBrowserService {
     const session = this.getOrCreateSession(sessionId);
     const check = this.canExecuteAction(sessionId, 'click', selector);
     if (!check.allowed) {
-      if (
-        session.challengeDetected ||
-        session.pageState === 'challenged' ||
-        session.authState === 'BLOCKED' ||
-        check.reason?.toLowerCase().includes('challenge') ||
-        check.reason?.toLowerCase().includes('blocked')
-      ) {
-        throw new ToolExecutionError(
-          'browser_click',
-          check.reason || 'Automated action blocked by human verification challenge'
-        );
-      }
-      return { success: true, url: this.activeUrl || '', preventedDuplicate: true };
+      throw new ToolExecutionError(
+        'browser_click',
+        check.reason || 'Automated action blocked by human verification challenge or policy'
+      );
     }
     const page = await this.ensurePage();
     const initialUrl = page.url();
@@ -828,6 +840,33 @@ export class PlaywrightBrowserService {
         this.activeUrl = (this.page || page).url();
       }
 
+      // Verify whether the clicked action resulted in a bot challenge / Robot Check / CAPTCHA
+      const targetPage = this.page || page;
+      const postClickHtml = typeof (targetPage as any)?.content === 'function'
+        ? await (targetPage as any).content().catch(() => '')
+        : '';
+      const postClickBotCheck = detectCaptchaOrBotBlock(postClickHtml);
+      if (postClickBotCheck.detected) {
+        console.log(`[Browser] click_resulted_in_challenge type="${postClickBotCheck.type}"`);
+        this.globalChallengeDetected = true;
+        this.globalChallengeType = postClickBotCheck.type;
+        session.pageState = 'challenged';
+        session.challengeDetected = true;
+        session.challengeType = postClickBotCheck.type;
+        session.authState = 'BLOCKED';
+        this.recordAction(sessionId, {
+          action: 'click',
+          target: effectiveSelector,
+          timestamp: Date.now(),
+          success: false,
+          error: postClickBotCheck.message,
+        });
+        throw new ToolExecutionError(
+          'browser_click',
+          `Automated action restricted by ${postClickBotCheck.type}: ${postClickBotCheck.message}`
+        );
+      }
+
       session.activeUrl = this.activeUrl;
       const urlChanged = Boolean(this.activeUrl && this.activeUrl !== initialUrl);
       const isProductPage = Boolean(this.activeUrl && (this.activeUrl.includes('/dp/') || this.activeUrl.includes('/gp/product/')));
@@ -853,6 +892,7 @@ export class PlaywrightBrowserService {
         success: false,
         error: err.message,
       });
+      if (err instanceof ToolExecutionError) throw err;
       throw new ToolExecutionError('browser_click', `Failed to click '${selector}': ${err.message}`);
     }
   }
@@ -949,6 +989,33 @@ export class PlaywrightBrowserService {
         }
       }
 
+      // Verify whether the typed action resulted in a bot challenge / Robot Check / CAPTCHA
+      const targetPage = this.page || page;
+      const postTypeHtml = typeof (targetPage as any)?.content === 'function'
+        ? await (targetPage as any).content().catch(() => '')
+        : '';
+      const postTypeBotCheck = detectCaptchaOrBotBlock(postTypeHtml);
+      if (postTypeBotCheck.detected) {
+        console.log(`[Browser] type_resulted_in_challenge type="${postTypeBotCheck.type}"`);
+        this.globalChallengeDetected = true;
+        this.globalChallengeType = postTypeBotCheck.type;
+        session.pageState = 'challenged';
+        session.challengeDetected = true;
+        session.challengeType = postTypeBotCheck.type;
+        session.authState = 'BLOCKED';
+        this.recordAction(sessionId, {
+          action: 'type',
+          target: effectiveSelector,
+          timestamp: Date.now(),
+          success: false,
+          error: postTypeBotCheck.message,
+        });
+        throw new ToolExecutionError(
+          'browser_type',
+          `Automated action restricted by ${postTypeBotCheck.type}: ${postTypeBotCheck.message}`
+        );
+      }
+
       this.recordAction(sessionId, {
         action: 'type',
         target: effectiveSelector,
@@ -960,6 +1027,7 @@ export class PlaywrightBrowserService {
       console.log(`[ComputerUse] state_verified type=type state_changed=true`);
       return { success: true };
     } catch (err: any) {
+      if (err instanceof ToolExecutionError) throw err;
       // Action Recovery Inspection: check if value actually made it into the field
       try {
         if (!page.isClosed()) {
@@ -1023,11 +1091,40 @@ export class PlaywrightBrowserService {
         check.reason || 'Automated action blocked by human verification challenge'
       );
     }
+    const session = this.getOrCreateSession(sessionId);
     const page = await this.ensurePage();
     const timeoutMs = options?.timeoutMs ?? BROWSER_ACTION_TIMEOUT_MS;
     try {
       console.log(`[ComputerUse] action_started type=press target="${key}"`);
       await page.keyboard.press(key);
+
+      // Verify whether pressing the key triggered a bot challenge / Robot Check
+      const targetPage = this.page || page;
+      const postPressHtml = typeof (targetPage as any)?.content === 'function'
+        ? await (targetPage as any).content().catch(() => '')
+        : '';
+      const postPressBotCheck = detectCaptchaOrBotBlock(postPressHtml);
+      if (postPressBotCheck.detected) {
+        console.log(`[Browser] press_resulted_in_challenge type="${postPressBotCheck.type}"`);
+        this.globalChallengeDetected = true;
+        this.globalChallengeType = postPressBotCheck.type;
+        session.pageState = 'challenged';
+        session.challengeDetected = true;
+        session.challengeType = postPressBotCheck.type;
+        session.authState = 'BLOCKED';
+        this.recordAction(sessionId, {
+          action: 'press',
+          target: key,
+          timestamp: Date.now(),
+          success: false,
+          error: postPressBotCheck.message,
+        });
+        throw new ToolExecutionError(
+          'browser_press',
+          `Automated action restricted by ${postPressBotCheck.type}: ${postPressBotCheck.message}`
+        );
+      }
+
       this.recordAction(sessionId, {
         action: 'press',
         target: key,
@@ -1045,6 +1142,7 @@ export class PlaywrightBrowserService {
         success: false,
         error: err.message,
       });
+      if (err instanceof ToolExecutionError) throw err;
       throw new ToolExecutionError('browser_press', `Failed to press key '${key}': ${err.message}`);
     }
   }
@@ -1074,12 +1172,41 @@ export class PlaywrightBrowserService {
         check.reason || 'Automated action blocked by human verification challenge'
       );
     }
+    const session = this.getOrCreateSession(sessionId);
     const page = await this.ensurePage();
     const timeoutMs = options?.timeoutMs ?? BROWSER_ACTION_TIMEOUT_MS;
     try {
       console.log(`[ComputerUse] action_started type=select target="${selector}" value="${value}"`);
       await page.waitForSelector(selector, { timeout: timeoutMs });
       await page.selectOption(selector, value);
+
+      // Verify whether selecting option triggered a bot challenge / Robot Check
+      const targetPage = this.page || page;
+      const postSelectHtml = typeof (targetPage as any)?.content === 'function'
+        ? await (targetPage as any).content().catch(() => '')
+        : '';
+      const postSelectBotCheck = detectCaptchaOrBotBlock(postSelectHtml);
+      if (postSelectBotCheck.detected) {
+        console.log(`[Browser] select_resulted_in_challenge type="${postSelectBotCheck.type}"`);
+        this.globalChallengeDetected = true;
+        this.globalChallengeType = postSelectBotCheck.type;
+        session.pageState = 'challenged';
+        session.challengeDetected = true;
+        session.challengeType = postSelectBotCheck.type;
+        session.authState = 'BLOCKED';
+        this.recordAction(sessionId, {
+          action: 'select',
+          target: selector,
+          timestamp: Date.now(),
+          success: false,
+          error: postSelectBotCheck.message,
+        });
+        throw new ToolExecutionError(
+          'browser_select',
+          `Automated action restricted by ${postSelectBotCheck.type}: ${postSelectBotCheck.message}`
+        );
+      }
+
       this.recordAction(sessionId, {
         action: 'select',
         target: selector,
@@ -1098,6 +1225,7 @@ export class PlaywrightBrowserService {
         success: false,
         error: err.message,
       });
+      if (err instanceof ToolExecutionError) throw err;
       throw new ToolExecutionError('browser_select', `Failed to select option '${value}' in '${selector}': ${err.message}`);
     }
   }
@@ -1118,12 +1246,48 @@ export class PlaywrightBrowserService {
     sessionId = 'default',
     options?: BrowserActionOptions
   ): Promise<{ success: boolean }> {
+    const check = this.canExecuteAction(sessionId, 'hover', selector);
+    if (!check.allowed) {
+      throw new ToolExecutionError(
+        'browser_hover',
+        check.reason || 'Automated action blocked by human verification challenge'
+      );
+    }
+    const session = this.getOrCreateSession(sessionId);
     const page = await this.ensurePage();
     const timeoutMs = options?.timeoutMs ?? BROWSER_ACTION_TIMEOUT_MS;
     try {
       console.log(`[ComputerUse] action_started type=hover target="${selector}"`);
       await page.waitForSelector(selector, { timeout: timeoutMs });
       await page.hover(selector);
+
+      // Verify whether hover triggered a bot challenge / Robot Check
+      const targetPage = this.page || page;
+      const postHoverHtml = typeof (targetPage as any)?.content === 'function'
+        ? await (targetPage as any).content().catch(() => '')
+        : '';
+      const postHoverBotCheck = detectCaptchaOrBotBlock(postHoverHtml);
+      if (postHoverBotCheck.detected) {
+        console.log(`[Browser] hover_resulted_in_challenge type="${postHoverBotCheck.type}"`);
+        this.globalChallengeDetected = true;
+        this.globalChallengeType = postHoverBotCheck.type;
+        session.pageState = 'challenged';
+        session.challengeDetected = true;
+        session.challengeType = postHoverBotCheck.type;
+        session.authState = 'BLOCKED';
+        this.recordAction(sessionId, {
+          action: 'hover',
+          target: selector,
+          timestamp: Date.now(),
+          success: false,
+          error: postHoverBotCheck.message,
+        });
+        throw new ToolExecutionError(
+          'browser_hover',
+          `Automated action restricted by ${postHoverBotCheck.type}: ${postHoverBotCheck.message}`
+        );
+      }
+
       this.recordAction(sessionId, {
         action: 'hover',
         target: selector,
@@ -1141,6 +1305,7 @@ export class PlaywrightBrowserService {
         success: false,
         error: err.message,
       });
+      if (err instanceof ToolExecutionError) throw err;
       throw new ToolExecutionError('browser_hover', `Failed to hover over '${selector}': ${err.message}`);
     }
   }

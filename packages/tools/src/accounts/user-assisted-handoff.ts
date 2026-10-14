@@ -19,6 +19,8 @@ export interface InitiateHandoffOptions {
   errorType?: string;
   status?: number;
   authState?: AuthState;
+  challengeType?: string;
+  userTitle?: string;
 }
 
 export interface HandoffSessionData {
@@ -105,10 +107,11 @@ export function generateHandoffMessage(
   merchant: string,
   directUrl: string,
   authState: AuthState,
-  details?: { errorType?: string; reason?: string; status?: number; challengeType?: string }
+  details?: { errorType?: string; reason?: string; status?: number; challengeType?: string; userTitle?: string }
 ): string {
   const cleanMerchant = merchant.trim();
   const isAuthRequired = authState === 'AUTH_REQUIRED';
+  const salutation = details?.userTitle ? `${details.userTitle}, ` : '';
 
   const reasonText = (details?.reason || '').toLowerCase();
   const isRateLimit =
@@ -120,6 +123,8 @@ export function generateHandoffMessage(
     details?.challengeType ||
     (reasonText.includes('robot check')
       ? 'Amazon Robot Check'
+      : reasonText.includes('recaptcha')
+      ? 'Google reCAPTCHA'
       : reasonText.includes('captcha')
       ? 'CAPTCHA'
       : 'Human Verification Challenge');
@@ -128,7 +133,7 @@ export function generateHandoffMessage(
     return [
       `🔐 *Sign-in required for ${cleanMerchant}*`,
       ``,
-      `${cleanMerchant} requires you to sign in to your account to view your cart or place orders.`,
+      `${salutation}${cleanMerchant} requires you to sign in to your account to view your cart or place orders.`,
       ``,
       `*Options to proceed:*`,
       `1️⃣ *Direct Order:* Open ${cleanMerchant} directly on your device: ${directUrl}`,
@@ -144,7 +149,7 @@ export function generateHandoffMessage(
     return [
       `🛡️ *${cleanMerchant} Human Verification Required*`,
       ``,
-      `${cleanMerchant} presented a verification check (${challengeType}).`,
+      `${salutation}${cleanMerchant} presented a verification check (${challengeType}).`,
       ``,
       `Please complete the verification using your secure session link:`,
       `${process.env.REMOTE_BROWSER_INTERACTIVE_URL}`,
@@ -163,7 +168,7 @@ export function generateHandoffMessage(
   return [
     `🛡️ *${cleanMerchant} Human Verification Required*`,
     ``,
-    `${cleanMerchant} ${causePhrase} from my cloud browser session.`,
+    `${salutation}${cleanMerchant} ${causePhrase} from my cloud browser session.`,
     ``,
     `*Session Limitation:*`,
     `Because NEXA runs in an isolated cloud environment, this specific browser session cannot be exposed for interactive human solving, and automated tools cannot bypass or solve bot challenges. Solving the check on your personal device will not clear the separate cloud session.`,
@@ -221,10 +226,23 @@ export class UserAssistedHandoffManager {
     const authState = options.authState || (errorType === 'AUTH_REQUIRED' ? 'AUTH_REQUIRED' : 'BLOCKED');
     const now = new Date().toISOString();
 
+    const challengeType =
+      options.challengeType ||
+      (options.openResult as any)?.challengeType ||
+      (reason.toLowerCase().includes('robot check')
+        ? 'Amazon Robot Check'
+        : reason.toLowerCase().includes('recaptcha')
+        ? 'Google reCAPTCHA'
+        : reason.toLowerCase().includes('captcha')
+        ? 'CAPTCHA'
+        : undefined);
+
     const userFacingMessage = generateHandoffMessage(storeName, canonicalUrl, authState, {
       errorType,
       reason,
       status,
+      challengeType,
+      userTitle: options.userTitle,
     });
 
     const handoffData: HandoffSessionData = {

@@ -229,10 +229,9 @@ export function detectAuthenticationRequirement(
 ): AuthDetectionResult {
   const botCheck = detectCaptchaOrBotBlock(pageContent);
   if (botCheck.detected) {
-    const isBlock = botCheck.type?.toLowerCase().includes('challenge') || botCheck.type?.toLowerCase().includes('blocked');
     return {
       required: true,
-      state: isBlock ? 'BLOCKED' : 'CAPTCHA_REQUIRED',
+      state: 'BLOCKED',
       type: botCheck.type,
       message: botCheck.message,
     };
