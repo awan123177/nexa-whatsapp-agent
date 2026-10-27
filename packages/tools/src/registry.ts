@@ -82,7 +82,7 @@ export class ToolRegistry {
     // 2. Validate arguments against schema
     let parsedArgs: any;
     try {
-      parsedArgs = tool.parametersSchema.parse(rawArgs);
+      parsedArgs = tool.parametersSchema.parse(rawArgs || {});
     } catch (err: any) {
       const zErr = err instanceof z.ZodError ? err.errors.map(e => `${e.path.join('.')}: ${e.message}`).join(', ') : err.message;
       throw new ToolExecutionError(tool.name, `Invalid tool arguments: ${zErr}`);

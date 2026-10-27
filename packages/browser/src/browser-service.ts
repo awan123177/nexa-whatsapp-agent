@@ -18,9 +18,27 @@ import {
   BROWSER_ACTION_TIMEOUT_MS,
   BROWSER_READINESS_TIMEOUT_MS,
 } from '@nexa/shared';
-import { validateBrowserUrl, detectCaptchaOrBotBlock, detectAuthenticationRequirement } from './safety.js';
+import {
+  validateBrowserUrl,
+  validateBrowserUrlAsync,
+  detectCaptchaOrBotBlock,
+  detectAuthenticationRequirement,
+  sanitizeUntrustedWebText,
+} from './safety.js';
 import { computerUseResolver, ComputerUseResolver } from './computer-use-resolver.js';
 import { PermissionEngine } from '@nexa/security';
+import { ObscuraManager, ObscuraConfig } from './obscura-manager.js';
+
+export type BrowserEngineType = 'playwright' | 'obscura' | 'auto';
+
+export interface BrowserServiceConfig {
+  engine?: BrowserEngineType;
+  obscuraPath?: string;
+  obscuraCdpUrl?: string;
+  obscuraToken?: string;
+  obscuraPort?: number;
+  allowPrivateNetwork?: boolean;
+}
 
 export interface BrowserActionOptions {
   timeoutMs?: number;
@@ -57,17 +75,46 @@ function sanitizeUrlForLogs(targetUrl: string): string {
 }
 
 export class PlaywrightBrowserService {
+  private enginePreference: BrowserEngineType;
+  private activeEngine: 'playwright' | 'obscura' = 'playwright';
+  private obscuraManager: ObscuraManager;
   private browser: Browser | null = null;
   private context: BrowserContext | null = null;
   private page: Page | null = null;
   private activeUrl: string | null = null;
   private sessions: Map<string, BrowserSessionMetadata> = new Map();
+  private sessionContexts: Map<string, BrowserContext> = new Map();
+  private sessionPages: Map<string, Page> = new Map();
   private activeSessionId: string = 'default';
   private sessionLocks: Map<string, Promise<void>> = new Map();
   private inFlightNavigations: Map<string, { url: string; promise: Promise<BrowserOpenResult> }> = new Map();
   private terminalTasks: Set<string> = new Set();
   public globalChallengeDetected: boolean = false;
   public globalChallengeType: string | undefined = undefined;
+
+  constructor(config: BrowserServiceConfig = {}) {
+    this.enginePreference =
+      config.engine || (process.env.NEXA_BROWSER_ENGINE as BrowserEngineType) || 'playwright';
+    this.obscuraManager = new ObscuraManager({
+      binaryPath: config.obscuraPath,
+      cdpUrl: config.obscuraCdpUrl,
+      cdpToken: config.obscuraToken,
+      port: config.obscuraPort,
+      allowPrivateNetwork: config.allowPrivateNetwork,
+    });
+  }
+
+  public getEngine(): 'playwright' | 'obscura' {
+    return this.activeEngine;
+  }
+
+  public isUsingObscura(): boolean {
+    return this.activeEngine === 'obscura';
+  }
+
+  public getObscuraManager(): ObscuraManager {
+    return this.obscuraManager;
+  }
 
   isChallengeActive(): boolean {
     if (this.globalChallengeDetected) return true;
@@ -338,37 +385,129 @@ export class PlaywrightBrowserService {
     }
   }
 
-  async ensurePage(): Promise<Page> {
+  async ensurePage(sessionId = 'default'): Promise<Page> {
     if (!this.browser) {
-      console.log('[Browser] launch_start');
-      try {
-        this.browser = await chromium.launch({
-          headless: true,
-          executablePath: process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH || undefined,
-          args: [
-            '--no-sandbox',
-            '--disable-setuid-sandbox',
-            '--disable-dev-shm-usage',
-            '--disable-gpu',
-            '--disable-accelerated-2d-canvas',
-            '--no-first-run',
-            '--no-zygote',
-            '--disable-software-rasterizer',
-            '--disable-extensions',
-          ],
-        });
-        console.log('[Browser] launch_success');
-      } catch (err: any) {
-        throw new NexaError(`Playwright browser initialization failed: ${err.message}`, {
-          code: 'BROWSER_INIT_FAILED',
-          statusCode: 500,
-          userFacingMessage: 'Web browser engine is currently unavailable on this host.',
-        });
+      if (this.enginePreference === 'obscura') {
+        console.log('[Browser] launch_start engine=obscura');
+        try {
+          const cdpUrl = await this.obscuraManager.startServer();
+          const headers = this.obscuraManager.getAuthHeaders();
+          this.browser = await chromium.connectOverCDP(cdpUrl, { headers });
+          this.activeEngine = 'obscura';
+          console.log(`[Browser] launch_success engine=obscura endpoint=${cdpUrl}`);
+        } catch (err: any) {
+          console.error(`[Browser] obscura_launch_failed: ${err.message}`);
+          throw new NexaError(`Obscura browser initialization failed: ${err.message}`, {
+            code: 'OBSCURA_UNAVAILABLE',
+            statusCode: 503,
+            userFacingMessage: 'Obscura browser engine is currently unavailable on this host.',
+          });
+        }
+      } else if (this.enginePreference === 'auto') {
+        let obscuraConnected = false;
+        if (this.obscuraManager.isBinaryAvailable() || process.env.OBSCURA_CDP_URL) {
+          try {
+            console.log('[Browser] launch_start engine=obscura (auto-detect)');
+            const cdpUrl = await this.obscuraManager.startServer();
+            const headers = this.obscuraManager.getAuthHeaders();
+            this.browser = await chromium.connectOverCDP(cdpUrl, { headers });
+            this.activeEngine = 'obscura';
+            obscuraConnected = true;
+            console.log(`[Browser] launch_success engine=obscura (auto-detect) endpoint=${cdpUrl}`);
+          } catch (err: any) {
+            console.log(`[Browser] obscura_auto_failed falling back to playwright: ${err.message}`);
+          }
+        }
+        if (!obscuraConnected) {
+          console.log('[Browser] launch_start engine=playwright (fallback)');
+          try {
+            this.browser = await chromium.launch({
+              headless: true,
+              executablePath: process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH || undefined,
+              args: [
+                '--no-sandbox',
+                '--disable-setuid-sandbox',
+                '--disable-dev-shm-usage',
+                '--disable-gpu',
+                '--disable-accelerated-2d-canvas',
+                '--no-first-run',
+                '--no-zygote',
+                '--disable-software-rasterizer',
+                '--disable-extensions',
+              ],
+            });
+            this.activeEngine = 'playwright';
+            console.log('[Browser] launch_success engine=playwright');
+          } catch (err: any) {
+            throw new NexaError(`Playwright browser initialization failed: ${err.message}`, {
+              code: 'BROWSER_INIT_FAILED',
+              statusCode: 500,
+              userFacingMessage: 'Web browser engine is currently unavailable on this host.',
+            });
+          }
+        }
+      } else {
+        console.log('[Browser] launch_start engine=playwright');
+        try {
+          this.browser = await chromium.launch({
+            headless: true,
+            executablePath: process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH || undefined,
+            args: [
+              '--no-sandbox',
+              '--disable-setuid-sandbox',
+              '--disable-dev-shm-usage',
+              '--disable-gpu',
+              '--disable-accelerated-2d-canvas',
+              '--no-first-run',
+              '--no-zygote',
+              '--disable-software-rasterizer',
+              '--disable-extensions',
+            ],
+          });
+          this.activeEngine = 'playwright';
+          console.log('[Browser] launch_success engine=playwright');
+        } catch (err: any) {
+          throw new NexaError(`Playwright browser initialization failed: ${err.message}`, {
+            code: 'BROWSER_INIT_FAILED',
+            statusCode: 500,
+            userFacingMessage: 'Web browser engine is currently unavailable on this host.',
+          });
+        }
       }
     }
 
+    if (!this.browser) {
+      throw new NexaError('Browser initialization failed: browser handle is null.', {
+        code: 'BROWSER_INIT_FAILED',
+        statusCode: 500,
+      });
+    }
+
+    // Session isolation for multi-user tasks
+    if (sessionId && sessionId !== 'default') {
+      let sCtx = this.sessionContexts.get(sessionId);
+      if (!sCtx) {
+        sCtx = await this.browser.newContext({
+          viewport: { width: 1280, height: 800 },
+          userAgent:
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36 NEXA/1.0',
+        });
+        this.sessionContexts.set(sessionId, sCtx);
+      }
+      let sPage = this.sessionPages.get(sessionId);
+      if (!sPage || sPage.isClosed()) {
+        sPage = await sCtx.newPage();
+        sPage.setDefaultTimeout(15_000);
+        this.sessionPages.set(sessionId, sPage);
+      }
+      this.page = sPage;
+      this.context = sCtx;
+      this.activeSessionId = sessionId;
+      return sPage;
+    }
+
     if (!this.context) {
-      this.context = await this.browser.newContext({
+      this.context = this.browser.contexts()[0] || await this.browser.newContext({
         viewport: { width: 1280, height: 800 },
         userAgent:
           'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36 NEXA/1.0',
@@ -522,11 +661,12 @@ export class PlaywrightBrowserService {
 
     // Security & SSRF pre-validation
     validateBrowserUrl(targetUrl);
+    await validateBrowserUrlAsync(targetUrl);
     PermissionEngine.validateResourceAccess(targetUrl);
 
     let page: Page;
     try {
-      page = await this.ensurePage();
+      page = await this.ensurePage(sessionId);
     } catch (err: any) {
       const latency = Date.now() - startNav;
       console.log(`[Browser] open_failed latency_ms=${latency} error_type=NAVIGATION_FAILED`);
@@ -577,6 +717,10 @@ export class PlaywrightBrowserService {
       }
 
       this.activeUrl = page.url();
+      if (this.activeUrl && this.activeUrl !== 'about:blank') {
+        validateBrowserUrl(this.activeUrl);
+        await validateBrowserUrlAsync(this.activeUrl);
+      }
       const title = await page.title().catch(() => '');
       const bodyHtml = await page.content().catch(() => '');
 
@@ -1656,7 +1800,142 @@ export class PlaywrightBrowserService {
     }
   }
 
+  async closeSession(sessionId: string): Promise<void> {
+    const sPage = this.sessionPages.get(sessionId);
+    if (sPage && !sPage.isClosed()) {
+      await sPage.close().catch(() => {});
+      this.sessionPages.delete(sessionId);
+    }
+    const sCtx = this.sessionContexts.get(sessionId);
+    if (sCtx) {
+      await sCtx.close().catch(() => {});
+      this.sessionContexts.delete(sessionId);
+    }
+    this.sessions.delete(sessionId);
+    this.sessionLocks.delete(sessionId);
+    if (this.activeSessionId === sessionId) {
+      this.page = null;
+      this.context = null;
+      this.activeUrl = null;
+    }
+    console.log(`[Browser] session_closed sessionId=${sessionId}`);
+  }
+
+  async selectDropdownOption(
+    selector: string,
+    value: string,
+    sessionId = 'default',
+    options?: BrowserActionOptions
+  ): Promise<{ success: boolean; selected: string }> {
+    return this.withSessionLock(sessionId, 'browser_select_option', options, async () => {
+      const page = await this.ensurePage(sessionId);
+      await page.waitForSelector(selector, { timeout: options?.timeoutMs ?? 10_000 });
+      await page.selectOption(selector, value);
+      const actualVal = await page.inputValue(selector).catch(() => value);
+      return { success: true, selected: actualVal };
+    });
+  }
+
+  async fillForm(
+    fields: Record<string, string>,
+    sessionId = 'default',
+    options?: BrowserActionOptions
+  ): Promise<{ success: boolean; filledCount: number; fields: string[] }> {
+    return this.withSessionLock(sessionId, 'browser_fill_form', options, async () => {
+      const page = await this.ensurePage(sessionId);
+      const filled: string[] = [];
+      for (const [key, val] of Object.entries(fields)) {
+        let selector = key;
+        if (!key.startsWith('#') && !key.startsWith('.') && !key.startsWith('[')) {
+          selector = `input[name="${key}"], textarea[name="${key}"], #${key}, [aria-label="${key}"]`;
+        }
+        await page.waitForSelector(selector, { timeout: 5000 });
+        await page.fill(selector, val);
+        filled.push(key);
+      }
+      return { success: true, filledCount: filled.length, fields: filled };
+    });
+  }
+
+  async extractContent(
+    selector?: string,
+    format: 'text' | 'markdown' | 'links' | 'all' = 'text',
+    sessionId = 'default',
+    options?: BrowserActionOptions
+  ): Promise<{
+    url: string;
+    title: string;
+    format: string;
+    content: string | Array<{ url: string; text: string }>;
+  }> {
+    return this.withSessionLock(sessionId, 'browser_extract', options, async () => {
+      const page = await this.ensurePage(sessionId);
+      const url = page.url();
+      const title = await page.title();
+
+      if (format === 'links') {
+        const links = await page.evaluate(() => {
+          const anchors = Array.from(document.querySelectorAll('a[href]'));
+          return anchors
+            .slice(0, 50)
+            .map((a) => ({
+              url: (a as HTMLAnchorElement).href,
+              text: (a.textContent || '').trim().replace(/\s+/g, ' '),
+            }))
+            .filter((l) => l.url && l.url.startsWith('http'));
+        });
+        return { url, title, format: 'links', content: links };
+      }
+
+      if (format === 'markdown') {
+        const md = await page.evaluate((sel) => {
+          const root = sel ? document.querySelector(sel) : document.body;
+          if (!root) return '';
+          const walk = (el: Node): string => {
+            if (el.nodeType === Node.TEXT_NODE) {
+              return el.textContent || '';
+            }
+            if (el.nodeType !== Node.ELEMENT_NODE) return '';
+            const tag = (el as Element).tagName.toLowerCase();
+            const children = Array.from(el.childNodes).map(walk).join('');
+            if (tag === 'h1') return `\n# ${children.trim()}\n`;
+            if (tag === 'h2') return `\n## ${children.trim()}\n`;
+            if (tag === 'h3') return `\n### ${children.trim()}\n`;
+            if (tag === 'p') return `\n${children.trim()}\n`;
+            if (tag === 'li') return `\n- ${children.trim()}`;
+            if (tag === 'a') {
+              const href = (el as Element).getAttribute('href');
+              return href ? ` [${children.trim()}](${href}) ` : children;
+            }
+            return children;
+          };
+          return walk(root).replace(/\n{3,}/g, '\n\n').trim();
+        }, selector);
+        const bounded = sanitizeUntrustedWebText(md);
+        return { url, title, format: 'markdown', content: bounded };
+      }
+
+      // Default text extraction
+      let text = '';
+      if (selector) {
+        text = (await page.textContent(selector)) || '';
+      } else {
+        text = await page.evaluate(() => (document.body ? document.body.innerText : ''));
+      }
+      const bounded = sanitizeUntrustedWebText(text);
+      return { url, title, format: 'text', content: bounded };
+    });
+  }
+
   async close(): Promise<void> {
+    for (const [sId, sPage] of this.sessionPages.entries()) {
+      if (!sPage.isClosed()) await sPage.close().catch(() => {});
+    }
+    this.sessionPages.clear();
+    for (const [sId, sCtx] of this.sessionContexts.entries()) {
+      await sCtx.close().catch(() => {});
+    }
+    this.sessionContexts.clear();
     if (this.page && !this.page.isClosed()) {
       await this.page.close().catch(() => {});
       this.page = null;
@@ -1669,6 +1948,7 @@ export class PlaywrightBrowserService {
       await this.browser.close().catch(() => {});
       this.browser = null;
     }
+    await this.obscuraManager.stopServer().catch(() => {});
     this.activeUrl = null;
   }
 }

@@ -338,6 +338,113 @@ export function createBrowserTools(
     },
   };
 
+  const browserExtractTool: BaseTool = {
+    name: 'browser_extract',
+    description:
+      'Extracts readable page content, formatted markdown, or hyperlinks from the active browser page with bounded output size.',
+    riskLevel: 'read_only',
+    parametersSchema: z.object({
+      selector: z.string().optional().describe('Optional CSS selector to extract from a specific container'),
+      format: z.enum(['text', 'markdown', 'links']).optional().describe('Format to extract (text, markdown, or links)'),
+      maxChars: z.number().min(100).max(10000).optional().describe('Maximum characters to return (default 4000)'),
+      sessionId: z.string().optional().describe('Optional browser session identifier'),
+    }),
+    requiresApproval: () => ({ required: false }),
+    execute: async (
+      args: { selector?: string; format?: 'text' | 'markdown' | 'links'; maxChars?: number; sessionId?: string },
+      context: ToolExecutionContext
+    ): Promise<ToolResult> => {
+      const sessionId = args.sessionId || context.user?.id || 'default';
+      const extracted = await browserService.extractContent(
+        args.selector,
+        args.format || 'text',
+        sessionId,
+        getActionOptions(context, args.sessionId)
+      );
+      return {
+        success: true,
+        data: extracted,
+        userFacingMessage: `Extracted ${extracted.format} from ${extracted.title || extracted.url}.`,
+      };
+    },
+  };
+
+  const browserFillFormTool: BaseTool = {
+    name: 'browser_fill_form',
+    description:
+      'Fills multiple fields in a form (e.g. name, email, search terms) on the active webpage in a single controlled action.',
+    riskLevel: 'medium_risk',
+    parametersSchema: z.object({
+      fields: z.record(z.string()).describe('Key-value pairs mapping selector or field name to input text'),
+      sessionId: z.string().optional().describe('Optional browser session identifier'),
+    }),
+    requiresApproval: () => ({ required: false }),
+    execute: async (
+      args: { fields: Record<string, string>; sessionId?: string },
+      context: ToolExecutionContext
+    ): Promise<ToolResult> => {
+      const sessionId = args.sessionId || context.user?.id || 'default';
+      const result = await browserService.fillForm(
+        args.fields,
+        sessionId,
+        getActionOptions(context, args.sessionId)
+      );
+      return {
+        success: result.success,
+        data: result,
+        userFacingMessage: `Filled ${result.filledCount} field(s) in the form.`,
+      };
+    },
+  };
+
+  const browserSelectOptionTool: BaseTool = {
+    name: 'browser_select_option',
+    description: 'Selects an option in a dropdown or <select> element on the active webpage.',
+    riskLevel: 'medium_risk',
+    parametersSchema: z.object({
+      selector: z.string().describe('CSS selector of the select dropdown element'),
+      value: z.string().describe('Value or label of the option to select'),
+      sessionId: z.string().optional().describe('Optional browser session identifier'),
+    }),
+    requiresApproval: () => ({ required: false }),
+    execute: async (
+      args: { selector: string; value: string; sessionId?: string },
+      context: ToolExecutionContext
+    ): Promise<ToolResult> => {
+      const sessionId = args.sessionId || context.user?.id || 'default';
+      const result = await browserService.selectDropdownOption(
+        args.selector,
+        args.value,
+        sessionId,
+        getActionOptions(context, args.sessionId)
+      );
+      return {
+        success: result.success,
+        data: result,
+        userFacingMessage: `Selected option '${result.selected}'.`,
+      };
+    },
+  };
+
+  const browserCloseTool: BaseTool = {
+    name: 'browser_close',
+    description: 'Closes the active webpage or browser session and releases browser resources.',
+    riskLevel: 'read_only',
+    parametersSchema: z.object({
+      sessionId: z.string().optional().describe('Optional browser session identifier to close'),
+    }),
+    requiresApproval: () => ({ required: false }),
+    execute: async (args: { sessionId?: string }, context: ToolExecutionContext): Promise<ToolResult> => {
+      const sessionId = args.sessionId || context.user?.id || 'default';
+      await browserService.closeSession(sessionId);
+      return {
+        success: true,
+        data: { closed: true, sessionId },
+        userFacingMessage: 'Browser session closed.',
+      };
+    },
+  };
+
   return [
     browserOpenTool,
     browserReadTool,
@@ -349,5 +456,9 @@ export function createBrowserTools(
     browserScreenshotTool,
     browserVerifyCartTool,
     browserRestoreSessionTool,
+    browserExtractTool,
+    browserFillFormTool,
+    browserSelectOptionTool,
+    browserCloseTool,
   ];
 }

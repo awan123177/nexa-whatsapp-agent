@@ -55,13 +55,13 @@ It is **NOT** just a chatbot. NEXA understands user intent and autonomously uses
             |                                    |                                    |
             v                                    v                                    v
 +-----------------------+            +-----------------------+            +-----------------------+
-|  Playwright Engine    |            |   Database Repository |            |  WhatsApp Gateway     |
-|                       |            |                       |            |                       |
-| • Headless Chromium   |            | • Supabase Client     |            | • Graph API v21.0     |
-| • SSRF & Private IP   |            | • In-Memory Fallback  |            | • Interactive Buttons |
-|   Shield              |            | • 11 Domain Tables    |            | • Read Receipts       |
-| • Anti-Bot & CAPTCHA  |            | • Foreign Keys, Index |            | • Media Pipeline      |
-|   Detection Guard     |            |   & Auto Timestamps   |            |   (Voice/Image/Doc)   |
+|  Browser Engine       |            |   Database Repository |            |  WhatsApp Gateway     |
+| (Obscura / Playwright)|            |                       |            |                       |
+| • Obscura CDP Daemon  |            | • Supabase Client     |            | • Graph API v21.0     |
+| • Headless Chromium   |            | • In-Memory Fallback  |            | • Interactive Buttons |
+| • SSRF & DNS Rebinding|            | • 11 Domain Tables    |            | • Read Receipts       |
+| • Prompt Sanitization |            | • Foreign Keys, Index |            | • Media Pipeline      |
+| • Anti-Bot Detection  |            |   & Auto Timestamps   |            |   (Voice/Image/Doc)   |
 +-----------------------+            +-----------------------+            +-----------------------+
 ```
 
@@ -168,6 +168,12 @@ The server will be available at `http://localhost:3000`.
 | `SUPABASE_ANON_KEY` | Optional | Supabase Anonymous Key |
 | `MAX_AGENT_STEPS` | Optional (default: `10`) | Maximum consecutive tool turns before stopping |
 | `RATE_LIMIT_MAX_REQUESTS_PER_MINUTE` | Optional (default: `30`) | Rate limit per phone number |
+| `NEXA_BROWSER_ENGINE` | Optional (default: `auto`) | Browser automation engine: `obscura`, `playwright`, or `auto` |
+| `OBSCURA_BIN_PATH` | Optional | Custom absolute path to the `obscura` binary |
+| `OBSCURA_CDP_URL` | Optional | External CDP endpoint (e.g., `ws://127.0.0.1:9222`) |
+| `OBSCURA_CDP_TOKEN` | Optional | Bearer/token authentication for remote CDP endpoints |
+| `OBSCURA_PORT` | Optional (default: `9222`) | Daemon loopback port for local Obscura CDP server |
+| `OBSCURA_STEALTH` | Optional (default: `true`) | Enable Obscura anti-detect stealth features |
 
 ---
 
@@ -204,6 +210,66 @@ The server will be available at `http://localhost:3000`.
    GEMINI_MODEL=gemini-2.5-flash
    ```
 4. NEXA uses `@google/genai` (Google's Unified Gen AI SDK), automatically formatting tools into function declarations and handling multi-turn conversational loops.
+
+---
+
+## 🌐 Obscura Browser Engine Integration
+
+NEXA integrates [Obscura](https://github.com/h4ckf0r0day/obscura), a high-performance headless browser engine built for AI agents. Obscura uses only ~30MB of memory (compared to ~300MB+ for standard headless Chrome), starts instantaneously, provides built-in anti-detection / stealth flags, and exposes a full Chrome DevTools Protocol (CDP) WebSocket endpoint.
+
+### 1. Local Installation (macOS Apple Silicon & Linux)
+
+Install the Obscura binary and its worker into `~/.obscura/bin` using the automated script:
+
+```bash
+pnpm run install:obscura
+```
+
+The script automatically detects your platform (`macos` / `linux`) and architecture (`aarch64` / `x86_64`), downloads the official release, extracts both `obscura` and `obscura-worker` binaries together, verifies permissions, and tests `--version`.
+
+### 2. Browser Engine Configuration
+
+Configure the browser engine in your `.env`:
+
+```env
+# Browser engine: 'obscura' (strict), 'playwright' (Chromium), or 'auto' (preferred Obscura with fallback)
+NEXA_BROWSER_ENGINE=obscura
+
+# Optional overrides:
+# OBSCURA_BIN_PATH=/Users/youruser/.obscura/bin/obscura
+# OBSCURA_PORT=9222
+# OBSCURA_STEALTH=true
+# OBSCURA_CDP_URL=ws://127.0.0.1:9222
+# OBSCURA_CDP_TOKEN=secret_token
+```
+
+> **Strict Engine Transparency**: If `NEXA_BROWSER_ENGINE=obscura` is set and the Obscura daemon fails to start or binary is missing, NEXA **fails clearly** with an `OBSCURA_UNAVAILABLE` error code. It will never silently fall back to Playwright and claim Obscura was used.
+
+### 3. Exposed Browser Capabilities (14 Tools)
+
+NEXA exposes 14 validated browser automation tools to Gemini:
+
+1. **`browser_open`**: Navigate to safe HTTP/HTTPS URLs with title extraction.
+2. **`browser_read`**: Extract clean, structured visible page content.
+3. **`browser_extract`**: Extract structured text, markdown, or all page hyperlinks.
+4. **`browser_click`**: Locate permitted interactive elements by role/label/CSS and click.
+5. **`browser_type`**: Type text into input fields and search boxes.
+6. **`browser_fill_form`**: Fill multi-field forms in a single operation.
+7. **`browser_select_option`**: Select dropdown values by label or value.
+8. **`browser_scroll`**: Scroll up, down, or to top/bottom of pages.
+9. **`browser_screenshot`**: Capture viewport or full-page screenshots delivered directly to WhatsApp.
+10. **`browser_close`**: Close page/session and release isolated contexts.
+11. **`search_hotels`**: Search and compare hotel options across travel portals.
+12. **`book_hotel`**: High-risk hotel booking tool (requires explicit user WhatsApp approval).
+13. **`search_flights`**: Search and compare flight itineraries.
+14. **`book_flight`**: High-risk flight ticketing tool (requires explicit user WhatsApp approval).
+
+### 4. Security & Isolation Architecture
+
+- **Multi-User Isolation**: Every WhatsApp user / session receives an isolated `BrowserContext` with separated cookies, storage, and cache.
+- **SSRF & DNS-Rebinding Defense**: Every target URL and subsequent redirect is checked against private IP ranges (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`), loopback (`127.0.0.1`), link-local / cloud metadata endpoints (`169.254.169.254`), and resolved asynchronously via DNS lookup to prevent rebinding attacks.
+- **Untrusted Web Text Sanitization**: Page text extracted by Obscura is treated as untrusted user input; system instruction overrides, markdown injection attempts, and suspicious commands are neutralized before reaching Gemini's prompt context.
+- **Consequential Action Approval**: High-risk actions (bookings, payments, data submissions) pause the agent loop and require interactive user confirmation before proceeding.
 
 ---
 
@@ -377,5 +443,4 @@ curl http://localhost:3000/health
    - Enable PDF receipt parsing and travel itinerary extraction.
 5. **Background Cron Worker**:
    - Worker process to poll the `tasks` table and dispatch proactive reminder messages to WhatsApp users.
-#   n e x a - w h a t s a p p - a g e n t  
- 
+## nexa-whatsapp-agent
