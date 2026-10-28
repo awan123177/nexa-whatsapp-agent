@@ -49,6 +49,19 @@ RUN mkdir -p /ms-playwright && \
     chmod -R 777 /ms-playwright && \
     rm -rf /var/lib/apt/lists/*
 
+# Install Obscura browser engine binary for Linux (keeps obscura and obscura-worker together)
+RUN ARCH=$(uname -m) && \
+    if [ "$ARCH" = "x86_64" ]; then \
+      curl -sLO https://github.com/h4ckf0r0day/obscura/releases/download/v0.2.5/obscura-x86_64-linux.tar.gz && \
+      tar -xzf obscura-x86_64-linux.tar.gz -C /usr/local/bin && \
+      rm -f obscura-x86_64-linux.tar.gz; \
+    elif [ "$ARCH" = "aarch64" ]; then \
+      curl -sLO https://github.com/h4ckf0r0day/obscura/releases/download/v0.2.5/obscura-aarch64-linux.tar.gz && \
+      tar -xzf obscura-aarch64-linux.tar.gz -C /usr/local/bin && \
+      rm -f obscura-aarch64-linux.tar.gz; \
+    fi && \
+    chmod +x /usr/local/bin/obscura* 2>/dev/null || true
+
 # Production environment variables
 ENV NODE_ENV=production
 ENV HOST=0.0.0.0

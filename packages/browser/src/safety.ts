@@ -1,6 +1,7 @@
+import dns from 'node:dns/promises';
 import { SecurityViolationError, AuthState } from '@nexa/shared';
 
-function isPrivateOrRestrictedHost(rawHostname: string): boolean {
+export function isPrivateOrRestrictedHost(rawHostname: string): boolean {
   // Strip IPv6 square brackets if present (e.g. "[::1]" -> "::1")
   let host = rawHostname.toLowerCase().replace(/^\[|\]$/g, '').trim();
 
@@ -98,7 +99,75 @@ export function validateBrowserUrl(targetUrl: string): URL {
   }
 
   return parsed;
+}
 
+/**
+ * Validates a browser URL and resolves its DNS records asynchronously to prevent
+ * DNS-rebinding attacks that point a public domain name to internal/private IP addresses.
+ */
+export async function validateBrowserUrlAsync(targetUrl: string): Promise<URL> {
+  const parsed = validateBrowserUrl(targetUrl);
+
+  if (
+    process.env.NODE_ENV === 'test' &&
+    process.env.ALLOW_LOCAL_TEST_HOSTS === 'true' &&
+    (parsed.hostname === '127.0.0.1' || parsed.hostname === 'localhost')
+  ) {
+    return parsed;
+  }
+
+  // If hostname is already a raw IP, it was strictly checked by isPrivateOrRestrictedHost.
+  // For domain names, resolve all DNS records and verify target IPs.
+  const isRawIp = /^[0-9.]+$|^\[?[0-9a-fA-F:]+\]?$/.test(parsed.hostname);
+  if (!isRawIp) {
+    try {
+      const records = await dns.lookup(parsed.hostname, { all: true });
+      for (const record of records) {
+        if (isPrivateOrRestrictedHost(record.address)) {
+          throw new SecurityViolationError(
+            `Navigation to domain '${parsed.hostname}' resolving to restricted IP address '${record.address}' is prohibited (SSRF/DNS-rebinding protection).`
+          );
+        }
+      }
+    } catch (err: any) {
+      if (err instanceof SecurityViolationError) {
+        throw err;
+      }
+      // If DNS resolution fails, log warning and let caller/navigation handle connectivity
+      console.warn(`[BrowserSafety] dns_lookup_failed domain="${parsed.hostname}" error="${err.message}"`);
+    }
+  }
+
+  return parsed;
+}
+
+/**
+ * Sanitizes untrusted webpage text before passing it to AI prompts or tool returns.
+ * Neutralizes prompt-injection keywords and bounds output text to prevent context saturation.
+ */
+export function sanitizeUntrustedWebText(text: string, maxChars = 8000): string {
+  if (!text) return '';
+
+  let sanitized = text;
+
+  // Flag and neutralize obvious prompt injection directives
+  const injectionPatterns = [
+    /ignore\s+(all\s+)?previous\s+instructions/gi,
+    /system\s+prompt\s+override/gi,
+    /system:\s*you\s+are/gi,
+    /disregard\s+(the\s+)?above/gi,
+    /output\s+all\s+(secrets|api\s*keys|env)/gi,
+  ];
+
+  for (const pattern of injectionPatterns) {
+    sanitized = sanitized.replace(pattern, '[INJECTION_BLOCKED]');
+  }
+
+  if (sanitized.length > maxChars) {
+    return sanitized.slice(0, maxChars) + `\n\n[Content truncated: exceeded ${maxChars} character limit]`;
+  }
+
+  return sanitized;
 }
 
 /**

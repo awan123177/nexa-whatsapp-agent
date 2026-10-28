@@ -14,6 +14,7 @@
     "build": "pnpm -r run build",
     "test": "vitest run",
     "test:watch": "vitest",
+    "install:obscura": "bash scripts/install-obscura.sh",
     "lint": "eslint . --ext .ts",
     "typecheck": "tsc --build --noEmit",
     "dev": "pnpm --filter @nexa/api dev",

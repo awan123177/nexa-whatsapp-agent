@@ -57,6 +57,10 @@ services:
       - key: ENCRYPTION_KEY
         sync: false
 
+      # Browser Engine Configuration (playwright | obscura | auto)
+      - key: NEXA_BROWSER_ENGINE
+        value: "playwright"
+
       # Runtime Limits
       - key: RATE_LIMIT_MAX_REQUESTS_PER_MINUTE
         value: "60"
