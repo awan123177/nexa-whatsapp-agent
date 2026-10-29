@@ -1,4 +1,8 @@
-import { NexaError } from '@nexa/shared';
+import {
+  NexaError,
+  cleanCredential,
+  cleanPhoneNumberId,
+} from '@nexa/shared';
 
 export interface DownloadedMedia {
   id: string;
@@ -14,7 +18,13 @@ export interface IMediaService {
 }
 
 export class WhatsAppMediaService implements IMediaService {
-  constructor(private accessToken?: string) {}
+  private accessToken?: string;
+  private graphApiVersion: string;
+
+  constructor(accessToken?: string, graphApiVersion = 'v21.0') {
+    this.accessToken = cleanCredential(accessToken);
+    this.graphApiVersion = cleanCredential(graphApiVersion) || 'v21.0';
+  }
 
   async downloadMedia(mediaId: string): Promise<DownloadedMedia> {
     if (!this.accessToken) {
@@ -25,13 +35,19 @@ export class WhatsAppMediaService implements IMediaService {
     }
 
     // Step 1: Retrieve media URL
-    const metaUrl = `https://graph.facebook.com/v21.0/${mediaId}`;
+    const metaUrl = `https://graph.facebook.com/${this.graphApiVersion}/${mediaId}`;
     const infoRes = await fetch(metaUrl, {
       headers: { Authorization: `Bearer ${this.accessToken}` },
     });
 
     if (!infoRes.ok) {
-      throw new NexaError(`Failed to fetch media metadata for ID ${mediaId}`, {
+      const rawText = await infoRes.text();
+      let metaErr: any;
+      try { metaErr = JSON.parse(rawText)?.error; } catch { metaErr = { message: rawText }; }
+      console.error(
+        `[WhatsApp Media] Failed to fetch media metadata: id=${mediaId} status=${infoRes.status} code=${metaErr?.code} message="${metaErr?.message}" fbtrace_id=${metaErr?.fbtrace_id}`
+      );
+      throw new NexaError(`Failed to fetch media metadata for ID ${mediaId}: ${metaErr?.message || infoRes.statusText}`, {
         code: 'MEDIA_FETCH_FAILED',
         statusCode: infoRes.status,
       });
@@ -47,7 +63,10 @@ export class WhatsAppMediaService implements IMediaService {
     });
 
     if (!mediaRes.ok) {
-      throw new NexaError(`Failed to download binary media content from Meta CDN`, {
+      console.error(
+        `[WhatsApp Media] Failed to download media bytes: id=${mediaId} status=${mediaRes.status}`
+      );
+      throw new NexaError(`Failed to download binary media content from Meta CDN: ${mediaRes.statusText}`, {
         code: 'MEDIA_DOWNLOAD_FAILED',
         statusCode: mediaRes.status,
       });
@@ -77,14 +96,15 @@ export class WhatsAppMediaService implements IMediaService {
       });
     }
 
-    if (!phoneNumberId) {
+    const cleanId = cleanPhoneNumberId(phoneNumberId);
+    if (!cleanId) {
       throw new NexaError('Cannot upload WhatsApp media: phoneNumberId is required.', {
         code: 'MISSING_PHONE_NUMBER_ID',
         statusCode: 400,
       });
     }
 
-    const url = `https://graph.facebook.com/v21.0/${phoneNumberId}/media`;
+    const url = `https://graph.facebook.com/${this.graphApiVersion}/${cleanId}/media`;
     const formData = new FormData();
     formData.append('messaging_product', 'whatsapp');
     formData.append('file', new Blob([new Uint8Array(buffer)], { type: mimeType }), filename);
@@ -98,9 +118,16 @@ export class WhatsAppMediaService implements IMediaService {
       body: formData,
     });
 
-    const data = (await res.json()) as any;
+    const rawText = await res.text();
+    let data: any;
+    try { data = JSON.parse(rawText); } catch { data = { raw: rawText }; }
+
     if (!res.ok) {
-      throw new NexaError(`Failed to upload media to WhatsApp: ${JSON.stringify(data)}`, {
+      const metaErr = data?.error;
+      console.error(
+        `[WhatsApp Media] Failed to upload media: filename=${filename} status=${res.status} code=${metaErr?.code} message="${metaErr?.message}" fbtrace_id=${metaErr?.fbtrace_id}`
+      );
+      throw new NexaError(`Failed to upload media to WhatsApp: ${metaErr?.message || res.statusText}`, {
         code: 'MEDIA_UPLOAD_FAILED',
         statusCode: res.status,
       });

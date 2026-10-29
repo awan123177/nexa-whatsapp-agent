@@ -1,10 +1,11 @@
 import { verifyMetaSignature } from '@nexa/security';
 import {
   NormalizedIncomingMessage,
-  WebhookVerificationError,
+  cleanCredential,
+  cleanPhoneNumberId,
 } from '@nexa/shared';
 import { WhatsAppPayloadParser } from './parser.js';
-import { WhatsAppCloudApiClient } from './client.js';
+import { WhatsAppCloudApiClient, OutboundSendOptions } from './client.js';
 import { WhatsAppMediaService } from './media-service.js';
 
 export interface WhatsAppGatewayConfig {
@@ -12,6 +13,9 @@ export interface WhatsAppGatewayConfig {
   appSecret?: string;
   accessToken?: string;
   phoneNumberId?: string;
+  businessAccountId?: string;
+  graphApiVersion?: string;
+  allowSimulation?: boolean;
 }
 
 export class WhatsAppGateway {
@@ -21,13 +25,27 @@ export class WhatsAppGateway {
   private appSecret?: string;
 
   constructor(config: WhatsAppGatewayConfig = {}) {
-    this.verifyToken = config.verifyToken;
-    this.appSecret = config.appSecret;
+    this.verifyToken = cleanCredential(config.verifyToken);
+    this.appSecret = cleanCredential(config.appSecret);
     this.client = new WhatsAppCloudApiClient({
       accessToken: config.accessToken,
       phoneNumberId: config.phoneNumberId,
+      businessAccountId: config.businessAccountId,
+      graphApiVersion: config.graphApiVersion,
+      allowSimulation: config.allowSimulation,
     });
-    this.mediaService = new WhatsAppMediaService(config.accessToken);
+    this.mediaService = new WhatsAppMediaService(
+      config.accessToken,
+      config.graphApiVersion
+    );
+  }
+
+  public getPhoneNumberId(): string | undefined {
+    return this.client.phoneNumberId;
+  }
+
+  public getBusinessAccountId(): string | undefined {
+    return this.client.businessAccountId;
   }
 
   /**
@@ -39,7 +57,7 @@ export class WhatsAppGateway {
     'hub.challenge'?: string;
   }): { isValid: boolean; challenge?: string } {
     const mode = query['hub.mode'];
-    const token = query['hub.verify_token'];
+    const token = cleanCredential(query['hub.verify_token']);
     const challenge = query['hub.challenge'];
 
     if (mode === 'subscribe' && token === this.verifyToken && challenge) {
@@ -93,8 +111,12 @@ export class WhatsAppGateway {
   /**
    * Sends a text message to a user WhatsApp number.
    */
-  async sendText(to: string, message: string): Promise<any> {
-    return this.client.sendTextMessage(to, message);
+  async sendText(
+    to: string,
+    message: string,
+    options?: OutboundSendOptions
+  ): Promise<any> {
+    return this.client.sendTextMessage(to, message, options);
   }
 
   /**
@@ -103,19 +125,28 @@ export class WhatsAppGateway {
   async sendApprovalRequest(
     to: string,
     prompt: string,
-    approvalId: string
+    approvalId: string,
+    options?: OutboundSendOptions
   ): Promise<any> {
-    return this.client.sendInteractiveButtons(to, prompt, [
-      { id: `approve_${approvalId}`, title: 'Approve' },
-      { id: `reject_${approvalId}`, title: 'Cancel' },
-    ]);
+    return this.client.sendInteractiveButtons(
+      to,
+      prompt,
+      [
+        { id: `approve_${approvalId}`, title: 'Approve' },
+        { id: `reject_${approvalId}`, title: 'Cancel' },
+      ],
+      options
+    );
   }
 
   /**
    * Marks a WhatsApp message as read to acknowledge receipt.
    */
-  async markRead(messageId: string): Promise<any> {
-    return this.client.markAsRead(messageId);
+  async markRead(
+    messageId: string,
+    options?: OutboundSendOptions
+  ): Promise<any> {
+    return this.client.markAsRead(messageId, options);
   }
 
   /**
@@ -124,9 +155,10 @@ export class WhatsAppGateway {
   async uploadMedia(
     buffer: Buffer,
     mimeType: string,
-    filename: string
+    filename: string,
+    options?: OutboundSendOptions
   ): Promise<{ mediaId: string }> {
-    return this.client.uploadMedia(buffer, mimeType, filename);
+    return this.client.uploadMedia(buffer, mimeType, filename, options);
   }
 
   /**
@@ -135,9 +167,10 @@ export class WhatsAppGateway {
   async sendImageMessage(
     to: string,
     mediaIdOrUrl: string,
-    caption?: string
+    caption?: string,
+    options?: OutboundSendOptions
   ): Promise<any> {
-    return this.client.sendImageMessage(to, mediaIdOrUrl, caption);
+    return this.client.sendImageMessage(to, mediaIdOrUrl, caption, options);
   }
 
   /**
@@ -146,8 +179,9 @@ export class WhatsAppGateway {
   async sendImage(
     to: string,
     mediaIdOrUrl: string,
-    caption?: string
+    caption?: string,
+    options?: OutboundSendOptions
   ): Promise<any> {
-    return this.client.sendImageMessage(to, mediaIdOrUrl, caption);
+    return this.client.sendImageMessage(to, mediaIdOrUrl, caption, options);
   }
 }

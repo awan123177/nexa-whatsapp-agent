@@ -181,7 +181,8 @@ describe('Fastify REST & Webhook API Suite', () => {
     expect(sendSpy).toHaveBeenCalledTimes(1);
     expect(sendSpy).toHaveBeenCalledWith(
       '15551234567',
-      expect.stringContaining('Echo: Hello deduplication test')
+      expect.stringContaining('Echo: Hello deduplication test'),
+      expect.anything()
     );
 
     sendSpy.mockRestore();
@@ -244,7 +245,8 @@ describe('Fastify REST & Webhook API Suite', () => {
     expect(sendSpy).toHaveBeenCalledTimes(1);
     expect(sendSpy).toHaveBeenCalledWith(
       '15559876543',
-      expect.stringContaining('Echo: Concurrent test message')
+      expect.stringContaining('Echo: Concurrent test message'),
+      expect.anything()
     );
 
     sendSpy.mockRestore();
