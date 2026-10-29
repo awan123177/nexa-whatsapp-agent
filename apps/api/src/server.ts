@@ -1,5 +1,5 @@
 import 'dotenv/config';
-import { loadConfig } from '@nexa/shared';
+import { loadConfig, logWhatsAppConfigStatus } from '@nexa/shared';
 import { createDatabaseRepository } from '@nexa/database';
 import { createAIProvider } from '@nexa/ai';
 import { createDefaultToolRegistry, GoogleOAuthService } from '@nexa/tools';
@@ -14,6 +14,9 @@ async function bootstrap() {
   console.log('----------------------------------------------------');
   console.log('  NEXA - Personal AI Agent Server Initializing');
   console.log('----------------------------------------------------');
+
+  // Diagnostic presence check for WhatsApp and credentials (without revealing values)
+  logWhatsAppConfigStatus(config);
 
   // 1. Initialize Database
   const db = createDatabaseRepository({
@@ -49,6 +52,8 @@ async function bootstrap() {
     appSecret: config.WHATSAPP_APP_SECRET,
     accessToken: config.WHATSAPP_ACCESS_TOKEN,
     phoneNumberId: config.WHATSAPP_PHONE_NUMBER_ID,
+    businessAccountId: config.WHATSAPP_BUSINESS_ACCOUNT_ID,
+    graphApiVersion: config.WHATSAPP_GRAPH_API_VERSION,
   });
 
   // 6. Initialize Tool Registry with all initial tools

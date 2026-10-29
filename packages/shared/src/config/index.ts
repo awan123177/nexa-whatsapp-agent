@@ -21,6 +21,7 @@ export const ConfigSchema = z.object({
   WHATSAPP_BUSINESS_ACCOUNT_ID: z.string().optional(),
   WHATSAPP_VERIFY_TOKEN: z.string().optional(),
   WHATSAPP_APP_SECRET: z.string().optional(),
+  WHATSAPP_GRAPH_API_VERSION: z.string().default('v21.0'),
 
   // Supabase Database
   SUPABASE_URL: z.string().url().optional(),
@@ -93,6 +94,94 @@ export const COMMERCE_TASK_MAX_STEPS = 25;
 
 export type NexaConfig = z.infer<typeof ConfigSchema>;
 
+/**
+ * Sanitizes credential values by trimming whitespace, stripping quotes,
+ * and removing redundant 'Bearer ' prefixes or newline characters.
+ */
+export function cleanCredential(val?: string | null): string | undefined {
+  if (!val || typeof val !== 'string') return undefined;
+  let cleaned = val.trim();
+  // Strip surrounding quotes if present (e.g. "token" or 'token')
+  if (
+    (cleaned.startsWith('"') && cleaned.endsWith('"')) ||
+    (cleaned.startsWith("'") && cleaned.endsWith("'"))
+  ) {
+    cleaned = cleaned.slice(1, -1).trim();
+  }
+  // Strip redundant 'Bearer ' prefix if accidentally included in token
+  if (/^bearer\s+/i.test(cleaned)) {
+    cleaned = cleaned.replace(/^bearer\s+/i, '').trim();
+  }
+  // Remove any internal linebreaks or carriage returns
+  cleaned = cleaned.replace(/[\r\n]+/g, '').trim();
+  return cleaned || undefined;
+}
+
+/**
+ * Sanitizes phone number ID by removing surrounding quotes and whitespace.
+ */
+export function cleanPhoneNumberId(val?: string | null): string | undefined {
+  const cleaned = cleanCredential(val);
+  if (!cleaned) return undefined;
+  // Meta phone number IDs are numeric strings
+  return cleaned.replace(/\s+/g, '');
+}
+
+/**
+ * Sanitizes recipient phone number for Meta WhatsApp Cloud API.
+ * Strips whitespace, dashes, parentheses, and dots, while verifying valid international format.
+ */
+export function sanitizeRecipientPhone(to: string): string {
+  if (!to || typeof to !== 'string') return '';
+  const cleaned = to.replace(/[\s\-\(\)\.]/g, '');
+  if (!/^\+?\d{7,15}$/.test(cleaned)) {
+    return '';
+  }
+  return cleaned;
+}
+
+/**
+ * Safely masks a phone number for diagnostic logs without leaking the full number.
+ * e.g. "15551234567" -> "155***4567"
+ */
+export function maskPhoneNumber(phone?: string | null): string {
+  if (!phone || typeof phone !== 'string') return 'unknown';
+  const clean = phone.replace(/\D/g, '');
+  if (clean.length <= 4) return '***';
+  if (clean.length <= 7) return `***${clean.slice(-4)}`;
+  return `${clean.slice(0, 3)}***${clean.slice(-4)}`;
+}
+
+/**
+ * Logs safe diagnostic status of WhatsApp configuration without exposing secrets.
+ */
+export function logWhatsAppConfigStatus(config: NexaConfig): void {
+  const isProd = config.NODE_ENV === 'production';
+  console.log('[WhatsApp Config] Environment check:');
+  console.log(`  - WHATSAPP_ACCESS_TOKEN: ${config.WHATSAPP_ACCESS_TOKEN ? 'configured' : 'MISSING'}`);
+  console.log(`  - WHATSAPP_PHONE_NUMBER_ID: ${config.WHATSAPP_PHONE_NUMBER_ID ? 'configured' : 'MISSING'}`);
+  console.log(`  - WHATSAPP_BUSINESS_ACCOUNT_ID: ${config.WHATSAPP_BUSINESS_ACCOUNT_ID ? 'configured' : 'not configured'}`);
+  console.log(`  - WHATSAPP_VERIFY_TOKEN: ${config.WHATSAPP_VERIFY_TOKEN ? 'configured' : 'MISSING'}`);
+  console.log(`  - WHATSAPP_APP_SECRET: ${config.WHATSAPP_APP_SECRET ? 'configured' : 'not configured (HMAC disabled)'}`);
+  console.log(`  - WHATSAPP_GRAPH_API_VERSION: ${config.WHATSAPP_GRAPH_API_VERSION || 'v21.0'}`);
+
+  if (
+    config.WHATSAPP_PHONE_NUMBER_ID &&
+    config.WHATSAPP_BUSINESS_ACCOUNT_ID &&
+    config.WHATSAPP_PHONE_NUMBER_ID === config.WHATSAPP_BUSINESS_ACCOUNT_ID
+  ) {
+    console.warn(
+      '[WhatsApp Config] MISCONFIGURATION WARNING: WHATSAPP_PHONE_NUMBER_ID is identical to WHATSAPP_BUSINESS_ACCOUNT_ID! Phone Number ID must be the specific phone number asset ID, NOT the WABA ID. Outbound sends to /messages will fail with Meta OAuthException code 100.'
+    );
+  }
+
+  if (isProd && (!config.WHATSAPP_ACCESS_TOKEN || !config.WHATSAPP_PHONE_NUMBER_ID)) {
+    console.error(
+      '[WhatsApp Config] CRITICAL WARNING: Missing required WhatsApp production credentials! Outbound message delivery will fail.'
+    );
+  }
+}
+
 export function loadConfig(env = process.env): NexaConfig {
   const result = ConfigSchema.safeParse(env);
   if (!result.success) {
@@ -101,5 +190,25 @@ export function loadConfig(env = process.env): NexaConfig {
       .join('\n');
     throw new Error(`Configuration Validation Error:\n${formattedErrors}`);
   }
-  return result.data;
+
+  const data = result.data;
+
+  // Clean WhatsApp credentials to eliminate quotes, whitespace, or redundant 'Bearer '
+  if (data.WHATSAPP_ACCESS_TOKEN) {
+    data.WHATSAPP_ACCESS_TOKEN = cleanCredential(data.WHATSAPP_ACCESS_TOKEN);
+  }
+  if (data.WHATSAPP_PHONE_NUMBER_ID) {
+    data.WHATSAPP_PHONE_NUMBER_ID = cleanPhoneNumberId(data.WHATSAPP_PHONE_NUMBER_ID);
+  }
+  if (data.WHATSAPP_BUSINESS_ACCOUNT_ID) {
+    data.WHATSAPP_BUSINESS_ACCOUNT_ID = cleanPhoneNumberId(data.WHATSAPP_BUSINESS_ACCOUNT_ID);
+  }
+  if (data.WHATSAPP_VERIFY_TOKEN) {
+    data.WHATSAPP_VERIFY_TOKEN = cleanCredential(data.WHATSAPP_VERIFY_TOKEN);
+  }
+  if (data.WHATSAPP_APP_SECRET) {
+    data.WHATSAPP_APP_SECRET = cleanCredential(data.WHATSAPP_APP_SECRET);
+  }
+
+  return data;
 }

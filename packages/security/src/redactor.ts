@@ -15,6 +15,8 @@ const PATTERNS = [
   // Bearer tokens and JWTs
   { regex: /Bearer\s+([A-Za-z0-9_\-\.]{20,})/gi, replacement: 'Bearer [REDACTED_TOKEN]' },
   { regex: /ey[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}/g, replacement: '[REDACTED_JWT]' },
+  // Meta Graph API Access Tokens (EAA...)
+  { regex: /\b(EAA[0-9A-Za-z_-]{20,})\b/g, replacement: '[REDACTED_META_TOKEN]' },
   // Common API key patterns
   { regex: /\b(AIza[0-9A-Za-z-_]{30,45})\b/g, replacement: '[REDACTED_GEMINI_KEY]' }, // Google API key
   { regex: /(sk-[a-zA-Z0-9]{20,})/g, replacement: '[REDACTED_API_KEY]' },
@@ -73,6 +75,10 @@ export function redactObject<T>(obj: T): T {
     'card_number',
     'privatekey',
     'private_key',
+    'verifytoken',
+    'verify_token',
+    'appsecret',
+    'app_secret',
   ]);
 
   for (const [key, value] of Object.entries(obj as Record<string, unknown>)) {
